@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main and OBS window access to app commands","local":true,"windows":["main","obs"],"permissions":["core:default","core:event:default","core:window:default"]}}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/resources/node.exe
+src-tauri/resources/dyhub/
+vendor/dyhub/node_modules/
+vendor/dyhub/dist/
+.env
+.build-tmp/

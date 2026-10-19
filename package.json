@@ -1,0 +1,29 @@
+{
+  "name": "ai-digital-human-live",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:desktop": "powershell -ExecutionPolicy Bypass -File scripts/dev-windows.ps1",
+    "build": "tsc && vite build",
+    "test": "node --test test/*.test.mjs",
+    "tauri": "tauri",
+    "prepare:dyhub": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dyhub.ps1",
+    "package:win": "powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "aliyun-rtc-sdk": "7.3.7",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

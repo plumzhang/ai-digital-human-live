@@ -1,0 +1,19 @@
+[package]
+name = "ai-digital-human-live"
+version = "0.1.0"
+description = "Windows control console for Vidu S2 Avatar and DyHub"
+authors = ["InnoTechx"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

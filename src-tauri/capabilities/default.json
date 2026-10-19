@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main and OBS window access to app commands",
+  "windows": ["main", "obs"],
+  "permissions": ["core:default", "core:event:default", "core:window:default"]
+}
