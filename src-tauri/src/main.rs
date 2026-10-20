@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod model_api;
+mod queue_store;
+
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -76,6 +79,7 @@ struct Session {
     sender: UnboundedSender<Outbound>,
     seq: u64,
     last_video_frame_ms: u128,
+    voice_provider: String,
 }
 
 struct Outbound {
@@ -84,7 +88,7 @@ struct Outbound {
 }
 
 #[derive(Serialize, Clone)]
-struct SessionSnapshot { live_id: String, rtc: Value }
+struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String }
 
 #[derive(Deserialize)]
 struct AvatarSettings {
@@ -137,6 +141,14 @@ async fn response_json(response: reqwest::Response) -> Result<Value, String> {
 
 fn unix_ms() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
 
+fn session_signal(text: &str, live_id: &str) -> Option<Value> {
+    let mut signal: Value = serde_json::from_str(text).ok()?;
+    // Transcription frames omit live_id. Bind all events to the trusted
+    // WebSocket session before sending them to the console and OBS windows.
+    signal.as_object_mut()?.insert("live_id".into(), json!(live_id));
+    Some(signal)
+}
+
 fn playback_expired(started_seconds: u64, ready_seconds: Option<u64>, frame_age_ms: u128) -> bool {
     match ready_seconds {
         Some(seconds) => seconds >= 30 && frame_age_ms >= 30_000,
@@ -183,6 +195,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
             "idle_action": advanced.idle_action
         },
         "audio": {"enable_transcription": advanced.enable_transcription},
+        "action": {"enabled":true,"library_id":"0"},
         "vad": {"type":advanced.vad_type,"threshold":advanced.vad_threshold,"silence_duration_ms":advanced.silence_duration_ms,"idle_timeout_ms":advanced.vad_idle_timeout_ms},
         "llm": {"temperature":advanced.temperature,"top_p":advanced.top_p,"top_k":advanced.top_k,"max_tokens":advanced.max_tokens},
         "idle_timeout_seconds": advanced.idle_timeout_seconds
@@ -204,8 +217,8 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let (sender, mut receiver) = unbounded_channel::<Outbound>();
     let init = json!({"type":1,"live_id":live_id,"conn_id":conn_id,"seq_id":1,"payload":{"conn_init":{"version":1}}});
     writer.send(Message::Text(init.to_string().into())).await.map_err(|e| e.to_string())?;
-    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone() };
-    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id, key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms() });
+    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: avatar.voice_provider.clone() };
+    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id, key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: avatar.voice_provider.clone() });
     let _ = app.emit("session-changed", snapshot.clone());
     let app_for_task = app.clone();
     let task_live_id = live_id.clone();
@@ -253,7 +266,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                 incoming = reader.next() => {
                     match incoming {
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            if let Some(value) = session_signal(&text, &task_live_id) {
                                 if value.pointer("/payload/conn_init_ack/success").and_then(Value::as_bool) == Some(true) && ready_at.is_none() {
                                     ready_at = Some(tokio::time::Instant::now());
                                 }
@@ -298,6 +311,35 @@ fn send_signal(session: &mut Session, kind: u64, payload: Value) -> Result<(), S
     session.seq += 1;
     let message = json!({"type":kind,"live_id":session.live_id,"conn_id":session.conn_id,"seq_id":session.seq,"payload":payload});
     session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written: None }).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn speak_text(state: State<'_, AppState>, live_id: String, content: String) -> Result<(), String> {
+    let content = content.trim();
+    if content.is_empty() { return Err("播报文本不能为空".into()); }
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次播报")?;
+    if session.voice_provider != "doubao" { return Err("指定台词播报需要豆包音色供应商，请结束会话后改为豆包再创建数字人".into()); }
+    send_signal(session, 100, json!({"text_tts":{"msg_id":uuid::Uuid::new_v4().to_string(),"content":content}}))
+}
+
+fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
+    let content = match gesture {
+        "heart" => "面向镜头，微笑着双手在胸前做一个比心动作，表达收到礼物后的开心和感谢。",
+        "kiss" => "面向镜头，微笑着轻吻自己的指尖，做一个可爱的亲吻手势，表达对观众礼物的感谢。",
+        "flying_kiss" => "面向镜头，微笑着将手指轻触嘴唇，然后向镜头送出一个飞吻，表达对观众礼物的感谢。",
+        _ => return Err("不支持的礼物动作".into()),
+    };
+    if task_id.trim().is_empty() { return Err("动作缺少互动任务 ID".into()); }
+    Ok(json!({"text_action":{"msg_id":format!("gift-action-{task_id}"),"content":content}}))
+}
+
+#[tauri::command]
+fn send_avatar_action(state: State<'_, AppState>, live_id: String, task_id: String, gesture: String) -> Result<(), String> {
+    let payload = gift_action_payload(&task_id, &gesture)?;
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次动作")?;
+    send_signal(session, 101, payload)
 }
 
 #[tauri::command]
@@ -372,7 +414,7 @@ fn playback_frame(state: State<'_, AppState>, live_id: String) -> Result<(), Str
 
 #[tauri::command]
 fn session_snapshot(state: State<'_, AppState>) -> Result<Option<SessionSnapshot>, String> {
-    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone() }))
+    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone(), voice_provider: s.voice_provider.clone() }))
 }
 
 #[tauri::command]
@@ -585,6 +627,7 @@ fn main() {
     let Some(_instance_guard) = single_instance::Guard::acquire() else { return; };
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(queue_store::QueueStorage::default())
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -613,7 +656,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, end_session, session_snapshot, playback_frame, live_status, open_obs_window, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice])
+        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, end_session, session_snapshot, playback_frame, live_status, open_obs_window, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }
@@ -621,6 +664,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_frames_are_bound_to_the_socket_session() {
+        let frame = r#"{"payload":{"text_msg":{"content":"你好，请问你可以帮我做什么？"}},"type":9}"#;
+        let signal = session_signal(frame, "live-123").unwrap();
+        assert_eq!(signal["live_id"], "live-123");
+        assert_eq!(signal["type"], 9);
+        assert_eq!(signal["payload"]["text_msg"]["content"], "你好，请问你可以帮我做什么？");
+        assert_eq!(session_signal(r#"{"type":10,"live_id":"wrong"}"#, "live-123").unwrap()["live_id"], "live-123");
+        assert!(session_signal("[]", "live-123").is_none());
+        assert!(session_signal("invalid", "live-123").is_none());
+    }
 
     #[test]
     fn playback_guard_allows_warmup_and_requires_recent_frames_after_ready() {
@@ -639,5 +694,17 @@ mod tests {
         assert!(CreateSessionGuard::acquire(&flag).is_err());
         drop(first);
         assert!(CreateSessionGuard::acquire(&flag).is_ok());
+    }
+
+    #[test]
+    fn gift_actions_use_separate_text_action_signals_with_stable_task_ids() {
+        for (gesture, expected) in [("heart", "比心"), ("kiss", "亲吻"), ("flying_kiss", "飞吻")] {
+            let payload = gift_action_payload("task-1", gesture).unwrap();
+            assert_eq!(payload["text_action"]["msg_id"], "gift-action-task-1");
+            assert!(payload["text_action"]["content"].as_str().unwrap().contains(expected));
+            assert!(payload.get("text_tts").is_none());
+        }
+        assert!(gift_action_payload("task-1", "untrusted_action").is_err());
+        assert!(gift_action_payload("", "heart").is_err());
     }
 }

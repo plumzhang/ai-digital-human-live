@@ -8,19 +8,32 @@ async function player(options = {}) {
   const handlers = new Map();
   const rtcHandlers = new Map();
   const calls = [];
+  const monitors = [];
   const refs = [];
+  const states = [];
+  let refCursor = 0;
+  let stateCursor = 0;
   let effect;
   const video = { videoWidth: 1080, paused: false, currentTime: 1, play: async () => {}, srcObject: null };
   const rtc = new Proxy({
     on: (name, fn) => rtcHandlers.set(name, fn),
     off: name => rtcHandlers.delete(name),
-  }, { get: (target, key) => target[key] ?? (async (...args) => { calls.push([key, ...args]); }) });
+    getAudioTrack: async uid => { calls.push(['getAudioTrack', uid]); return { kind: 'audio', id: uid }; },
+  }, { get: (target, key) => target[key] ?? (async (...args) => {
+    calls.push([key, ...args]);
+    if (key === 'startAudioCapture' && options.captureError) throw new Error(options.captureError);
+    if (key === 'startAudioCapture' && options.captureWait) await options.captureWait;
+  }) });
   const snapshot = { live_id: '123', rtc: { token: 'test-token', user_id: 'client' } };
   const imports = {
     react: {
       useEffect: fn => { effect = fn; },
-      useRef: value => { const ref = { current: refs.length === 0 ? video : value }; refs.push(ref); return ref; },
-      useState: value => [value, () => {}],
+      useRef: value => { const index = refCursor++; return refs[index] ??= { current: index === 0 ? video : value }; },
+      useState: initial => {
+        const index = stateCursor++;
+        if (!(index in states)) states[index] = initial;
+        return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+      },
     },
     'react/jsx-runtime': { jsx: (tag, props) => ({ tag, props }), jsxs: (tag, props) => ({ tag, props }) },
     '@tauri-apps/api/core': { invoke: async (name, args) => { calls.push([name, args]); return name === 'session_snapshot' ? snapshot : undefined; } },
@@ -29,17 +42,63 @@ async function player(options = {}) {
       listen: async (name, fn) => { handlers.set(name, fn); return () => handlers.delete(name); },
     },
     'aliyun-rtc-sdk': { default: { getInstance: () => { if (options.engineError) throw new Error(options.engineError); return rtc; } }, AliRtcSdkChannelProfile: { AliRtcSdkCommunication: 0 } },
+    '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed) => {
+      const monitor = { track, receiving, activity, failed, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
+      monitors.push(monitor);
+      return monitor;
+    } },
   };
   const source = ts.transpileModule(fs.readFileSync('src/ui/ObsWindow.tsx', 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const exports = {};
   vm.runInNewContext(source, { exports, require: name => imports[name], Date });
-  const tree = exports.ObsWindow();
+  const render = () => { refCursor = 0; stateCursor = 0; return exports.ObsWindow(); };
+  const tree = render();
   effect();
   await new Promise(resolve => setImmediate(resolve));
-  return { handlers, rtcHandlers, calls, tree, video, snapshot };
+  return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors };
 }
+
+test('OBS monitors only subscribed downlink audio and emits VAD events with transport health', async () => {
+  const p = await player();
+  const subscribe = p.rtcHandlers.get('audioSubscribeStateChanged');
+  subscribe('client', 2, 3);
+  subscribe('avatar', 2, 3);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(p.calls.filter(([name]) => name === 'getAudioTrack'), [['getAudioTrack', 'avatar']]);
+  const monitor = p.monitors[0];
+  assert.equal(monitor.receiving(), false);
+  p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid: 'avatar', stats: { bytesReceived: 1000 } }]);
+  assert.equal(monitor.receiving(), true);
+  monitor.activity({ speaking: true, ended: false, healthy: true });
+  monitor.activity({ speaking: false, ended: true, healthy: true });
+  const end = p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1];
+  assert.equal(end.source, 'pcm-vad');
+  assert.equal(end.ended, true);
+  assert.equal(end.live_id, '123');
+  p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid: 'avatar', stats: { bytesReceived: 1000 } }]);
+  assert.equal(monitor.receiving(), false);
+  assert.equal(p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1].healthy, false);
+  subscribe('avatar', 3, 0);
+  assert.equal(monitor.disposed, true);
+  const before = p.calls.length;
+  monitor.activity({ speaking: false, ended: true, healthy: true });
+  assert.equal(p.calls.length, before);
+});
+
+test('ending a session closes the PCM observer and ignores late VAD results', async () => {
+  const p = await player();
+  p.rtcHandlers.get('audioSubscribeStateChanged')('avatar', 2, 3);
+  await new Promise(resolve => setImmediate(resolve));
+  const monitor = p.monitors[0];
+  p.handlers.get('session-ended')({ payload: {} });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(monitor.disposed, true);
+  const before = p.calls.length;
+  monitor.activity({ speaking: false, ended: true, healthy: true });
+  assert.equal(p.calls.length, before);
+});
 
 test('OBS deduplicates session event and startup snapshot without rejoining', async () => {
   const p = await player();
@@ -80,4 +139,143 @@ test('ending a session releases the engine and stops reporting playback frames',
   p.tree.props.children[0].props.onTimeUpdate({ currentTarget: p.video });
   assert.equal(p.calls.filter(([name]) => name === 'destroy').length, 1);
   assert.equal(p.calls.filter(([name]) => name === 'playback_frame').length, 0);
+});
+
+test('microphone starts only on request and closing it releases local capture', async () => {
+  const p = await player();
+  assert.equal(p.calls.filter(([name]) => name === 'startAudioCapture').length, 0);
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name]) => name === 'startAudioCapture').length, 1);
+  assert.ok(p.calls.some(([name, enabled]) => name === 'publishLocalAudioStream' && enabled));
+  assert.ok(p.calls.some(([name, state]) => name === 'mic-state' && state.enabled && state.live_id === '123'));
+  p.calls.length = 0;
+  p.handlers.get('mic-control')({ payload: { enabled: false, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(p.calls.some(([name, enabled]) => name === 'publishLocalAudioStream' && !enabled));
+  assert.ok(p.calls.some(([name]) => name === 'stopAudioCapture'));
+  assert.ok(p.calls.some(([name, state]) => name === 'mic-state' && !state.enabled && !state.error));
+});
+
+test('joining and enabling the microphone never captures or publishes local camera video', async () => {
+  const p = await player();
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.handlers.has('camera-control'), false);
+  assert.equal(p.calls.some(([name, enabled]) => name === 'enableLocalVideo' && enabled), false);
+  assert.equal(p.calls.some(([name, enabled]) => name === 'publishLocalVideoStream' && enabled), false);
+  assert.ok(p.calls.some(([name, enabled]) => name === 'setDefaultSubscribeAllRemoteVideoStreams' && enabled));
+});
+
+test('denied microphone permission reports failure and does not publish audio', async () => {
+  const p = await player({ captureError: 'NotAllowedError' });
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name, enabled]) => name === 'publishLocalAudioStream' && enabled).length, 0);
+  const failure = p.calls.find(([name, state]) => name === 'mic-state' && state.error);
+  assert.equal(failure[1].enabled, false);
+  assert.match(failure[1].error, /权限被拒绝/);
+});
+
+test('stale microphone requests cannot enable another session', async () => {
+  const p = await player();
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: 'old-session' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name]) => name === 'startAudioCapture').length, 0);
+});
+
+test('ending the session while permission is pending never publishes late audio', async () => {
+  let finishCapture;
+  const captureWait = new Promise(resolve => { finishCapture = resolve; });
+  const p = await player({ captureWait });
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  p.handlers.get('session-ended')({ payload: {} });
+  await new Promise(resolve => setImmediate(resolve));
+  finishCapture();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name, enabled]) => name === 'publishLocalAudioStream' && enabled).length, 0);
+});
+
+function caption(player) {
+  return player.render().props.children[1].props.children[0];
+}
+
+test('queue chat and gift speech use the same centered overlay as microphone captions', async () => {
+  const p = await player();
+  assert.ok(p.calls.some(([name, payload]) => name === 'queue-caption-request' && payload.live_id === '123'));
+  Object.assign(p.video, { videoHeight: 1920, clientWidth: 1920, clientHeight: 1080 });
+  p.tree.props.children[0].props.onLoadedMetadata();
+  const overlay = p.render().props.children[1];
+  assert.equal(overlay.props.style.top, 540);
+  assert.equal(overlay.props.style.left, (1920 - 1080 * 1080 / 1920) / 2);
+  for (const content of ['[弹幕] 小杰: 姐姐今天好漂亮啊\n[回复] 小杰你真会夸人呀！', '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！']) {
+    p.handlers.get('queue-caption')({ payload: { live_id: '123', content } });
+    assert.equal(caption(p).props.className, 'obs-caption');
+    assert.equal(caption(p).props.children, content);
+  }
+  p.handlers.get('queue-caption')({ payload: { live_id: 'old', content: '过期回答' } });
+  assert.equal(caption(p).props.children, '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！');
+  p.handlers.get('queue-caption')({ payload: { live_id: '123', content: '' } });
+  assert.equal(caption(p), '');
+});
+
+test('queue captions clear on microphone takeover, disconnect and session end', async () => {
+  const p = await player();
+  const show = () => p.handlers.get('queue-caption')({ payload: { live_id: '123', content: '谢谢礼物' } });
+  show();
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(caption(p), '');
+  show();
+  assert.equal(caption(p), '');
+  p.handlers.get('mic-control')({ payload: { enabled: false, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  show();
+  p.handlers.get('vidu-disconnected')({ payload: { live_id: '123' } });
+  assert.equal(caption(p), '');
+  show();
+  p.handlers.get('session-ended')({ payload: {} });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(caption(p), '');
+  show();
+  assert.equal(caption(p), '');
+});
+
+test('OBS displays server microphone transcription as 我：内容 and replaces it with the latest phrase', async () => {
+  const p = await player();
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  p.handlers.get('vidu-signal')({ payload: { type: 9, live_id: '123', payload: { text_msg: { content: ' 你好，数字人。 ' } } } });
+  assert.equal(caption(p).props.className, 'obs-caption');
+  assert.equal(caption(p).props.children, '我：你好，数字人。');
+  p.handlers.get('vidu-signal')({ payload: { type: 9, live_id: '123', payload: { text_msg: { content: '第二句话' } } } });
+  assert.equal(caption(p).props.children, '我：第二句话');
+});
+
+test('OBS ignores avatar replies, foreign sessions, empty results, and results while the microphone is off', async () => {
+  const p = await player();
+  const signal = { type: 9, live_id: '123', payload: { text_msg: { content: '你好' } } };
+  p.handlers.get('vidu-signal')({ payload: signal });
+  assert.equal(caption(p), '');
+  p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  for (const payload of [{ ...signal, type: 10 }, { ...signal, live_id: 'old' }, { ...signal, payload: { text_msg: { content: ' ' } } }]) {
+    p.handlers.get('vidu-signal')({ payload });
+    assert.equal(caption(p), '');
+  }
+});
+
+test('OBS clears microphone subtitles when the microphone is closed or the session ends', async () => {
+  const p = await player();
+  for (const endSession of [false, true]) {
+    p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
+    await new Promise(resolve => setImmediate(resolve));
+    p.handlers.get('vidu-signal')({ payload: { type: 9, live_id: '123', payload: { text_msg: { content: '你好' } } } });
+    assert.ok(caption(p));
+    if (endSession) p.handlers.get('session-ended')({ payload: {} });
+    else p.handlers.get('mic-control')({ payload: { enabled: false, live_id: '123' } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(caption(p), '');
+  }
 });
