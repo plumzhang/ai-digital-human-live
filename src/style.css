@@ -23,7 +23,52 @@
 .voice-notice.error{background:#43262e;border:1px solid #a65360;color:#ffd0d4}
 .voice-notice.success{background:#173c33;border:1px solid #2d9b78;color:#b9f3dc}
 .voice-notice button{padding:6px 10px;font-size:11px;flex:none}
+.voice-sample-label{margin-top:20px}
+.voice-item{display:inline-flex;align-items:stretch;gap:5px}
+.voice-item button{font-size:12px;padding:8px 10px}
+.voice-preview-player{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;padding:12px;border:1px solid #31445f;border-radius:10px;background:#142236;color:#c5d7ec;font-size:12px}
+.voice-preview-player audio{min-width:260px;max-width:100%;height:36px;flex:1}
 @media(max-width:1100px){.settings-layout{grid-template-columns:1fr}.settings-layout .settings-preview{position:static}}
 @media(max-width:760px){.settings-layout .settings-form .form-grid{grid-template-columns:1fr}.avatar-preview-stage{min-height:260px;height:40vh}}
 .brand{padding-bottom:24px}
 .topbar h1,.section-title h2{margin-top:0}
+.credits-panel{border:1px solid #31445f;border-radius:10px;background:#142236;padding:14px}
+.credits-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px}
+.credits-heading button{padding:6px 10px;font-size:11px}
+.credits-total{font-size:27px;font-weight:700;margin-top:8px;color:#d9e7ff}
+.credits-total small{font-size:12px;color:#92a6c0;font-weight:400}
+.advanced-config summary{cursor:pointer}
+.advanced-config{margin-top:22px;border:1px solid #31445f;border-radius:10px;padding:15px}
+.advanced-config>summary{font-size:14px;font-weight:700;color:#dce8f7}
+.advanced-actions{display:flex;justify-content:flex-end;margin-top:10px}
+.advanced-actions button{font-size:11px;padding:6px 9px}
+.advanced-grid{margin-top:20px}
+.advanced-checkbox{flex-direction:row;align-items:center;gap:10px}
+.advanced-checkbox input{width:16px;height:16px;flex:none}
+.sidebar-bottom{display:block;padding:16px 4px 2px}
+.sidebar-status{display:flex;align-items:center;gap:8px;padding:0 8px}
+.sidebar-bottom .credits-panel{margin-top:16px;padding:11px;overflow-wrap:anywhere}
+.sidebar-bottom .credits-heading{font-size:12px}
+.sidebar-bottom .credits-total{font-size:23px}
+.credits-total-button{display:block;width:100%;margin-top:8px;padding:0;border:0;background:transparent;text-align:left;color:#d9e7ff;font-size:23px;font-weight:700}
+.credits-total-button:hover:not(:disabled){border:0;background:transparent;color:#fff}
+.credits-total-button small{font-size:12px;color:#92a6c0;font-weight:400}
+.credits-modal-backdrop{position:fixed;inset:0;z-index:1000;background:#050a13b8;display:flex;align-items:center;justify-content:center;padding:20px}
+.credits-modal{width:min(460px,100%);max-height:min(80vh,700px);overflow:auto;background:#111d2d;border:1px solid #405a7a;border-radius:14px;padding:22px;box-shadow:0 24px 70px #0009}
+.credits-modal-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.credits-modal-heading h2{margin:0;font-size:18px}
+.credits-modal-heading button{padding:6px 10px;font-size:12px}
+.credits-modal-section{margin-top:20px;border-top:1px solid #2a3b53;padding-top:12px}
+.credits-modal-section h3{font-size:13px;margin:0 0 8px;color:#adc4e0}
+.credits-modal-row{display:flex;justify-content:space-between;gap:16px;padding:9px 0;border-bottom:1px solid #223149;font-size:12px;line-height:1.5}
+.credits-modal-row strong{color:#e4eefb}
+.credits-modal-row span{text-align:right;color:#99abc3}
+@media(max-width:760px){.sidebar-bottom{display:block;margin-top:10px}.sidebar-bottom .credits-panel{max-width:320px}}
+.error-stack{position:fixed;top:16px;right:16px;z-index:2000;width:min(420px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow-y:auto;display:grid;align-content:start;gap:10px;pointer-events:none}
+.error-toast{pointer-events:auto;background:#3b2028;border:1px solid #ba6570;border-radius:11px;box-shadow:0 14px 40px #0008;padding:12px 14px;color:#ffe4e5;overflow-wrap:anywhere}
+.error-toast-heading{display:flex;align-items:center;gap:10px;font-size:12px}
+.error-toast-heading strong{flex:1}
+.error-toast-heading time{color:#e4adb3;font-size:10px}
+.error-toast-heading button{padding:0 5px;min-width:26px;height:26px;border:0;background:transparent;color:#ffe4e5;font-size:21px;line-height:1}
+.error-toast-heading button:hover:not(:disabled){border:0;background:#743b45}
+.error-toast p{margin:8px 0 0;font-size:12px;line-height:1.55;white-space:pre-wrap}
