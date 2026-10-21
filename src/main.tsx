@@ -3,4 +3,6 @@ import { ConsoleApp } from './ui/ConsoleApp';
 import { ObsWindow } from './ui/ObsWindow';
 import './style.css';
 
-createRoot(document.getElementById('root')!).render(new URLSearchParams(location.search).get('view') === 'obs' ? <ObsWindow /> : <ConsoleApp />);
+const isObs = new URLSearchParams(location.search).get('view') === 'obs';
+document.documentElement.classList.toggle('obs-page', isObs);
+createRoot(document.getElementById('root')!).render(isObs ? <ObsWindow /> : <ConsoleApp />);

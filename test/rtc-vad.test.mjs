@@ -46,6 +46,7 @@ test('analysis consumes remote PCM on a silent branch and releases analysis with
   const track = { kind: 'audio', readyState: 'live', muted: false, enabled: true, stop: () => { stopped = true; },
     addEventListener: (name, handler) => listeners.set(name, handler), removeEventListener: name => listeners.delete(name) };
   const states = [];
+  const pcmFrames = [];
   const graph = [];
   let now = 100;
   const processorContext = { currentTime: 0, sampleRate: 48000,
@@ -62,17 +63,18 @@ test('analysis consumes remote PCM on a silent branch and releases analysis with
   }
   const { monitorDownlinkAudio } = load({
     AudioContext: FakeContext,
-    AudioWorkletNode: class { constructor() { workletNode = this; this.port = { close() {} }; } connect() {} disconnect() {} },
+    AudioWorkletNode: class { constructor(_context, _name, options) { workletNode = this; this.options = options; this.port = { close() {} }; } connect() {} disconnect() {} },
     MediaStream: class { constructor(tracks) { this.tracks = tracks; } },
     Blob: class { constructor(parts) { processorSource = parts.join(''); } },
     URL: { createObjectURL: () => 'blob:meter', revokeObjectURL() {} },
     performance: { now: () => now },
   });
   let receiving = true;
-  const monitor = await monitorDownlinkAudio(track, () => receiving, state => states.push(state), assert.fail);
+  const monitor = await monitorDownlinkAudio(track, () => receiving, state => states.push(state), assert.fail,
+    (samples, sampleRate, quietMs) => pcmFrames.push({ samples, sampleRate, quietMs }));
   assert.equal(context.gain.gain.value, 0);
   assert.equal(graph.length, 1);
-  const meter = new meterClass();
+  const meter = new meterClass(workletNode.options);
   let phase = 0;
   const feed = (amplitude, blocks) => {
     for (let b = 0; b < blocks; b++) {
@@ -83,9 +85,14 @@ test('analysis consumes remote PCM on a silent branch and releases analysis with
   };
   feed(0.05, 60);
   assert.ok(states.some(state => state.speaking));
+  assert.ok(pcmFrames.length > 0);
+  assert.equal(pcmFrames[0].sampleRate, 48000);
+  assert.ok(pcmFrames[0].samples.length >= 960);
   feed(0, 360);
   assert.equal(states.filter(state => state.ended).length, 1);
+  const capturedFrames = pcmFrames.length;
   receiving = false; feed(0, 50);
+  assert.equal(pcmFrames.length, capturedFrames);
   assert.equal(states.at(-1).healthy, false);
   listeners.get('mute')();
   monitor.dispose();

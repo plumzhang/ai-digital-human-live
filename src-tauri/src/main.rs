@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod model_api;
+mod obs_window;
 mod queue_store;
+mod signal_trace;
+mod whisper;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -92,6 +95,8 @@ struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String }
 
 #[derive(Deserialize)]
 struct AvatarSettings {
+    #[serde(default)]
+    model: Option<String>,
     image_uri: String,
     persona: String,
     voice: String,
@@ -149,10 +154,11 @@ fn session_signal(text: &str, live_id: &str) -> Option<Value> {
     Some(signal)
 }
 
-fn playback_expired(started_seconds: u64, ready_seconds: Option<u64>, frame_age_ms: u128) -> bool {
-    match ready_seconds {
-        Some(seconds) => seconds >= 30 && frame_age_ms >= 30_000,
-        None => started_seconds >= 90,
+fn avatar_model(model: Option<&str>) -> Result<&'static str, String> {
+    match model {
+        None | Some("vidu-s2") => Ok("vidu-s2"),
+        Some("vidu-s1") => Ok("vidu-s1"),
+        _ => Err("数字人模型无效，请选择 vidu-s2 或 vidu-s1".into()),
     }
 }
 
@@ -161,6 +167,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let _creation_guard = CreateSessionGuard::acquire(&state.creating_session)?;
     if state.session.lock().map_err(|e| e.to_string())?.is_some() { return Err("已有运行中的 Vidu 会话，请先结束".into()); }
     let key = normalized_key(&key)?;
+    let model = avatar_model(avatar.model.as_deref())?;
     if avatar.image_uri.trim().is_empty() || avatar.persona.trim().is_empty() { return Err("请填写形象图片和人设".into()); }
     if avatar.greeting_instruction.chars().count() > 200 { return Err("开场白指令不能超过 200 字".into()); }
     if avatar.voice_provider != "qwen_omni" && avatar.voice_provider != "doubao" { return Err("音色供应商无效，请在形象与配置中重新选择".into()); }
@@ -181,7 +188,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
         json!({"provider":"qwen_omni","qwen":{"voice":avatar.voice}})
     };
     let body = json!({
-        "model": "vidu-s2",
+        "model": model,
         "call_mode": "video",
         "rtc": {"provider": "artc"},
         "character_id": "1",
@@ -223,40 +230,23 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let app_for_task = app.clone();
     let task_live_id = live_id.clone();
     tauri::async_runtime::spawn(async move {
+        signal_trace::record(&app_for_task, &task_live_id, "connected", &json!({}));
         let mut retries = 0_u64;
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(10), std::time::Duration::from_secs(10));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut forced = false;
-        let mut ready_at = None;
-        let started_at = tokio::time::Instant::now();
-        let mut playback_check = tokio::time::interval(std::time::Duration::from_secs(3));
         loop {
             tokio::select! {
-                _ = playback_check.tick() => {
-                    let last_frame = app_for_task.state::<AppState>().session.lock().ok()
-                        .and_then(|guard| guard.as_ref().filter(|s| s.live_id == task_live_id).map(|s| s.last_video_frame_ms));
-                    let Some(last_frame) = last_frame else { break; };
-                    if playback_expired(started_at.elapsed().as_secs(), ready_at.map(|at: tokio::time::Instant| at.elapsed().as_secs()), unix_ms().saturating_sub(last_frame)) {
-                        let _ = app_for_task.emit("playback-failed", json!({"live_id": task_live_id, "error": if ready_at.is_some() { "30 秒未收到可播放的视频画面，正在自动挂断以避免持续计费" } else { "90 秒内初始化未完成，正在自动挂断" }}));
-                        let cleanup_app = app_for_task.clone();
-                        let cleanup_id = task_live_id.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(error) = end_session(cleanup_app.clone(), cleanup_app.state::<AppState>(), Some(cleanup_id)).await {
-                                let _ = cleanup_app.emit("session-cleanup-error", error);
-                            }
-                        });
-                        // Keep the socket alive so end_session can send and confirm the hangup.
-                        playback_check = tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30), std::time::Duration::from_secs(30));
-                    }
-                }
                 _ = heartbeat.tick() => {
                     if writer.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
                 }
                 outgoing = receiver.recv() => {
                     match outgoing {
                         Some(outbound) => {
+                            let metadata = match &outbound.message { Message::Text(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null), _ => Value::Null };
                             let result = writer.send(outbound.message).await.map_err(|e| e.to_string());
                             let failed = result.is_err();
+                            signal_trace::record(&app_for_task, &task_live_id, if failed { "write_failed" } else { "written" }, &metadata);
                             if let Some(written) = outbound.written { let _ = written.send(result); }
                             if failed { break; }
                         }
@@ -267,9 +257,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                     match incoming {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(value) = session_signal(&text, &task_live_id) {
-                                if value.pointer("/payload/conn_init_ack/success").and_then(Value::as_bool) == Some(true) && ready_at.is_none() {
-                                    ready_at = Some(tokio::time::Instant::now());
-                                }
+                                if matches!(value["type"].as_u64(), Some(2 | 6 | 103)) { signal_trace::record(&app_for_task, &task_live_id, "received", &value); }
                                 if value.get("type").and_then(Value::as_u64) == Some(6) { forced = true; }
                                 if value.get("type").and_then(Value::as_u64) == Some(2)
                                     && value.pointer("/payload/conn_init_ack/error_code").and_then(Value::as_str) == Some("NOT_READY")
@@ -290,11 +278,12 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                 }
             }
         }
+        signal_trace::record(&app_for_task, &task_live_id, if forced { "forced_closed" } else { "socket_closed" }, &json!({}));
         if forced {
             if let Ok(mut guard) = app_for_task.state::<AppState>().session.lock() {
                 if guard.as_ref().is_some_and(|session| session.live_id == task_live_id) { guard.take(); }
             }
-            let _ = app_for_task.emit("session-ended", ());
+            let _ = app_for_task.emit("session-ended", json!({"live_id":task_live_id}));
         }
         let _ = writer.close().await;
         let _ = app_for_task.emit("vidu-disconnected", json!({"live_id":task_live_id,"forced":forced}));
@@ -314,13 +303,14 @@ fn send_signal(session: &mut Session, kind: u64, payload: Value) -> Result<(), S
 }
 
 #[tauri::command]
-fn speak_text(state: State<'_, AppState>, live_id: String, content: String) -> Result<(), String> {
+fn speak_text(state: State<'_, AppState>, live_id: String, content: String, task_id: Option<String>) -> Result<(), String> {
     let content = content.trim();
     if content.is_empty() { return Err("播报文本不能为空".into()); }
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次播报")?;
     if session.voice_provider != "doubao" { return Err("指定台词播报需要豆包音色供应商，请结束会话后改为豆包再创建数字人".into()); }
-    send_signal(session, 100, json!({"text_tts":{"msg_id":uuid::Uuid::new_v4().to_string(),"content":content}}))
+    let msg_id = task_id.filter(|id| !id.trim().is_empty()).map(|id| format!("tts-{id}")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    send_signal(session, 100, json!({"text_tts":{"msg_id":msg_id,"content":content}}))
 }
 
 fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
@@ -335,10 +325,41 @@ fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn send_avatar_action(state: State<'_, AppState>, live_id: String, task_id: String, gesture: String) -> Result<(), String> {
-    let payload = gift_action_payload(&task_id, &gesture)?;
+fn send_avatar_action(state: State<'_, AppState>, live_id: String, task_id: String, gesture: Option<String>, instruction: Option<String>) -> Result<(), String> {
+    let payload = avatar_action_payload(&task_id, gesture.as_deref(), instruction.as_deref())?;
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次动作")?;
+    send_signal(session, 101, payload)
+}
+
+fn avatar_action_payload(task_id: &str, gesture: Option<&str>, instruction: Option<&str>) -> Result<Value, String> {
+    if let Some(instruction) = instruction {
+        let instruction = instruction.trim();
+        if task_id.trim().is_empty() { return Err("动作缺少互动任务 ID".into()); }
+        if instruction.is_empty() || instruction.chars().count() > 300 || instruction.chars().any(char::is_control) {
+            return Err("动作描述需为1–300字且不能包含控制字符".into());
+        }
+        return Ok(json!({"text_action":{"msg_id":format!("avatar-action-{task_id}"),"content":format!("{instruction} 动作自然连贯，完成后回到面对镜头的自然姿态。只做动作，不要说话。")}}));
+    }
+    gift_action_payload(task_id, gesture.unwrap_or("none"))
+}
+
+fn handoff_action_payload(task_id: &str, direction: &str, angle_deg: u16) -> Result<Value, String> {
+    if task_id.trim().is_empty() { return Err("承接动作缺少互动任务 ID".into()); }
+    if angle_deg > 90 { return Err("承接动作查看角度需为0–90度".into()); }
+    let content = match direction {
+        "left_down" => format!("头部与视线朝向左下角，向左下方斜向下{angle_deg}度查看，像在查看左下方手机上的新消息。动作自然流畅，保持放松，随后自然抬眼看向镜头。只做动作，不要说话。"),
+        "right_down" => format!("头部与视线朝向右下角，向右下方斜向下{angle_deg}度查看，像在查看右下方手机上的新消息。动作自然流畅，保持放松，随后自然抬眼看向镜头。只做动作，不要说话。"),
+        _ => return Err("未知的承接动作方向".into()),
+    };
+    Ok(json!({"text_action":{"msg_id":format!("handoff-{task_id}"),"content":content}}))
+}
+
+#[tauri::command]
+fn send_handoff_action(state: State<'_, AppState>, live_id: String, task_id: String, direction: String, angle_deg: Option<u16>) -> Result<(), String> {
+    let payload = handoff_action_payload(&task_id, &direction, angle_deg.unwrap_or(45))?;
+    let mut guard = state.session.lock().map_err(|error| error.to_string())?;
+    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消承接动作")?;
     send_signal(session, 101, payload)
 }
 
@@ -436,9 +457,13 @@ async fn open_obs_window(app: tauri::AppHandle) -> Result<(), String> {
     // WebView2 window creation deadlocks inside synchronous Windows commands.
     // Keep this command async so construction runs outside the UI event callback.
     if let Some(window) = app.get_webview_window("obs") { window.set_focus().map_err(|e| e.to_string())?; return Ok(()); }
-    WebviewWindowBuilder::new(&app, "obs", WebviewUrl::App("index.html?view=obs".into()))
-        .title("数字人画面 · OBS 窗口").inner_size(1080.0, 1920.0).min_inner_size(360.0, 640.0)
+    let window = WebviewWindowBuilder::new(&app, "obs", WebviewUrl::App("index.html?view=obs".into()))
+        .title("数字人画面 · OBS 窗口").inner_size(360.0, 640.0)
+        .visible(false).resizable(false).maximizable(false)
         .build().map_err(|e| e.to_string())?;
+    obs_window::resize_to_video(&window, 9, 16)?;
+    window.center().map_err(|e| e.to_string())?;
+    window.show().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -622,12 +647,42 @@ async fn preview_voice(key: String, region: String, voice_id: String, text: Stri
     Err("Vidu 试听生成超时，请稍后重试".into())
 }
 
+fn voice_document_url(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "ali" => Ok("https://platform.vidu.cn/vidu-stream/doc/voice-list?provider=ali"),
+        "doubao3" => Ok("https://platform.vidu.cn/vidu-stream/doc/voice-list?provider=doubao3"),
+        _ => Err("未知的官方音色列表".into()),
+    }
+}
+
+#[tauri::command]
+fn open_voice_document(provider: String) -> Result<(), String> {
+    let url = voice_document_url(&provider)?;
+    #[cfg(windows)] {
+        use std::{ffi::c_void, ptr};
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(window: *mut c_void, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> *mut c_void;
+        }
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let result = unsafe { ShellExecuteW(ptr::null_mut(), operation.as_ptr(), file.as_ptr(), ptr::null(), ptr::null(), 1) } as isize;
+        if result <= 32 { return Err(format!("无法打开系统默认浏览器（错误码 {result}）")); }
+        Ok(())
+    }
+    #[cfg(not(windows))] {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener).arg(url).spawn().map(|_| ()).map_err(|error| format!("无法打开系统默认浏览器：{error}"))
+    }
+}
+
 fn main() {
     #[cfg(windows)]
     let Some(_instance_guard) = single_instance::Guard::acquire() else { return; };
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(queue_store::QueueStorage::default())
+        .manage(whisper::WhisperRuntime::default())
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -656,7 +711,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, end_session, session_snapshot, playback_frame, live_status, open_obs_window, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config])
+        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, whisper::whisper_prepare, whisper::whisper_transcribe])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }
@@ -678,22 +733,43 @@ mod tests {
     }
 
     #[test]
-    fn playback_guard_allows_warmup_and_requires_recent_frames_after_ready() {
-        assert!(!playback_expired(89, None, 89_000));
-        assert!(playback_expired(90, None, 90_000));
-        assert!(!playback_expired(100, Some(29), 100_000));
-        assert!(playback_expired(100, Some(30), 30_000));
-        assert!(!playback_expired(7200, Some(7100), 1000));
-        assert!(playback_expired(7200, Some(7100), 30_000));
-    }
-
-    #[test]
     fn only_one_create_request_can_hold_the_guard() {
         let flag = AtomicBool::new(false);
         let first = CreateSessionGuard::acquire(&flag).unwrap();
         assert!(CreateSessionGuard::acquire(&flag).is_err());
         drop(first);
         assert!(CreateSessionGuard::acquire(&flag).is_ok());
+    }
+
+    #[test]
+    fn avatar_model_honors_selection_and_defaults_older_clients_to_s2() {
+        assert_eq!(avatar_model(None).unwrap(), "vidu-s2");
+        assert_eq!(avatar_model(Some("vidu-s1")).unwrap(), "vidu-s1");
+        assert_eq!(avatar_model(Some("vidu-s2")).unwrap(), "vidu-s2");
+        assert!(avatar_model(Some("")).is_err());
+        assert!(avatar_model(Some("other-model")).is_err());
+    }
+
+    #[test]
+    fn voice_document_links_only_open_the_two_official_catalogs() {
+        assert_eq!(voice_document_url("ali").unwrap(), "https://platform.vidu.cn/vidu-stream/doc/voice-list?provider=ali");
+        assert_eq!(voice_document_url("doubao3").unwrap(), "https://platform.vidu.cn/vidu-stream/doc/voice-list?provider=doubao3");
+        assert!(voice_document_url("https://example.com").is_err());
+    }
+
+    #[test]
+    fn chat_visual_actions_use_separate_signals_and_validate_descriptions() {
+        let payload = avatar_action_payload("chat-1", None, Some("双手在脑后扎起马尾")).unwrap();
+        assert_eq!(payload["text_action"]["msg_id"], "avatar-action-chat-1");
+        let content = payload["text_action"]["content"].as_str().unwrap();
+        assert!(content.contains("双手在脑后扎起马尾"));
+        assert!(content.contains("只做动作，不要说话"));
+        assert!(payload.get("text_tts").is_none());
+        assert!(avatar_action_payload("", None, Some("挥手")).is_err());
+        assert!(avatar_action_payload("chat-1", None, Some(" ")).is_err());
+        assert!(avatar_action_payload("chat-1", None, Some("挥手\n说话")).is_err());
+        assert!(avatar_action_payload("chat-1", None, Some(&"动".repeat(301))).is_err());
+        assert_eq!(avatar_action_payload("gift-1", Some("heart"), None).unwrap(), gift_action_payload("gift-1", "heart").unwrap());
     }
 
     #[test]
@@ -706,5 +782,21 @@ mod tests {
         }
         assert!(gift_action_payload("task-1", "untrusted_action").is_err());
         assert!(gift_action_payload("", "heart").is_err());
+    }
+
+    #[test]
+    fn handoff_actions_use_the_requested_direction_without_speech_or_arbitrary_commands() {
+        for (direction, expected) in [("left_down", "左下"), ("right_down", "右下")] {
+            for angle in [0, 30, 45, 90] {
+                let payload = handoff_action_payload("task-1", direction, angle).unwrap();
+                assert_eq!(payload["text_action"]["msg_id"], "handoff-task-1");
+                let text = payload["text_action"]["content"].as_str().unwrap();
+                assert!(text.contains(expected)); assert!(text.contains(&format!("斜向下{angle}度"))); assert!(text.contains("不要说话"));
+                assert!(payload.get("text_tts").is_none());
+            }
+        }
+        assert!(handoff_action_payload("task-1", "left_down", 91).is_err());
+        assert!(handoff_action_payload("task-1", "arbitrary-command", 45).is_err());
+        assert!(handoff_action_payload("", "left_down", 45).is_err());
     }
 }

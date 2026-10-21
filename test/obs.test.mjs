@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import ts from 'typescript';
+import * as pinyinPro from 'pinyin-pro';
+
+const recognitionExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: recognitionExports, require: name => { assert.equal(name, 'pinyin-pro'); return pinyinPro; } });
 
 async function player(options = {}) {
   const handlers = new Map();
@@ -36,14 +40,19 @@ async function player(options = {}) {
       },
     },
     'react/jsx-runtime': { jsx: (tag, props) => ({ tag, props }), jsxs: (tag, props) => ({ tag, props }) },
-    '@tauri-apps/api/core': { invoke: async (name, args) => { calls.push([name, args]); return name === 'session_snapshot' ? snapshot : undefined; } },
+    '@tauri-apps/api/core': { invoke: async (name, args) => {
+      calls.push([name, args]);
+      if (name === 'whisper_transcribe' && options.transcribe) return options.transcribe(args.request);
+      return name === 'session_snapshot' ? snapshot : undefined;
+    } },
     '@tauri-apps/api/event': {
       emit: async (name, payload) => calls.push([name, payload]),
       listen: async (name, fn) => { handlers.set(name, fn); return () => handlers.delete(name); },
     },
     'aliyun-rtc-sdk': { default: { getInstance: () => { if (options.engineError) throw new Error(options.engineError); return rtc; } }, AliRtcSdkChannelProfile: { AliRtcSdkCommunication: 0 } },
-    '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed) => {
-      const monitor = { track, receiving, activity, failed, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
+    '../whisperRecognition': recognitionExports,
+    '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
+      const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
       return monitor;
     } },
@@ -87,6 +96,28 @@ test('OBS monitors only subscribed downlink audio and emits VAD events with tran
   assert.equal(p.calls.length, before);
 });
 
+test('OBS binds Whisper PCM and recognition results to the current task and ignores another live', async () => {
+  const p = await player({ transcribe: async request => ({ ...request, segments: [{ text: '大家晚上好', start_ms: 0, end_ms: 1000 }], inference_ms: 25 }) });
+  p.rtcHandlers.get('audioSubscribeStateChanged')('avatar', 2, 3);
+  await new Promise(resolve => setImmediate(resolve));
+  p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid: 'avatar', stats: { bytesReceived: 1000 } }]);
+  const target = { live_id: '123', task_id: 'task', capture_id: 'attempt', enabled: true };
+  p.handlers.get('whisper-task')({ payload: { ...target, live_id: 'other-live' } });
+  for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
+  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length, 0);
+  p.handlers.get('whisper-task')({ payload: target });
+  for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
+  await new Promise(resolve => setImmediate(resolve));
+  const result = p.calls.find(([name]) => name === 'whisper-recognition')[1];
+  assert.equal(result.task_id, 'task'); assert.equal(result.capture_id, 'attempt');
+  assert.equal(result.text, '大家晚上好');
+  p.handlers.get('session-ended')({ payload: { live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  const count = p.calls.filter(([name]) => name === 'whisper_transcribe').length;
+  for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
+  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length, count);
+});
+
 test('ending a session closes the PCM observer and ignores late VAD results', async () => {
   const p = await player();
   p.rtcHandlers.get('audioSubscribeStateChanged')('avatar', 2, 3);
@@ -106,6 +137,19 @@ test('OBS deduplicates session event and startup snapshot without rejoining', as
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(p.calls.filter(([name]) => name === 'joinChannel').length, 1);
   assert.equal(p.calls.filter(([name]) => name === 'destroy').length, 0);
+});
+
+test('a delayed end from the old live cannot tear down the recovered RTC session', async () => {
+  const p = await player();
+  p.handlers.get('session-changed')({ payload: { ...p.snapshot, live_id: 'recovered-live' } });
+  await new Promise(resolve => setImmediate(resolve));
+  const before = p.calls.filter(([name]) => name === 'destroy').length;
+  p.handlers.get('session-ended')({ payload: { live_id: '123' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name]) => name === 'destroy').length, before);
+  p.handlers.get('session-ended')({ payload: { live_id: 'recovered-live' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name]) => name === 'destroy').length, before + 1);
 });
 
 test('subscription alone does not report frames; advancing video reports a frame for the active live', async () => {
@@ -218,6 +262,28 @@ test('queue chat and gift speech use the same centered overlay as microphone cap
   assert.equal(caption(p).props.children, '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！');
   p.handlers.get('queue-caption')({ payload: { live_id: '123', content: '' } });
   assert.equal(caption(p), '');
+});
+
+test('OBS fits its native window to decoded video dimensions and updates when the stream resolution changes', async () => {
+  const p = await player();
+  const videoProps = p.tree.props.children[0].props;
+  p.video.videoWidth = 0;
+  videoProps.onLoadedMetadata();
+  assert.equal(p.calls.filter(([name]) => name === 'fit_obs_video').length, 0);
+  Object.assign(p.video, { videoWidth: 872, videoHeight: 1192, clientWidth: 580, clientHeight: 793 });
+  videoProps.onLoadedMetadata();
+  videoProps.onResize();
+  videoProps.onTimeUpdate({ currentTarget: p.video });
+  let fits = p.calls.filter(([name]) => name === 'fit_obs_video');
+  assert.equal(fits.length, 1);
+  assert.equal(fits[0][1].videoWidth, 872);
+  assert.equal(fits[0][1].videoHeight, 1192);
+  Object.assign(p.video, { videoWidth: 1920, videoHeight: 1080 });
+  videoProps.onResize();
+  fits = p.calls.filter(([name]) => name === 'fit_obs_video');
+  assert.equal(fits.length, 2);
+  assert.equal(fits[1][1].videoWidth, 1920);
+  assert.equal(fits[1][1].videoHeight, 1080);
 });
 
 test('queue captions clear on microphone takeover, disconnect and session end', async () => {

@@ -1,4 +1,4 @@
-export type VadActivity = { speaking: boolean; ended: boolean; healthy: boolean };
+export type VadActivity = { speaking: boolean; ended: boolean; healthy: boolean; quiet_ms?: number };
 
 // Energy VAD for the clean, synthesized RTC downlink. Hysteresis prevents quiet
 // syllables from flickering; onset rejects clicks; hangover bridges word pauses.
@@ -24,13 +24,13 @@ export class DownlinkVad {
       if (!this.voiced) this.noise = this.noise * 0.98 + Math.min(rms, 0.003) * 0.02;
       if (this.voiced && this.silence >= 900) { this.voiced = false; ended = true; }
     }
-    return { speaking: this.voiced, ended, healthy: true };
+    return { speaking: this.voiced, ended, healthy: true, quiet_ms: this.silence };
   }
 }
 
 const processorCode = `
 class DownlinkMeter extends AudioWorkletProcessor {
-  constructor() { super(); this.sum = 0; this.sumSquares = 0; this.samples = 0; }
+  constructor(options = {}) { super(); this.sum = 0; this.sumSquares = 0; this.samples = 0; this.pcm = []; this.capturePcm = !!options.processorOptions?.capturePcm; }
   process(inputs) {
     const channels = inputs[0];
     if (!channels || !channels.length || !channels[0].length) return true;
@@ -38,11 +38,14 @@ class DownlinkMeter extends AudioWorkletProcessor {
       let value = 0;
       for (const channel of channels) value += channel[i] || 0;
       value /= channels.length;
+      if (this.capturePcm) this.pcm.push(value);
       this.sum += value; this.sumSquares += value * value; this.samples++;
     }
     if (this.samples >= sampleRate * 0.02) {
       const mean = this.sum / this.samples;
-      this.port.postMessage({ rms: Math.sqrt(Math.max(0, this.sumSquares / this.samples - mean * mean)), durationMs: this.samples / sampleRate * 1000, audioTime: currentTime });
+      const pcm = this.capturePcm ? new Float32Array(this.pcm) : undefined;
+      this.port.postMessage({ rms: Math.sqrt(Math.max(0, this.sumSquares / this.samples - mean * mean)), durationMs: this.samples / sampleRate * 1000, audioTime: currentTime, pcm, sampleRate }, pcm ? [pcm.buffer] : []);
+      this.pcm = [];
       this.sum = 0; this.sumSquares = 0; this.samples = 0;
     }
     return true;
@@ -57,6 +60,7 @@ export async function monitorDownlinkAudio(
   receiving: () => boolean,
   activity: (state: VadActivity) => void,
   failed: (message: string) => void,
+  pcm?: (samples: Float32Array, sampleRate: number, quietMs: number) => void,
 ): Promise<DownlinkMonitor> {
   const context = new AudioContext();
   const url = URL.createObjectURL(new Blob([processorCode], { type: 'text/javascript' }));
@@ -91,7 +95,7 @@ export async function monitorDownlinkAudio(
   try {
     await context.audioWorklet.addModule(url);
     source = context.createMediaStreamSource(new MediaStream([track]));
-    processor = new AudioWorkletNode(context, 'downlink-meter');
+    processor = new AudioWorkletNode(context, 'downlink-meter', { processorOptions: { capturePcm: !!pcm } });
     gain = context.createGain(); gain.gain.value = 0;
     source.connect(processor); processor.connect(gain); gain.connect(context.destination);
     processor.port.onmessage = event => {
@@ -100,6 +104,7 @@ export async function monitorDownlinkAudio(
         unavailable(); return;
       }
       const state = vad.frame(event.data.rms, event.data.durationMs);
+      if (state.healthy && pcm && ArrayBuffer.isView(event.data.pcm)) pcm(event.data.pcm, event.data.sampleRate, state.quiet_ms ?? 0);
       const now = performance.now();
       if (state.ended || !previousHealthy || state.speaking !== previousSpeaking || now - lastReport >= 100) {
         lastReport = now; previousSpeaking = state.speaking; previousHealthy = state.healthy; activity(state);

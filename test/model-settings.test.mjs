@@ -165,3 +165,15 @@ test('fixed persona defaults to 晚晚 and is saved with the selected model', as
   nodes(tree).find(node => node.tag === 'button' && node.props.children?.includes(' 保存配置')).props.onClick();
   assert.equal(JSON.parse(p.storage.get('openai-model-config')).persona, '你是晚晚，只输出要说的话。');
 });
+
+test('the unchanged legacy default gains actions while custom personas are preserved', () => {
+  const initial = mount(async () => [], config);
+  const current = nodes(initial.render()).find(node => node.tag === 'textarea').props.value;
+  assert.ok(current.includes('边说边做'));
+  const legacy = current.replace(/8\. 台词与动作配合：[\s\S]*$/, '8. 只输出要说的话，不输出动作或解释。');
+  const migrated = mount(async () => [], { ...config, persona: legacy });
+  assert.equal(nodes(migrated.render()).find(node => node.tag === 'textarea').props.value, current);
+  const custom = '你是晚晚，请按我的自定义风格互动。';
+  const retained = mount(async () => [], { ...config, persona: custom });
+  assert.equal(nodes(retained.render()).find(node => node.tag === 'textarea').props.value, custom);
+});

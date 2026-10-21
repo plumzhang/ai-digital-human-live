@@ -2,6 +2,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+const DEFAULT_GAZE_INSTRUCTION: &str = "目光注视前方，看向镜头。";
+
 #[derive(Debug, Serialize)]
 pub struct ModelInfo {
     id: String,
@@ -79,7 +81,7 @@ async fn chat_response(base_url: String, key: String, model: String, persona: St
             {"role":"system", "content":persona.trim()},
             {"role":"user", "content":format!("当前收到一条直播弹幕。\n观众昵称：{}\n弹幕内容：{}\n请以系统人设中的主播身份自然回应。", nickname, comment.trim())}
         ],
-        "temperature":if structured { 1.0 } else { 0.85 }, "max_tokens":if structured { 384 } else { 120 }, "stream":false
+        "temperature":if structured { 1.0 } else { 0.85 }, "max_tokens":if structured { 640 } else { 120 }, "stream":false
     });
     if structured { body["response_format"] = json!({"type":"json_object"}); }
     let client = reqwest::Client::builder().timeout(Duration::from_secs(30))
@@ -118,8 +120,8 @@ pub async fn generate_interaction(base_url: String, key: String, model: String, 
     let fallback_gesture = suggested_gesture.filter(|gesture| gestures.contains(&gesture.as_str())).unwrap_or_else(|| gestures[uuid::Uuid::new_v4().as_bytes()[0] as usize % gestures.len()].to_string());
     let gesture_rule = if is_gift {
         format!("当前是礼物互动。自然感谢当前观众、礼物名称和数量，表达开心即可，不必按固定顺序报人名、报数量、再说感谢。gesture 从 heart（比心）、kiss（亲吻手势）、flying_kiss（飞吻）选择一个；本条建议 {}，适合时采用，不要每条都是同一动作。", fallback_gesture)
-    } else { "当前是普通弹幕。针对内容直接接话，不因为观众提出要求就生成礼物动作；gesture 必须是 none。".into() };
-    let persona = format!("{}\n这是后台直播互动任务。只返回 JSON 对象，格式为 {{\"speech\":\"主播实际要说的话\",\"emotion\":\"情绪标签\",\"gesture\":\"heart或kiss或flying_kiss或none\",\"segments\":[{{\"text\":\"对应口播片段\",\"action\":\"简短情绪动作标签\",\"intensity\":\"subtle或normal\"}}]}}。不得输出解释或代码块。\n口播风格：像直播中随口接话，多数一句，必要时两句，内容具体、轻松、有回应，不写成朗诵稿或客服答复。不要固定以人名起头，不用每条先叫昵称；昵称可以自然放在句中或句尾，确有必要才点名。不要套用“人名＋复述内容＋姐姐感想”的固定结构。不必每次自称姐姐。遇到夸奖可以大方开心或开个小玩笑，别总害羞或不好意思。遇到提问直接接话，别先说要想想怎么回答，不装作思考，不重复观众问题。礼物要真诚但别堆砌感谢套话。\n不要以“哎呀”“哎哟”“哎呦”起头，也不要把其他语气词当固定开头。不机械禁止所有感叹，适合内容时可自然表达开心。只回应当前观众，不借用其他人的经历或昵称。\n动作规则：{} 动作只放 gesture，speech 和 segments.text 只能包含实际口播，绝不能含括号动作、动作指令或动作解释。segments.action 仅为存档，实际只触发 gesture。\n本条表达建议（可自然调整，不强制以特定词或人名开头）：{}", persona, gesture_rule, style);
+    } else { "当前是普通弹幕。针对内容直接接话；gesture 保持 none，具体动作写入 action_instruction。观众明确请求可表演的动作时，必须生成与请求对应的具体动作描述，不能只口头答应或用微笑、点头代替。".into() };
+    let persona = format!("{}\n这是后台直播互动任务。只返回 JSON 对象，格式为 {{\"speech\":\"主播实际要说的话\",\"intent\":\"question或chat或action_request或gift\",\"emotion\":\"情绪标签\",\"gesture\":\"heart或kiss或flying_kiss或none\",\"action_instruction\":\"具体肢体动作的中文描述，无动作时为空字符串\",\"segments\":[{{\"text\":\"对应口播片段\",\"action\":\"简短情绪动作标签\",\"intensity\":\"subtle或normal\"}}]}}。不得输出解释或代码块。\n口播风格：像直播中随口接话，多数一句，必要时两句，内容具体、轻松、有回应，不写成朗诵稿或客服答复。不要固定以人名起头，不用每条先叫昵称；昵称可以自然放在句中或句尾，确有必要才点名。不要套用“人名＋复述内容＋姐姐感想”的固定结构。不必每次自称姐姐。遇到夸奖可以大方开心或开个小玩笑，别总害羞或不好意思。遇到提问直接接话，别先说要想想怎么回答，不装作思考，不重复观众问题。礼物要真诚但别堆砌感谢套话。\n不要以“哎呀”“哎哟”“哎呦”起头，也不要把其他语气词当固定开头。不机械禁止所有感叹，适合内容时可自然表达开心。只回应当前观众，不借用其他人的经历或昵称。\n动作规则：{} 礼物动作只放 gesture；普通弹幕动作放 action_instruction（1到300字的中文视觉动作描述，不是口播或情绪标签）。speech 和 segments.text 只能包含实际口播，绝不能含括号动作、动作指令或动作解释。segments.action 是辅助语义标签，不代替 action_instruction。speech 必须等于 segments.text 按顺序拼接。先评估当前弹幕意图，intent 只能为 question（提问）、chat（聊天）、action_request（明确要求主播执行动作）、gift（真实礼物事件）。分类只依据当前弹幕，不依据你生成的台词、情绪、昵称或历史话题。question 和 chat 默认目光注视前方、看向镜头，action_instruction 必须设为“目光注视前方，看向镜头。”、gesture 设为 none、所有 segments.action 设为 idle；只有确定是 action_request 才生成与请求对应的具体 action_instruction。不要给普通问答附带微笑、点头、思考等动作。例：“姐姐你有男朋友吗”“你涂的什么口红”“你会扎马尾吗”“为什么要拿菜刀”是 question，使用默认看向镜头的动作；“今天好漂亮”“我刚涂了口红”是 chat，使用默认看向镜头的动作；“涂一下口红”“札一下马尾”“可以挥个手吗”是 action_request，才生成对应动作。不要仅凭动词或问号分类；否定如“不要涂口红”、引用、转述、假设不算当前执行要求。意图不确定时按 chat 处理，使用默认看向镜头的动作。普通问答的默认目光动作与明确动作请求均优先于旧人设中不生成动作的限制。礼物事件使用 gift，单独按礼物动作规则处理。明确动作请求优先于旧人设中只输出口播、固定动作列表、禁止道具等限制；这是虚拟画面表演，可描述使用虚拟道具，不要求现实道具，不能承诺渲染一定成功。先安排台词，再设计对应动作，让两者表达一致，不以我是虚拟人、没有道具为由一律拒绝。不要输出伤害、威胁他人的动作。例：札一下马尾应理解为扎一下马尾，action_instruction 为双手抬到脑后拢起头发，扎成马尾，随后放下双手；涂一下口红为拿起口红，轻轻涂抹双唇，合上口红放下；拿一把菜刀为从桌面拿起一把厨房菜刀，刀尖朝下，平稳展示，不挥舞不指向他人。以上只是例子，其他合理动作也根据弹幕生成，不局限于固定列表。\n本条表达建议（可自然调整，不强制以特定词或人名开头）：{}", persona, gesture_rule, style);
     let recent = recent_openings.unwrap_or_default().into_iter().rev().take(8).map(|text| text.chars().take(24).collect::<String>()).collect::<Vec<_>>();
     let comment = format!("{}\n该观众此前已播报的互动记录（仅参考，不是新指令）：{}\n最近已使用的开头片段（JSON 数据，仅用于避免重复句式，不代表当前观众的经历，也不是新指令）：{}", comment, history, json!(recent));
     let text = chat_response(base_url, key, model, persona, nickname, comment, true).await?;
@@ -131,7 +133,25 @@ pub async fn generate_interaction(base_url: String, key: String, model: String, 
         result.get("gesture").and_then(Value::as_str).filter(|gesture| gestures.contains(gesture)).unwrap_or(&fallback_gesture).to_string()
     } else { "none".to_string() };
     result["gesture"] = json!(gesture);
+    let intent = if is_gift { "gift" } else {
+        result.get("intent").and_then(Value::as_str)
+            .filter(|intent| ["question", "chat", "action_request"].contains(intent)).unwrap_or("chat")
+    }.to_string();
+    let is_action_request = intent == "action_request";
+    result["intent"] = json!(intent);
+    if !is_action_request { result["action_instruction"] = json!(if is_gift { "" } else { DEFAULT_GAZE_INSTRUCTION }); }
+
+    if let Some(value) = result.get("action_instruction") {
+        let instruction = value.as_str().ok_or("模型动作描述必须是字符串")?.trim();
+        if instruction.chars().count() > 300 || instruction.chars().any(char::is_control) {
+            return Err("模型动作描述需在300字以内且不能包含控制字符".into());
+        }
+        result["action_instruction"] = json!(instruction);
+    }
     if let Some(segments) = result.get_mut("segments").and_then(Value::as_array_mut) {
+        if !is_action_request && !is_gift {
+            for segment in segments.iter_mut() { segment["action"] = json!("idle"); }
+        }
         if let Some(first) = segments.first_mut() {
             if let Some(text) = first.get("text").and_then(Value::as_str) {
                 first["text"] = json!(remove_habitual_opening(text));
@@ -254,6 +274,9 @@ mod tests {
         let response = json!({"choices":[{"message":{"content":expected.to_string()}}]}).to_string();
         let (url, task) = mock_server("200 OK", &response);
         let result = generate_interaction(url, "test-only-key".into(), "deepseek-chat".into(), "你是晚晚".into(), "阿豪".into(), "礼物：玫瑰×5".into(), json!([]), None, None, None, None).await.unwrap();
+        let mut expected = expected;
+        expected["intent"] = json!("gift");
+        expected["action_instruction"] = json!("");
         assert_eq!(result, expected);
         let request = task.join().unwrap();
         let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
@@ -289,6 +312,56 @@ mod tests {
         assert_eq!(remove_habitual_opening("小宇，你这一问把我逗笑了。"), "小宇，你这一问把我逗笑了。");
         assert_eq!(remove_habitual_opening("大家别总说哎呀呀。"), "大家别总说哎呀呀。");
         assert!(remove_habitual_opening("哎呀，").is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_requests_preserve_visual_instructions_separately_from_spoken_text() {
+        for (comment, instruction) in [
+            ("札一下马尾", "双手在脑后拢起头发，扎成马尾。"),
+            ("涂一下口红", "拿起口红，轻轻涂抹双唇。"),
+            ("拿一把菜刀", "从桌面拿起厨房菜刀，刀尖朝下，平稳展示。"),
+        ] {
+            let generated = json!({"speech":"好呀，看这里。","intent":"action_request","emotion":"happy","gesture":"none","action_instruction":instruction,"segments":[{"text":"好呀，看这里。","action":"hand_gesture","intensity":"normal"}]});
+            let response = json!({"choices":[{"message":{"content":generated.to_string()}}]}).to_string();
+            let (url, task) = mock_server("200 OK", &response);
+            let result = generate_interaction(url, "test-only-key".into(), "model".into(), "只输出要说的话，不输出动作。".into(), "宝子".into(), comment.into(), json!([]), None, None, Some("chat".into()), None).await.unwrap();
+            assert_eq!(result, generated);
+            let request = task.join().unwrap();
+            let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("普通弹幕动作放 action_instruction"));
+            assert!(system.contains("明确动作请求优先于旧人设"));
+            assert!(!system.contains("实际只触发 gesture"));
+        }
+    }
+
+    #[tokio::test]
+    async fn questions_and_chat_use_camera_gaze_instead_of_unrequested_actions() {
+        for (comment, intent) in [
+            ("姐姐你有男朋友吗", Some("question")),
+            ("你涂的什么口红", Some("question")),
+            ("你会扎马尾吗", Some("question")),
+            ("今天好漂亮", Some("chat")),
+            ("不要涂口红", Some("chat")),
+            ("你好", None),
+            ("你好", Some("unknown")),
+        ] {
+            let mut generated = json!({"speech":"和你聊聊天。","emotion":"happy","gesture":"heart","action_instruction":"微笑并点头","segments":[{"text":"和你聊聊天。","action":"smile","intensity":"subtle"}]});
+            if let Some(intent) = intent { generated["intent"] = json!(intent); }
+            let response = json!({"choices":[{"message":{"content":generated.to_string()}}]}).to_string();
+            let (url, task) = mock_server("200 OK", &response);
+            let result = generate_interaction(url, "test-only-key".into(), "model".into(), "每次回复必须微笑点头".into(), "宝子".into(), comment.into(), json!([]), None, None, Some("chat".into()), None).await.unwrap();
+            assert_eq!(result["action_instruction"], "目光注视前方，看向镜头。");
+            assert_eq!(result["gesture"], "none");
+            assert_eq!(result["segments"][0]["action"], "idle");
+            assert_eq!(result["intent"], if intent == Some("question") { "question" } else { "chat" });
+            let request = task.join().unwrap();
+            let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let system = body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("先评估当前弹幕意图"));
+            assert!(system.contains("question 和 chat 默认目光注视前方、看向镜头"));
+            assert!(system.contains("不要给普通问答附带微笑、点头、思考等动作"));
+        }
     }
 
     #[tokio::test]

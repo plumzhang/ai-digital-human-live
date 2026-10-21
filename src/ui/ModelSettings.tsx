@@ -78,7 +78,7 @@ export function ModelSettings() {
         </button>) : <div className="empty">{error ? '查询失败，请检查配置后重试。' : queried ? models.length ? '没有匹配的模型。' : '接口未返回可用模型。' : '填写 API 地址和 Key 后，这里会显示可用模型。'}</div>}
     </div>
     <label className="model-persona-field">固定人设<textarea rows={15} value={config.persona} onChange={event => { setConfig(old => ({ ...old, persona: event.target.value })); setSaveNotice(''); }} placeholder="填写主播身份、性格和互动规则"/></label>
-    <p className="hint">手动文字提问和自动弹幕使用已保存的模型与人设生成回复，再由数字人播报。每次独立发送人设、观众昵称和弹幕内容。temperature 0.85；手动口播 max_tokens 120，队列 JSON 结果 max_tokens 384。</p>
+    <p className="hint">手动文字提问和自动弹幕使用已保存的模型与人设生成回复，再由数字人播报。每次独立发送人设、观众昵称和弹幕内容。先判断弹幕意图：普通问答和聊天只播报台词，确定是动作要求时才随口播发送对应动作；礼物按礼物动作规则处理。队列中可查看动作描述与提交状态；画面效果由数字人模型生成，暂不支持逐句精确同步。</p>
     <p className="hint">选择模型后点击“保存配置”，地址、Key、所选模型和人设会保存在本机，下次进入自动恢复。Key 仅发送到你填写的模型服务地址。</p>
     <div className="button-row"><button type="button" className="primary" disabled={!config.selectedModel || !config.apiKey.trim() || !config.baseUrl.trim() || !config.persona.trim()} onClick={saveConfig}><Save size={16}/> 保存配置</button></div>
     {saveNotice && <div className="voice-notice success" role="status">{saveNotice}</div>}

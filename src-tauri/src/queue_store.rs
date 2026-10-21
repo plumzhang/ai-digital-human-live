@@ -3,6 +3,8 @@ use serde_json::{json, Value};
 use std::{fs::{self, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::Mutex};
 use tauri::{Manager, State};
 
+const INTERACTION_SLOT_COUNT: usize = 6;
+
 #[derive(Default)]
 pub struct QueueStorage(Mutex<Option<Store>>);
 struct Store { db: Connection, directory: PathBuf }
@@ -60,7 +62,7 @@ fn export_state(store: &Store, snapshot: &Value) -> Result<(), String> {
         }.into());
         lines.push(format!("{left}//{right}"));
     }
-    lines.resize(3, String::new());
+    lines.resize(INTERACTION_SLOT_COUNT, String::new());
     atomic_write(&store.directory, "queue.txt", &(lines.join("\n") + "\n"))?;
     atomic_write(&store.directory, "queue.json", &serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?)?;
     let playing = tasks.iter().find(|task| matches!(task["status"].as_str(), Some("playing" | "uncertain"))).unwrap_or(&Value::Null);
@@ -104,8 +106,8 @@ pub async fn queue_commit(app: tauri::AppHandle, storage: State<'_, QueueStorage
 
 fn commit_snapshot(store: &mut Store, snapshot: &Value) -> Result<(), String> {
     let tasks = snapshot["tasks"].as_array().ok_or("无效的队列快照")?;
-    if tasks.len() > 3 || tasks.iter().filter(|task| matches!(task["status"].as_str(), Some("playing" | "uncertain"))).count() > 1 || tasks.iter().filter(|task| task["status"] == "generating").count() > 2 {
-        return Err("队列超过 3 个槽位或包含多个播报任务".into());
+    if tasks.len() > INTERACTION_SLOT_COUNT || tasks.iter().filter(|task| matches!(task["status"].as_str(), Some("playing" | "uncertain"))).count() > 1 || tasks.iter().filter(|task| task["status"] == "generating").count() > 2 {
+        return Err(format!("队列超过 {INTERACTION_SLOT_COUNT} 个槽位或包含多个播报任务"));
     }
     let transaction = store.db.transaction().map_err(|error| error.to_string())?;
     let mut appended_history = Vec::new();
@@ -153,7 +155,7 @@ pub async fn queue_ack_event(app: tauri::AppHandle, storage: State<'_, QueueStor
 pub async fn queue_save_config(app: tauri::AppHandle, storage: State<'_, QueueStorage>, persona: String, model: String, base_url: String) -> Result<(), String> {
     with_store(&app, &storage, |store| {
         atomic_write(&store.directory, "persona.txt", &persona)?;
-        atomic_write(&store.directory, "config.json", &json!({"window_size":3,"generation_concurrency":2,"playback_concurrency":1,"chat_expiry_seconds":30,"gift_merge_ms":2000,"gift_priority":true,"model":model,"base_url":base_url}).to_string())
+        atomic_write(&store.directory, "config.json", &json!({"window_size":INTERACTION_SLOT_COUNT,"generation_concurrency":2,"playback_concurrency":1,"chat_expiry_seconds":30,"gift_merge_ms":2000,"gift_priority":true,"model":model,"base_url":base_url}).to_string())
     })
 }
 
@@ -180,12 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_commit_exports_three_readable_lines_and_replaces_existing_snapshots() {
+    fn sqlite_commit_exports_six_readable_lines_and_replaces_existing_snapshots() {
         let mut store = temporary_store();
         let first = snapshot();
         commit_snapshot(&mut store, &first).unwrap();
         let text = fs::read_to_string(store.directory.join("queue.txt")).unwrap();
-        assert_eq!(text.lines().count(), 3);
+        assert_eq!(text.lines().count(), 6);
         assert!(text.contains("[弹幕][小杰] 你好//小杰你好！"));
         assert!(text.contains("[礼物][阿豪][玫瑰×5]//生成中"));
         let mut second = first.clone();
@@ -195,6 +197,27 @@ mod tests {
         assert_eq!(playing["status"], "uncertain");
         let saved: String = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), second);
+        cleanup(store);
+    }
+
+    #[test]
+    fn six_tasks_are_persisted_and_exported_and_a_seventh_is_rejected() {
+        let mut store = temporary_store();
+        let mut valid = snapshot();
+        for id in ["d", "e", "f"] {
+            valid["tasks"].as_array_mut().unwrap().push(json!({
+                "id":id,"status":"pending","event":{"type":"chat","nickname":id,"content":id}
+            }));
+        }
+        commit_snapshot(&mut store, &valid).unwrap();
+        let text = fs::read_to_string(store.directory.join("queue.txt")).unwrap();
+        assert_eq!(text.lines().count(), 6);
+        assert!(text.contains("[弹幕][f] f//等待生成"));
+        let mut invalid = valid.clone();
+        invalid["tasks"].as_array_mut().unwrap().push(json!({"id":"g","status":"pending"}));
+        assert!(commit_snapshot(&mut store, &invalid).is_err());
+        let saved: String = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), valid);
         cleanup(store);
     }
 

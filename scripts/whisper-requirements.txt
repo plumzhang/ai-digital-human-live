@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+opencc-python-reimplemented==0.1.7
+av==16.0.1
+ctranslate2==4.8.3

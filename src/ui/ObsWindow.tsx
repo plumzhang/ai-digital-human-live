@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import AliRtcEngine, { AliRtcSdkChannelProfile } from 'aliyun-rtc-sdk';
 import { monitorDownlinkAudio, type DownlinkMonitor, type VadActivity } from '../rtcVad';
+import { WhisperCapture, type RecognitionTarget, type WhisperResult } from '../whisperRecognition';
 
 type Snapshot = { live_id: string; rtc: { token: string; user_id: string } };
 type MediaControl = { enabled: boolean; live_id?: string };
@@ -18,6 +19,7 @@ export function ObsWindow() {
   const micRef = useRef(false);
   const liveIdRef = useRef<string | null>(null);
   const lastFrameRef = useRef({ time: -1, reportedAt: 0 });
+  const fittedVideoSizeRef = useRef('');
   const [status, setStatus] = useState('等待数字人会话');
   const [resumePlayback, setResumePlayback] = useState(false);
   const [microphoneCaption, setMicrophoneCaption] = useState('');
@@ -30,6 +32,19 @@ export function ObsWindow() {
     const width = video.videoWidth * scale;
     setOverlayPosition({ left: (video.clientWidth - width) / 2, top: video.clientHeight / 2, width });
   };
+  const updateVideoLayout = () => {
+    updateOverlayPosition();
+    const video = videoRef.current;
+    if (!video?.videoWidth || !video.videoHeight) return;
+    const key = `${video.videoWidth}x${video.videoHeight}`;
+    if (fittedVideoSizeRef.current === key) return;
+    fittedVideoSizeRef.current = key;
+    void invoke('fit_obs_video', { videoWidth: video.videoWidth, videoHeight: video.videoHeight }).catch(error => {
+      if (fittedVideoSizeRef.current !== key) return;
+      fittedVideoSizeRef.current = '';
+      setStatus(`窗口尺寸适配失败：${String(error)}`);
+    });
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -37,6 +52,11 @@ export function ObsWindow() {
     if (videoRef.current) resizeObserver?.observe(videoRef.current);
     let detachRtcListeners: (() => void) | null = null;
     const downlinks = new Map<string, { token: object; bytes?: number; progressAt: number; activity: VadActivity }>();
+    let whisperUid: string | undefined;
+    const whisper = new WhisperCapture(
+      request => invoke<WhisperResult>('whisper_transcribe', { request }),
+      result => { if (!disposed && result.live_id === liveIdRef.current) void emit('whisper-recognition', result); },
+    );
     const reportVad = (uid: string, state: VadActivity) => {
       const entry = downlinks.get(uid);
       if (!entry || disposed) return;
@@ -44,7 +64,8 @@ export function ObsWindow() {
       const all = [...downlinks.values()];
       const healthy = all.length > 0 && all.every(item => item.activity.healthy);
       const speaking = all.some(item => item.activity.speaking);
-      void emit('avatar-audio', { live_id: liveIdRef.current, source: 'pcm-vad', speaking, healthy, ended: healthy && !speaking && state.ended, at: Date.now() });
+      if (!healthy && whisperUid === uid) whisper.invalidate('RTC 下行音频中断，识别已停止，请确认当前任务');
+      void emit('avatar-audio', { live_id: liveIdRef.current, source: 'pcm-vad', speaking, healthy, quiet_ms: state.quiet_ms, ended: healthy && !speaking && state.ended, at: Date.now() });
     };
     async function reportMic(enabled: boolean, error?: string) {
       micRef.current = enabled;
@@ -53,6 +74,7 @@ export function ObsWindow() {
       await emit('mic-state', { live_id: liveIdRef.current, enabled, error });
     }
     async function leave() {
+      whisper.start(); whisperUid = undefined;
       for (const monitor of downlinkMonitorsRef.current.values()) monitor.dispose();
       downlinkMonitorsRef.current.clear(); downlinks.clear();
       vadNeedsResumeRef.current = false;
@@ -151,7 +173,7 @@ export function ObsWindow() {
         const entry = { token: {}, progressAt: 0, activity: { speaking: false, ended: false, healthy: false } };
         downlinks.set(_uid, entry);
         reportVad(_uid, entry.activity);
-        if (next !== 3) { downlinks.delete(_uid); return; }
+        if (next !== 3) { downlinks.delete(_uid); if (whisperUid === _uid) { whisper.invalidate('RTC 下行音频取消订阅，请确认当前任务'); whisperUid = undefined; } return; }
         void (async () => {
           const track = await rtc.getAudioTrack(_uid);
           const current = () => !disposed && rtcRef.current === rtc && liveIdRef.current === snapshot.live_id && downlinks.get(_uid)?.token === entry.token;
@@ -161,6 +183,11 @@ export function ObsWindow() {
             () => current() && entry.progressAt > 0 && Date.now() - entry.progressAt < 3500,
             state => { if (current()) reportVad(_uid, state); },
             message => { if (current()) { vadNeedsResumeRef.current = true; setResumePlayback(true); setStatus(message); void emit('rtc-vad-status', { live_id: snapshot.live_id, error: message }); } },
+            (samples, rate, quietMs) => {
+              if (!current() || micRef.current) return;
+              whisperUid ??= _uid;
+              if (whisperUid === _uid) whisper.push(samples, rate, quietMs);
+            },
           );
           if (!current()) { monitor.dispose(); return; }
           downlinkMonitorsRef.current.set(_uid, monitor);
@@ -216,11 +243,18 @@ export function ObsWindow() {
     const unlisteners: Array<() => void> = [];
     void (async () => {
       unlisteners.push(await listen<Snapshot>('session-changed', e => enqueue(() => join(e.payload))));
-      unlisteners.push(await listen('session-ended', () => enqueue(async () => { await leave(); setStatus('直播已结束'); })));
+      unlisteners.push(await listen<{ live_id?: string }>('session-ended', event => {
+        const endedId = event.payload?.live_id;
+        enqueue(async () => {
+          if (endedId && endedId !== liveIdRef.current) return;
+          await leave(); setStatus('直播已结束');
+        });
+      }));
       unlisteners.push(await listen<MediaControl>('mic-control', e => {
         const requestedLiveId = e.payload.live_id || liveIdRef.current;
         microphoneOperations = microphoneOperations.then(async () => {
           if (disposed || !requestedLiveId || requestedLiveId !== liveIdRef.current) return;
+          if (e.payload.enabled) whisper.start();
           await setMicrophone(e.payload.enabled);
         }).catch(error => { if (!disposed) void reportMic(false, `麦克风操作失败：${String(error)}`); });
       }));
@@ -236,6 +270,10 @@ export function ObsWindow() {
         if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
         if (typeof event.payload.content === 'string') setQueueCaption(event.payload.content.trim());
       }));
+      unlisteners.push(await listen<RecognitionTarget>('whisper-task', event => {
+        if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
+        whisper.start(event.payload);
+      }));
       unlisteners.push(await listen<{ live_id: string }>('vidu-disconnected', event => {
         if (event.payload.live_id === liveIdRef.current) { setMicrophoneCaption(''); setQueueCaption(''); }
       }));
@@ -246,8 +284,9 @@ export function ObsWindow() {
   }, []);
 
   return <div className="obs-root">
-    <video ref={videoRef} autoPlay playsInline className="obs-video" onLoadedMetadata={updateOverlayPosition} onResize={updateOverlayPosition} onTimeUpdate={event => {
+    <video ref={videoRef} autoPlay playsInline className="obs-video" onLoadedMetadata={updateVideoLayout} onResize={updateVideoLayout} onTimeUpdate={event => {
       const video = event.currentTarget;
+      updateVideoLayout();
       const liveId = liveIdRef.current;
       const now = Date.now();
       if (!liveId || !video.videoWidth || video.paused || video.currentTime === lastFrameRef.current.time || now - lastFrameRef.current.reportedAt < 1000) return;
