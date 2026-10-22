@@ -11,10 +11,14 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/queueCaption.ts', 'ut
 const { formatQueueCaption } = exports;
 
 test('queue captions bind original viewer, event type and answer into two lines', () => {
-  assert.equal(formatQueueCaption({ event: { type: 'chat', nickname: '小宇', content: '姐姐你有男朋友吗？' }, result: { speech: '先保密，留点神秘感。' } }),
+  assert.equal(formatQueueCaption({ event: { type: 'chat', nickname: '小宇', content: '姐姐你有男朋友吗？' }, result: { speech: '请回答一下观众的问题' }, answer: { text: '先保密，留点神秘感。' } }),
     '[弹幕] 小宇: 姐姐你有男朋友吗？\n[回复] 先保密，留点神秘感。');
-  assert.equal(formatQueueCaption({ event: { type: 'gift', nickname: '阿豪', content: '玫瑰×5' }, result: { speech: '谢谢阿豪的五朵玫瑰！', gesture: 'heart', segments: [{ action: '比心', text: '谢谢阿豪的五朵玫瑰！' }] }, action_state: 'submitted' }),
+  assert.equal(formatQueueCaption({ event: { type: 'gift', nickname: '阿豪', content: '玫瑰×5' }, result: { speech: '谢谢阿豪的五朵玫瑰！', gesture: 'heart', segments: [{ action: '比心', text: '谢谢阿豪的五朵玫瑰！' }] }, answer: { text: '谢谢阿豪的五朵玫瑰！' }, action_state: 'submitted' }),
     '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪的五朵玫瑰！');
   assert.equal(formatQueueCaption(), '');
   assert.equal(formatQueueCaption({ event: {}, result: { speech: '  ' } }), '');
+});
+
+test('OBS captions stay empty until actual Vidu output arrives', () => {
+  assert.equal(formatQueueCaption({ event: { type: 'chat', nickname: '宝子', content: '扎一下马尾' }, result: { speech: '来，扎个高马尾。' } }), '');
 });

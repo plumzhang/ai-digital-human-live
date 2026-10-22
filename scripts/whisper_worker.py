@@ -34,24 +34,35 @@ def main():
     for line in sys.stdin:
         try:
             request = json.loads(line)
-            samples = request["samples"]
-            if not 1600 <= len(samples) <= 400000:
-                raise ValueError("Expected 0.1–25 seconds of mono 16kHz PCM")
-            audio = np.asarray(samples, dtype=np.float32) / 32768.0
-            if not np.isfinite(audio).all():
-                raise ValueError("Invalid audio samples")
+            song = "audio_path" in request
+            if song:
+                # faster-whisper/PyAV decodes the full local song; timestamps
+                # remain relative to the original audio, including intros.
+                audio = request["audio_path"]
+            else:
+                samples = request["samples"]
+                if not 1600 <= len(samples) <= 400000:
+                    raise ValueError("Expected 0.1–25 seconds of mono 16kHz PCM")
+                audio = np.asarray(samples, dtype=np.float32) / 32768.0
+                if not np.isfinite(audio).all():
+                    raise ValueError("Invalid audio samples")
             started = time.perf_counter()
             # No expected script/lyrics prompt: copying that prompt could falsely
             # suggest that words were heard. Retain music for future lyric tests.
             segments, _ = model.transcribe(
-                audio, language="zh", beam_size=1, temperature=0,
+                audio, language="zh", beam_size=5 if song else 1, temperature=0,
                 condition_on_previous_text=False, word_timestamps=True,
                 vad_filter=False, no_speech_threshold=0.6,
-                hallucination_silence_threshold=1.0,
+                # The speech hallucination heuristic can skip a whole sung
+                # verse after a stretched syllable. Do not use it for music.
+                hallucination_silence_threshold=None if song else 1.0,
             )
             output = []
             for segment in segments:
-                if segment.no_speech_prob > 0.6 or segment.avg_logprob < -1.0:
+                # Match Whisper's joint silence criterion for songs. A low
+                # lyric confidence alone is not evidence of an instrumental.
+                silent = (segment.no_speech_prob > 0.6 and segment.avg_logprob < -1.0) if song else (segment.no_speech_prob > 0.6 or segment.avg_logprob < -1.0)
+                if silent:
                     continue
                 output.append({
                     "text": converter.convert(segment.text.strip()),

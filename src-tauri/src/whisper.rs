@@ -68,6 +68,24 @@ impl Worker {
         self.stdin.write_all(b"\n").and_then(|_| self.stdin.flush()).map_err(|e| e.to_string())?;
         self.read(Duration::from_secs(30))
     }
+    fn transcribe_file(&mut self, path: &Path) -> Result<Value, String> {
+        serde_json::to_writer(&mut self.stdin, &json!({"audio_path":path})).map_err(|e| e.to_string())?;
+        self.stdin.write_all(b"\n").and_then(|_| self.stdin.flush()).map_err(|e| e.to_string())?;
+        self.read(Duration::from_secs(1800))
+    }
+}
+
+// Only called with an application-owned song file, never a renderer-supplied path.
+pub async fn transcribe_song(app: tauri::AppHandle, path: PathBuf) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<WhisperRuntime>();
+        let mut guard = state.0.try_lock().map_err(|_| "语音识别正在使用中，请稍后生成歌曲导播".to_string())?;
+        if guard.is_none() { *guard = Some(Worker::start(&runtime_directory(&app)?)?); }
+        match guard.as_mut().unwrap().transcribe_file(&path) {
+            Ok(value) => Ok(value),
+            Err(error) => { *guard = None; Err(error) }
+        }
+    }).await.map_err(|e| e.to_string())?
 }
 
 fn runtime_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -124,6 +142,19 @@ pub async fn whisper_transcribe(app: tauri::AppHandle, request: AudioRequest) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires local Whisper and WHISPER_TEST_SONG pointing to 花落了一整个秋天"]
+    fn local_song_recognition_keeps_the_verse_and_chorus_after_42_seconds() {
+        let root = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("com.innotechx.digitalhuman.live/whisper");
+        let mut worker = Worker::start(&root).unwrap();
+        let result = worker.transcribe_file(Path::new(&std::env::var("WHISPER_TEST_SONG").unwrap())).unwrap();
+        let segments = result["segments"].as_array().unwrap();
+        assert!(segments.iter().any(|segment| segment["text"].as_str().unwrap_or("").contains("后来天空") && (42000..48000).contains(&segment["start_ms"].as_u64().unwrap())));
+        assert!(segments.iter().any(|segment| segment["text"].as_str().unwrap_or("").contains("花落") && (65000..80000).contains(&segment["start_ms"].as_u64().unwrap())));
+        assert!(segments.iter().filter(|segment| (42000..99900).contains(&segment["start_ms"].as_u64().unwrap())).count() >= 12);
+        println!("song segments={}; inference_ms={}", segments.len(), result["inference_ms"]);
+    }
+
     #[test]
     fn bounds_audio_and_requires_task_identity() {
         let mut request = AudioRequest { live_id:"live".into(), task_id:"task".into(), capture_id:"attempt".into(), offset_ms:0, captured_at:1, samples:vec![0; 1600] };

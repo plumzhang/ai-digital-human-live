@@ -12,7 +12,7 @@ type ReplyOptions = {
 export async function replyWithSavedModel(options: ReplyOptions): Promise<boolean> {
   const config: ModelConfig = loadModelConfig();
   if (!config.baseUrl.trim() || !config.apiKey.trim() || !config.selectedModel.trim() || !config.persona.trim()) {
-    throw new Error('请先在“模型配置”填写 API 地址、Key、模型和固定人设，并点击“保存配置”。');
+    throw new Error('请先在“模型配置 → 大语言模型”填写 API 地址、Key、模型和固定人设，并点击“保存配置”。');
   }
   const text = await invoke<string>('generate_reply', {
     baseUrl: config.baseUrl, key: config.apiKey, model: config.selectedModel,

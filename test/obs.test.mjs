@@ -6,6 +6,10 @@ import ts from 'typescript';
 import * as pinyinPro from 'pinyin-pro';
 
 const recognitionExports = {};
+const captionSettingsExports = {};
+const songDirectorExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/songDirector.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: songDirectorExports, setInterval: () => 1, clearInterval: () => {}, Date });
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/captionSettings.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: captionSettingsExports });
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: recognitionExports, require: name => { assert.equal(name, 'pinyin-pro'); return pinyinPro; } });
 
 async function player(options = {}) {
@@ -13,6 +17,7 @@ async function player(options = {}) {
   const rtcHandlers = new Map();
   const calls = [];
   const monitors = [];
+  const songs = [];
   const refs = [];
   const states = [];
   let refCursor = 0;
@@ -35,14 +40,15 @@ async function player(options = {}) {
       useRef: value => { const index = refCursor++; return refs[index] ??= { current: index === 0 ? video : value }; },
       useState: initial => {
         const index = stateCursor++;
-        if (!(index in states)) states[index] = initial;
+        if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial;
         return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
       },
     },
     'react/jsx-runtime': { jsx: (tag, props) => ({ tag, props }), jsxs: (tag, props) => ({ tag, props }) },
-    '@tauri-apps/api/core': { invoke: async (name, args) => {
+    '@tauri-apps/api/core': { convertFileSrc: path => `asset://${path}`, invoke: async (name, args) => {
       calls.push([name, args]);
       if (name === 'whisper_transcribe' && options.transcribe) return options.transcribe(args.request);
+      if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
       return name === 'session_snapshot' ? snapshot : undefined;
     } },
     '@tauri-apps/api/event': {
@@ -50,7 +56,10 @@ async function player(options = {}) {
       listen: async (name, fn) => { handlers.set(name, fn); return () => handlers.delete(name); },
     },
     'aliyun-rtc-sdk': { default: { getInstance: () => { if (options.engineError) throw new Error(options.engineError); return rtc; } }, AliRtcSdkChannelProfile: { AliRtcSdkCommunication: 0 } },
+    './ObsCaption': { ObsCaption: 'ObsCaption' },
+    '../captionSettings': captionSettingsExports,
     '../whisperRecognition': recognitionExports,
+    '../songDirector': songDirectorExports,
     '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
       const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
@@ -61,13 +70,88 @@ async function player(options = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const exports = {};
-  vm.runInNewContext(source, { exports, require: name => imports[name], Date });
+  vm.runInNewContext(source, { exports, require: name => imports[name], Date, Audio: class {
+    constructor(src) { this.src = src; this.paused = true; this.currentTime = 0; songs.push(this); }
+    async play() {
+      if (options.blockSongAutoplay && !this.tried) { this.tried=true; const error=new Error('user gesture required'); error.name='NotAllowedError'; throw error; }
+      this.paused = false;
+    }
+    pause() { this.paused = true; }
+    removeAttribute() {}
+    load() {}
+  } });
   const render = () => { refCursor = 0; stateCursor = 0; return exports.ObsWindow(); };
   const tree = render();
   effect();
   await new Promise(resolve => setImmediate(resolve));
-  return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors };
+  return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors, songs };
 }
+
+test('OBS song control plays original audio, mutes RTC, submits exact lyrics and restores sound at ended', async () => {
+  const p = await player();
+  const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
+  p.handlers.get('song-control')({ payload:control });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.songs.length,1); assert.equal(p.songs[0].src,'asset://song.mp3'); assert.equal(p.songs[0].paused,false);
+  assert.ok(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === true));
+  const tts = p.calls.find(([name]) => name === 'speak_text')[1];
+  assert.equal(tts.content, '原歌词'); assert.equal(tts.taskId,'attempt-0');
+  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length,0);
+  p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
+  const interrupt = p.calls.findIndex(([name]) => name === 'interrupt_session');
+  const unmute = p.calls.findIndex(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false);
+  assert.ok(interrupt >= 0 && unmute > interrupt);
+  assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'ended' && state.playback_token === 'attempt'));
+});
+
+test('OBS ignores stale song commands and cancelling a pending load never starts late playback', async () => {
+  let resolveDirector;
+  const p = await player({ getDirector: () => new Promise(resolve => { resolveDirector=resolve; }) });
+  const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
+  p.handlers.get('song-control')({ payload:{ ...control, live_id:'old' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.calls.filter(([name]) => name === 'director_get').length,0);
+  p.handlers.get('song-control')({ payload:control }); await new Promise(resolve => setImmediate(resolve));
+  p.handlers.get('song-control')({ payload:{ ...control, action:'stop' } });
+  resolveDirector({ status:'ready', available:true, audio_path:'song.mp3', cues:[{ start_ms:0,end_ms:1000,lead_ms:500,text:'不要发送' }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.songs.length,0); assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,0);
+  assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'stopped'));
+});
+
+test('song VAD observations are logged under the matching lyric id and Vidu rejection stops local music', async () => {
+  const p = await player();
+  p.rtcHandlers.get('audioSubscribeStateChanged')('avatar',2,3);
+  await new Promise(resolve => setImmediate(resolve));
+  const control={action:'start',live_id:'123',task_id:'song-task',playback_token:'attempt',song_id:'song-id'};
+  p.handlers.get('song-control')({payload:control}); await new Promise(resolve => setImmediate(resolve));
+  p.handlers.get('vidu-signal')({payload:{type:103,live_id:'old',payload:{error:{msg_id:'tts-attempt-0',message:'old rejection'}}}});
+  assert.equal(p.songs[0].paused,false);
+  p.handlers.get('vidu-signal')({payload:{type:103,live_id:'123',payload:{error:{msg_id:'tts-other-0',message:'other request'}}}});
+  assert.equal(p.songs[0].paused,false);
+  p.handlers.get('vidu-signal')({payload:{type:103,live_id:'123',payload:{error:{msg_id:'tts-attempt-0',message:'not ready'}}}});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.songs[0].paused,true);
+  const report=p.calls.find(([name])=>name==='tts_log_song_observation')[1];
+  assert.equal(report.liveId,'123'); assert.equal(report.msgId,'tts-attempt-0');
+  assert.ok(p.calls.some(([name,value])=>name==='song-playback-state' && value.state==='error' && value.error.includes('not ready')));
+});
+
+test('OBS retains the song resume button across video frames and resumes the original audio on click', async () => {
+  const p = await player({ blockSongAutoplay:true });
+  const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
+  p.handlers.get('song-control')({ payload:control }); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(p.calls.some(([name,state]) => name === 'song-playback-state' && state.state === 'blocked'));
+  assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,0);
+  const frame = p.render().props.children[0]; frame.props.onTimeUpdate({ currentTarget:p.video });
+  const overlay = p.render().props.children[1];
+  const button = overlay.props.children.find(child => child && child.tag === 'button');
+  assert.ok(button); button.props.onClick(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.songs[0].paused,false);
+  assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,1);
+  assert.ok(p.calls.some(([name,state]) => name === 'song-playback-state' && state.state === 'started'));
+  p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
+});
 
 test('OBS monitors only subscribed downlink audio and emits VAD events with transport health', async () => {
   const p = await player();
@@ -242,26 +326,44 @@ test('ending the session while permission is pending never publishes late audio'
 });
 
 function caption(player) {
-  return player.render().props.children[1].props.children[0];
+  const node = player.render().props.children[1].props.children[0];
+  assert.equal(node.tag, 'ObsCaption');
+  return node.props.content;
 }
 
-test('queue chat and gift speech use the same centered overlay as microphone captions', async () => {
+test('queue chat and gift speech share the video-relative overlay with microphone captions', async () => {
   const p = await player();
   assert.ok(p.calls.some(([name, payload]) => name === 'queue-caption-request' && payload.live_id === '123'));
   Object.assign(p.video, { videoHeight: 1920, clientWidth: 1920, clientHeight: 1080 });
   p.tree.props.children[0].props.onLoadedMetadata();
   const overlay = p.render().props.children[1];
-  assert.equal(overlay.props.style.top, 540);
+  assert.equal(overlay.props.style.top, 0);
+  assert.equal(overlay.props.style.height, 1080);
   assert.equal(overlay.props.style.left, (1920 - 1080 * 1080 / 1920) / 2);
   for (const content of ['[弹幕] 小杰: 姐姐今天好漂亮啊\n[回复] 小杰你真会夸人呀！', '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！']) {
     p.handlers.get('queue-caption')({ payload: { live_id: '123', content } });
-    assert.equal(caption(p).props.className, 'obs-caption');
-    assert.equal(caption(p).props.children, content);
+    assert.equal(caption(p), content);
   }
   p.handlers.get('queue-caption')({ payload: { live_id: 'old', content: '过期回答' } });
-  assert.equal(caption(p).props.children, '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！');
+  assert.equal(caption(p), '[礼物] 阿豪: 玫瑰×5\n[回复] 谢谢阿豪送来的五朵玫瑰！');
   p.handlers.get('queue-caption')({ payload: { live_id: '123', content: '' } });
   assert.equal(caption(p), '');
+});
+
+test('OBS requests caption settings on startup and applies validated live changes without replacing the text', async () => {
+  const p = await player();
+  assert.ok(p.calls.some(([name]) => name === 'caption-settings-request'));
+  p.handlers.get('queue-caption')({ payload: { live_id: '123', content: '正在播报的弹幕' } });
+  p.handlers.get('caption-settings-changed')({ payload: { x: 15, y: 90, color: '#ffd700', entrance: 'zoom' } });
+  const node = p.render().props.children[1].props.children[0];
+  assert.equal(node.props.content, '正在播报的弹幕');
+  assert.equal(node.props.settings.x, 15); assert.equal(node.props.settings.y, 90);
+  assert.equal(node.props.settings.color, '#ffd700'); assert.equal(node.props.settings.entrance, 'zoom');
+  Object.assign(p.video, { videoWidth: 1920, videoHeight: 1080, clientWidth: 1000, clientHeight: 1000 });
+  p.tree.props.children[0].props.onLoadedMetadata();
+  const overlay = p.render().props.children[1];
+  assert.equal(overlay.props.style.top, 218.75);
+  assert.equal(overlay.props.style.height, 562.5);
 });
 
 test('OBS fits its native window to decoded video dimensions and updates when the stream resolution changes', async () => {
@@ -313,10 +415,9 @@ test('OBS displays server microphone transcription as 我：内容 and replaces 
   p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
   await new Promise(resolve => setImmediate(resolve));
   p.handlers.get('vidu-signal')({ payload: { type: 9, live_id: '123', payload: { text_msg: { content: ' 你好，数字人。 ' } } } });
-  assert.equal(caption(p).props.className, 'obs-caption');
-  assert.equal(caption(p).props.children, '我：你好，数字人。');
+  assert.equal(caption(p), '我：你好，数字人。');
   p.handlers.get('vidu-signal')({ payload: { type: 9, live_id: '123', payload: { text_msg: { content: '第二句话' } } } });
-  assert.equal(caption(p).props.children, '我：第二句话');
+  assert.equal(caption(p), '我：第二句话');
 });
 
 test('OBS ignores avatar replies, foreign sessions, empty results, and results while the microphone is off', async () => {

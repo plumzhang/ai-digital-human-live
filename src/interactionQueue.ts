@@ -1,21 +1,43 @@
+import { mergeAvatarText, type AvatarOutput } from './avatarOutput';
 import { avatarActionFor } from './giftActions';
 import { matchReplyEnding, type RecognitionObservation, type WhisperSegment } from './whisperRecognition';
+import type { SongDirector, SongPlaybackState } from './songDirector';
 
 export type InteractionEvent = {
-  event_id: string; type: 'chat' | 'gift'; room_id: string; user_id: string; nickname: string;
+  event_id: string; type: 'chat' | 'gift' | 'song'; room_id: string; user_id: string; nickname: string;
   content: string; created_at: number; source?: 'test'; gift?: { name: string; count: number; gift_id: string; combo_id: string; is_final: boolean };
 };
 export type GiftGesture = 'heart' | 'kiss' | 'flying_kiss';
-export type GeneratedReply = { speech: string; emotion: string; intent?: 'question' | 'chat' | 'action_request' | 'gift'; gesture?: GiftGesture | 'none'; action_instruction?: string; segments: { text: string; action: string; intensity: string }[] };
+// `speech` retains the persisted field name, but contains the question sent to
+// Vidu. Only InteractionTask.answer contains the avatar's actual answer.
+export type GeneratedReply = { speech: string; generation_mode?: 'question'; emotion: string; intent?: 'question' | 'chat' | 'action_request' | 'gift'; gesture?: GiftGesture | 'none'; action_instruction?: string; segments: { text: string; action: string; intensity: string }[] };
 export type InteractionTask = {
   id: string; event: InteractionEvent; status: 'pending' | 'generating' | 'ready' | 'playing' | 'uncertain' | 'failed';
   result?: GeneratedReply; error?: string; started_at?: number; live_id?: string; opening_style?: string;
   action_state?: 'submitted' | 'failed'; action_error?: string;
   playback_token?: string;
+  answer?: { text: string; received_at: number; message_ids: string[]; final?: boolean };
+  song?: { id: string; title: string; duration_ms: number };
+  song_playback?: 'starting' | 'blocked' | 'playing';
   recognition?: { text: string; matched: boolean; progress: number; method?: 'text' | 'phonetic'; scope?: 'full' | 'tail'; compared_chars?: number; captured_at: number; inference_ms: number; segments?: WhisperSegment[]; error?: string };
 };
 export type HistoryEntry = { task: InteractionTask; outcome: 'played' | 'skipped' | 'failed'; reason: string; at: number };
-export type HandoffDirection = 'left_down' | 'right_down';
+export const HANDOFF_DIRECTIONS = [
+  { value: 'left_down', label: '向左下角查看' },
+  { value: 'right_down', label: '向右下角查看' },
+  { value: 'left_up', label: '向左上角查看' },
+  { value: 'right_up', label: '向右上角查看' },
+  { value: 'left', label: '向左侧查看' },
+  { value: 'right', label: '向右侧查看' },
+  { value: 'up', label: '向上方查看' },
+  { value: 'down', label: '向下方查看' },
+  { value: 'front', label: '平视前方' },
+] as const;
+export type HandoffDirection = typeof HANDOFF_DIRECTIONS[number]['value'];
+export function handoffActionLabel(direction: HandoffDirection, angleDeg = 30): string {
+  const label = HANDOFF_DIRECTIONS.find(item => item.value === direction)?.label || '未知方向';
+  return direction === 'front' ? label : `${label}（${angleDeg}度）`;
+}
 export type HandoffAction = { task_id: string; live_id: string; direction: HandoffDirection; status: 'pending' | 'submitted' | 'failed' | 'cancelled'; error?: string; resume_at?: number; wait_ms?: number; angle_deg?: number };
 export type QueueSnapshot = {
   version: 1; room_id: string; tasks: InteractionTask[]; candidates: InteractionEvent[];
@@ -23,9 +45,9 @@ export type QueueSnapshot = {
   thanked_combos: Record<string, number>; history: HistoryEntry[];
   totals?: { played: number; skipped: number; failed: number };
   next_opening_style?: number;
-  handoff?: { enabled: boolean; direction: HandoffDirection; wait_ms?: number; angle_deg?: number };
+  handoff?: { enabled: boolean; direction: HandoffDirection; wait_ms?: number; angle_deg?: number; trigger_percent?: number };
   handoff_action?: HandoffAction;
-  recognition?: { enabled: boolean };
+  recognition?: { enabled: boolean; match_percent?: number };
 };
 export type ReplyDiversity = { openingStyle: string; recentOpenings: string[] };
 const OPENING_STYLES = [
@@ -36,7 +58,7 @@ const OPENING_STYLES = [
 ];
 export const INTERACTION_SLOT_COUNT = 6;
 export const emptyQueue = (): QueueSnapshot => ({ version: 1, room_id: '', tasks: [], candidates: [], combos: {}, thanked_combos: {}, history: [], totals: { played: 0, skipped: 0, failed: 0 } });
-// text_tts has no completion acknowledgement. Use one RTC silence window,
+// text_msg has no completion acknowledgement. Use one RTC silence window,
 // shared by completion detection and the next submission, without waiting twice.
 const PLAYBACK_SILENCE_MS = 1500;
 
@@ -67,6 +89,7 @@ type QueueAdapter = {
   persist: (snapshot: QueueSnapshot) => Promise<void>;
   generate: (task: InteractionTask, history: HistoryEntry[], diversity: ReplyDiversity) => Promise<GeneratedReply>;
   speak: (task: InteractionTask, liveId: string) => Promise<void>;
+  stopSong?: (task: InteractionTask) => Promise<void>;
   act?: (task: InteractionTask, liveId: string) => Promise<void>;
   handoff?: (task: InteractionTask, liveId: string, direction: HandoffDirection, angleDeg: number) => Promise<void>;
   changed: (snapshot: QueueSnapshot) => void;
@@ -84,12 +107,14 @@ export class InteractionQueue {
   private faulted = false;
   private disposed = false;
   private speaking = false;
+  private playbackHeld = false;
   private pumping = false;
   private heardSpeech = false;
   private audioAt = 0;
   private lastSpeechAt = 0;
   private videoAt = 0;
   private quietSince = 0;
+  private insertionQuietSince = 0;
   private vadMode = false;
   private vadIdle = false;
   private vadEndTask?: string;
@@ -105,11 +130,18 @@ export class InteractionQueue {
   constructor(snapshot: QueueSnapshot, private adapter: QueueAdapter) {
     this.state = structuredClone(snapshot);
     this.state.totals ||= { played: 0, skipped: 0, failed: 0 };
+    if (this.state.recognition) {
+      const matchPercent = this.state.recognition.match_percent;
+      this.state.recognition.match_percent = matchPercent !== undefined && Number.isInteger(matchPercent) && matchPercent >= 50 && matchPercent <= 100 ? matchPercent : 70;
+    }
     this.state.handoff ||= { enabled: false, direction: 'left_down' };
+    if (!HANDOFF_DIRECTIONS.some(item => item.value === this.state.handoff?.direction)) this.state.handoff.direction = 'left_down';
     const waitMs = this.state.handoff.wait_ms;
-    this.state.handoff.wait_ms = waitMs !== undefined && Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 3000 ? waitMs : 1000;
+    this.state.handoff.wait_ms = waitMs !== undefined && Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 3000 ? waitMs : 1699;
     const angle = this.state.handoff.angle_deg;
-    this.state.handoff.angle_deg = angle !== undefined && Number.isInteger(angle) && angle >= 0 && angle <= 90 ? angle : 45;
+    this.state.handoff.angle_deg = angle !== undefined && Number.isInteger(angle) && angle >= 0 && angle <= 90 ? angle : 30;
+    const triggerPercent = this.state.handoff.trigger_percent;
+    this.state.handoff.trigger_percent = triggerPercent !== undefined && Number.isInteger(triggerPercent) && triggerPercent >= 1 && triggerPercent <= 100 ? triggerPercent : 50;
     if (this.state.handoff_action?.status === 'pending') {
       this.state.handoff_action.status = 'cancelled';
       this.state.handoff_action.error = '客户端已重新打开，未自动重复发送承接动作';
@@ -118,11 +150,25 @@ export class InteractionQueue {
     for (const task of this.state.tasks) {
       if (task.status === 'playing') task.status = 'uncertain';
       if (task.status === 'generating') task.status = 'pending';
-      if (task.recognition && task.result && !task.recognition.error) Object.assign(task.recognition, matchReplyEnding(task.result.speech, task.recognition.text));
+      if (!task.song && task.status === 'ready' && task.result?.generation_mode !== 'question') {
+        task.status = 'pending';
+        delete task.result; delete task.error; delete task.answer;
+        delete task.action_state; delete task.action_error; delete task.recognition;
+      }
+      if (task.recognition && task.result && !task.recognition.error) {
+        const match = matchReplyEnding(task.answer?.text || '', task.recognition.text);
+        Object.assign(task.recognition, match, { matched: match.progress * 100 + 1e-9 >= (this.state.recognition?.match_percent ?? 70) });
+      }
     }
   }
   snapshot() { return structuredClone(this.state); }
   isGenerating() { return this.running.size > 0; }
+  setPlaybackHeld(held: boolean) { this.playbackHeld = held; }
+  canInsertPlayback(quietMs = PLAYBACK_SILENCE_MS) {
+    return !this.disposed && !this.faulted && !this.importing && !this.finishing && !this.speaking && !this.current() && !!this.activeLive &&
+      this.now() - this.videoAt < 2000 && this.now() - this.audioAt < (this.vadMode ? 500 : 2000) &&
+      (this.vadMode ? this.vadIdle : true) && !!this.insertionQuietSince && this.now() - this.insertionQuietSince >= quietMs;
+  }
   private now() { return this.adapter.now?.() ?? Date.now(); }
   private current() { return this.state.tasks.find(task => task.status === 'playing' || task.status === 'uncertain'); }
   private mutate(change: (next: QueueSnapshot) => boolean): Promise<void> {
@@ -148,31 +194,59 @@ export class InteractionQueue {
     next.tasks = next.tasks.filter(item => item.id !== task.id);
   }
   async restore() { await this.mutate(() => true); }
-  async configureRecognition(enabled: boolean) {
+  async configureRecognition(enabled: boolean, matchPercent?: number) {
+    if (matchPercent !== undefined && (!Number.isInteger(matchPercent) || matchPercent < 50 || matchPercent > 100)) throw new Error('台词匹配度需为50–100%的整数');
     let configured = false;
     await this.mutate(next => {
       if (next.tasks.some(task => ['playing', 'uncertain'].includes(task.status))) return false;
-      next.recognition = { enabled }; configured = true; return true;
+      next.recognition = { enabled, match_percent: matchPercent ?? next.recognition?.match_percent ?? 70 }; configured = true; return true;
     });
-    if (!configured) throw new Error('请先确认完成或跳过当前播报，再切换结束检测方式');
+    if (!configured) throw new Error('请先确认完成或跳过当前播报，再调整语音识别设置');
+  }
+  async observeOutput(output: AvatarOutput) {
+    const current = this.current();
+    if (!current || current.song || !['playing', 'uncertain'].includes(current.status) || !this.activeLive || output.live_id !== this.activeLive) return;
+    const taskId = current.id, captureId = current.playback_token;
+    await this.mutate(next => {
+      const task = next.tasks.find(item => item.id === taskId && item.playback_token === captureId && ['playing', 'uncertain'].includes(item.status) && item.live_id === output.live_id);
+      if (!task || task.song || !task.result || output.live_id !== this.activeLive || !output.text.trim() || !Number.isFinite(output.received_at)
+          || output.received_at < (task.started_at || 0) || output.received_at > this.now() + 1000 || output.received_at < (task.answer?.received_at || 0)) return false;
+      const requestId = output.request_id || (output.msg_id?.startsWith('tts-') ? output.msg_id : undefined);
+      if (requestId && requestId !== task.id && requestId !== `tts-${task.id}`) return false;
+      if (output.msg_id && next.history.some(entry => entry.task.live_id === output.live_id && entry.task.answer?.message_ids.includes(output.msg_id!))) return false;
+      const previous = task.answer;
+      const text = mergeAvatarText(previous?.text || '', output.text.trim());
+      const final = output.final ?? (text === previous?.text ? previous.final : undefined);
+      const ids = [...new Set([...(previous?.message_ids || []), ...(output.msg_id ? [output.msg_id] : [])])].slice(-100);
+      if (previous?.text === text && previous.final === final && ids.length === previous.message_ids.length) return false;
+      task.answer = { text, received_at: output.received_at, message_ids: ids, final };
+      if (task.recognition && !task.recognition.error) {
+        const match = matchReplyEnding(text, task.recognition.text);
+        Object.assign(task.recognition, match, { matched: match.progress * 100 + 1e-9 >= (next.recognition?.match_percent ?? 70) });
+      }
+      return true;
+    });
+    await this.tick();
   }
   async observeRecognition(observation: RecognitionObservation) {
     if (!this.state.recognition?.enabled || !this.activeLive || observation.live_id !== this.activeLive) return;
     await this.mutate(next => {
       const task = next.tasks.find(task => task.id === observation.task_id && task.status === 'playing' && task.live_id === observation.live_id && task.playback_token === observation.capture_id);
-      if (!task?.result || !Number.isFinite(observation.captured_at) || observation.captured_at < (task.started_at || 0) || observation.captured_at > this.now() + 1000 || observation.captured_at < (task.recognition?.captured_at || 0)) return false;
-      const match = observation.error ? { matched: false, progress: 0 } : matchReplyEnding(task.result.speech, observation.text);
+      if (task?.song || !task?.result || !Number.isFinite(observation.captured_at) || observation.captured_at < (task.started_at || 0) || observation.captured_at > this.now() + 1000 || observation.captured_at < (task.recognition?.captured_at || 0)) return false;
+      const match = observation.error ? { matched: false, progress: 0 } : matchReplyEnding(task.answer?.text || '', observation.text);
+      match.matched = !observation.error && match.progress * 100 + 1e-9 >= (this.state.recognition?.match_percent ?? 70);
       task.recognition = { text: observation.text.slice(0, 10000), ...match, captured_at: observation.captured_at, inference_ms: observation.inference_ms, segments: observation.segments?.slice(-500), error: observation.error };
-      if (observation.error) { task.status = 'uncertain'; task.error = `Whisper 识别失败，需人工确认完成或跳过：${observation.error}`; clearTimeout(this.playbackTimer); }
+      if (observation.error) { task.status = 'uncertain'; task.error = `语音识别失败，需人工确认完成或跳过：${observation.error}`; clearTimeout(this.playbackTimer); }
       return true;
     });
     await this.tick();
   }
-  async configureHandoff(enabled: boolean, direction: HandoffDirection, waitMs?: number, angleDeg?: number) {
-    if (!['left_down', 'right_down'].includes(direction)) throw new Error('未知的承接动作方向');
+  async configureHandoff(enabled: boolean, direction: HandoffDirection, waitMs?: number, angleDeg?: number, triggerPercent?: number) {
+    if (!HANDOFF_DIRECTIONS.some(item => item.value === direction)) throw new Error('未知的承接动作方向');
     if (waitMs !== undefined && (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 3000)) throw new Error('承接动作等待时间需为0–3000毫秒的整数');
     if (angleDeg !== undefined && (!Number.isInteger(angleDeg) || angleDeg < 0 || angleDeg > 90)) throw new Error('承接动作查看角度需为0–90度的整数');
-    await this.mutate(next => { next.handoff = { enabled, direction, wait_ms: waitMs ?? next.handoff?.wait_ms ?? 1000, angle_deg: angleDeg ?? next.handoff?.angle_deg ?? 45 }; return true; });
+    if (triggerPercent !== undefined && (!Number.isInteger(triggerPercent) || triggerPercent < 1 || triggerPercent > 100)) throw new Error('承接动作触发匹配度需为1–100%的整数');
+    await this.mutate(next => { next.handoff = { enabled, direction, wait_ms: waitMs ?? next.handoff?.wait_ms ?? 1699, angle_deg: angleDeg ?? next.handoff?.angle_deg ?? 30, trigger_percent: triggerPercent ?? next.handoff?.trigger_percent ?? 50 }; return true; });
   }
   async importTestBatch(items: { event: InteractionEvent; result?: GeneratedReply }[]) {
     if (items.length < 1 || items.length > INTERACTION_SLOT_COUNT || items.some(item => !['chat', 'gift'].includes(item.event.type) || (item.event.type === 'gift' && !item.event.gift))) throw new Error(`测试需导入 1～${INTERACTION_SLOT_COUNT} 条有效弹幕或礼物`);
@@ -207,6 +281,8 @@ export class InteractionQueue {
       // Stop submissions immediately, before asynchronously persisting the old
       // task. Audio callbacks may tick while storage is still pending.
       this.enabled = false; this.available = false;
+      const current = this.current();
+      if (current?.song) await this.adapter.stopSong?.(current);
       await this.mutate(next => {
         const task = next.tasks.find(item => item.status === 'playing');
         if (task) { task.status = 'uncertain'; task.error = '会话已切换，需人工确认上一条是否已播报'; return true; }
@@ -215,10 +291,36 @@ export class InteractionQueue {
     }
     if (this.activeLive !== liveId) {
       this.audioAt = 0; this.videoAt = 0; this.quietSince = 0;
+      this.insertionQuietSince = 0;
       this.heardSpeech = false; this.vadMode = false; this.vadIdle = false; this.vadEndTask = undefined;
     }
     this.enabled = enabled; this.activeLive = liveId; this.available = available;
     await this.tick();
+  }
+  async enqueueSong(song: SongDirector) {
+    if (song.status !== 'ready' || !song.available || !song.cues.length || !Number.isFinite(song.duration_ms) || song.duration_ms <= 0) throw new Error('请先生成并保存有效的歌曲导播');
+    if (this.disposed || this.faulted) throw new Error('队列不可用，请重新打开中控台');
+    let added = false;
+    await this.mutate(next => {
+      if (next.tasks.length >= INTERACTION_SLOT_COUNT) return false;
+      next.tasks.push({ id: crypto.randomUUID(), status: 'ready', song: { id: song.id, title: song.title, duration_ms: song.duration_ms },
+        event: { event_id: crypto.randomUUID(), type: 'song', room_id: next.room_id, user_id: '', nickname: '歌曲导播', content: song.title, created_at: this.now() } });
+      added = true; return true;
+    });
+    if (!added) throw new Error('6个槽位已满，请稍后加入歌曲');
+    await this.tick();
+  }
+  async observeSong(state: SongPlaybackState) {
+    const task = this.current();
+    if (!task?.song || task.status !== 'playing' || task.id !== state.task_id || task.playback_token !== state.playback_token || task.live_id !== state.live_id || this.activeLive !== state.live_id) return;
+    if (state.state === 'ended') await this.finish('played', '原歌曲播放结束');
+    else if (state.state === 'error') await this.markUncertain(state.error || '歌曲播放失败', task.id);
+    else if (state.state === 'started' || state.state === 'blocked') await this.mutate(next => {
+      const current = next.tasks.find(item => item.id === state.task_id && item.status === 'playing' && item.playback_token === state.playback_token);
+      if (!current) return false;
+      current.song_playback = state.state === 'blocked' ? 'blocked' : 'playing';
+      return true;
+    });
   }
   async disconnectSession(liveId: string, reason: string) {
     if (this.activeLive && this.activeLive !== liveId) return;
@@ -308,9 +410,12 @@ export class InteractionQueue {
     if (this.pumping) return;
     this.pumping = true;
     try {
-    if (this.disposed || this.faulted || this.importing || !this.enabled || !this.available || !this.activeLive) return;
+    // Songs are explicitly queued by the operator. They can play with automatic
+    // chat replies off, while chat/gift generation and playback stay paused.
+    if (this.disposed || this.faulted || this.importing || (!this.enabled && !this.state.tasks[0]?.song) || !this.available || !this.activeLive) return;
     const jobs: InteractionTask[] = [];
     await this.mutate(next => {
+      if (!this.enabled) return false;
       for (const task of next.tasks) {
         if (this.running.size + jobs.length >= 2) break;
         if (task.status !== 'pending' || this.running.has(task.id)) continue;
@@ -325,10 +430,10 @@ export class InteractionQueue {
     for (const task of jobs) {
       this.running.add(task.id);
       const history = this.state.history.filter(entry => entry.outcome === 'played' && task.event.user_id && entry.task.event.user_id === task.event.user_id && entry.task.event.room_id === task.event.room_id).slice(-3);
-      const recent = [...this.state.history.filter(entry => entry.outcome === 'played').slice(-6).map(entry => entry.task), ...this.state.tasks.filter(item => item.id !== task.id && item.result)];
-      const recentOpenings = [...new Set(recent.map(item => (item.result?.speech || '').split(item.event.nickname).join('观众').replace(/[\r\n]+/g, ' ').trim().slice(0, 18)).filter(Boolean))].slice(-8);
+      const recent = [...this.state.history.filter(entry => entry.outcome === 'played').slice(-6).map(entry => entry.task), ...this.state.tasks.filter(item => item.id !== task.id && item.answer?.text)];
+      const recentOpenings = [...new Set(recent.map(item => (item.answer?.text || '').split(item.event.nickname).join('观众').replace(/[\r\n]+/g, ' ').trim().slice(0, 18)).filter(Boolean))].slice(-8);
       void this.adapter.generate(task, history, { openingStyle: task.opening_style!, recentOpenings }).then(async result => {
-        if (!result.speech.trim()) throw new Error('模型返回空台词');
+        if (!result.speech.trim()) throw new Error('模型返回空提问指令');
         await this.mutate(next => {
           const target = next.tasks.find(item => item.id === task.id && item.status === 'generating');
           if (!target) return false;
@@ -343,29 +448,36 @@ export class InteractionQueue {
       }).finally(() => { this.running.delete(task.id); void this.tick(); });
     }
     const handoff = this.state.handoff_action;
+    if (this.playbackHeld) return;
     if (handoff?.status === 'submitted' && handoff.live_id === this.activeLive && this.now() < (handoff.resume_at || 0)) return;
-    if (this.batchNeedsSilence && (this.batchQuietSince === undefined || this.now() - this.batchQuietSince < (this.vadMode ? 900 : PLAYBACK_SILENCE_MS))) return;
-    if (this.finishing || this.speaking || this.current() || this.audioAt < this.now() - (this.vadMode ? 500 : 2000) || this.videoAt < this.now() - 2000 ||
-      (this.vadMode ? !this.vadIdle : this.now() - this.quietSince < PLAYBACK_SILENCE_MS)) return;
+    const nextIsSong = !!this.state.tasks[0]?.song;
+    if (!nextIsSong && this.batchNeedsSilence && (this.batchQuietSince === undefined || this.now() - this.batchQuietSince < (this.vadMode ? 900 : PLAYBACK_SILENCE_MS))) return;
+    if (this.finishing || this.speaking || this.current() || this.videoAt < this.now() - 2000) return;
+    // Original song audio does not depend on the avatar publishing fresh PCM or
+    // silence. OBS interrupts old AI output before starting the song instead.
+    if (!nextIsSong && (this.audioAt < this.now() - (this.vadMode ? 500 : 2000) ||
+      (this.vadMode ? !this.vadIdle : this.now() - this.quietSince < PLAYBACK_SILENCE_MS))) return;
     this.speaking = true;
     let selected: InteractionTask | undefined;
     const liveId = this.activeLive;
     await this.mutate(next => {
       const task = next.tasks[0];
-      if (!task || task.status !== 'ready' || this.importing || !this.enabled || !this.available || this.activeLive !== liveId) return false;
-      task.status = 'playing'; task.started_at = this.now(); task.live_id = liveId; task.playback_token = crypto.randomUUID(); delete task.recognition; selected = structuredClone(task); return true;
+      if (!task || task.status !== 'ready' || this.playbackHeld || this.importing || (!this.enabled && !task.song) || !this.available || this.activeLive !== liveId) return false;
+      task.status = 'playing'; task.started_at = this.now(); task.live_id = liveId; task.playback_token = crypto.randomUUID();
+      if (task.song) task.song_playback = 'starting';
+      delete task.recognition; delete task.answer; selected = structuredClone(task); return true;
     });
     if (!selected) { this.speaking = false; return; }
     this.batchNeedsSilence = false; this.batchQuietSince = undefined;
     this.heardSpeech = false; this.lastSpeechAt = 0; this.vadEndTask = undefined;
     this.whisperQuietMs = 0; this.lastActualVoiceAt = 0;
     const selectedId = selected.id;
-    this.playbackTimer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, 60_000);
+    this.playbackTimer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, selected.song ? selected.song.duration_ms + 60_000 : 60_000);
     try {
       await this.adapter.speak(selected, liveId);
       // Submit the reply's action alongside speech. Late
       // completions, interruption and crash recovery must never replay it.
-      if (this.adapter.act && avatarActionFor(selected) && !this.disposed && this.activeLive === liveId && this.current()?.id === selectedId && this.current()?.status === 'playing') {
+      if (!selected.song && this.adapter.act && avatarActionFor(selected) && !this.disposed && this.activeLive === liveId && this.current()?.id === selectedId && this.current()?.status === 'playing') {
         let actionError: string | undefined;
         try { await this.adapter.act(selected, liveId); }
         catch (error) { actionError = String(error); }
@@ -384,6 +496,7 @@ export class InteractionQueue {
   }
   observeAudio(speaking: boolean, liveId: string) {
     if (!liveId || liveId !== this.activeLive) return;
+    if (speaking || !this.insertionQuietSince || this.now() - this.audioAt >= (this.vadMode ? 500 : 2000)) this.insertionQuietSince = this.now();
     if (this.batchNeedsSilence) {
       if (speaking || this.now() - this.audioAt >= (this.vadMode ? 500 : 2000)) this.batchQuietSince = undefined;
       if (!speaking) this.batchQuietSince ??= this.now();
@@ -398,6 +511,7 @@ export class InteractionQueue {
     if (!liveId || liveId !== this.activeLive || !Number.isFinite(at) || this.now() - at > 500 || at > this.now() + 100) return;
     this.vadMode = true;
     if (!state.healthy) {
+      this.insertionQuietSince = 0;
       this.whisperQuietMs = 0; this.lastActualVoiceAt = this.now();
       this.batchQuietSince = undefined;
       this.audioAt = 0; this.vadIdle = false; this.vadEndTask = undefined; this.heardSpeech = false;
@@ -414,19 +528,23 @@ export class InteractionQueue {
   private async observeCompletion() {
     const task = this.current();
     if (!task || task.status !== 'playing') return;
+    if (task.song) return; // Only the original audio's ended event completes a song.
     if (this.now() - task.started_at! >= 60_000) {
       await this.markUncertain('60 秒内未确认播放结束，已保留任务并暂停后续播报');
       return;
     }
     if (this.state.recognition?.enabled) {
+      if (!task.answer?.text || task.answer.final === false) return;
       const evidence = task.recognition;
       const handoffEnabled = this.state.handoff?.enabled === true;
-      if (this.heardSpeech && evidence?.matched && !evidence.error && evidence.captured_at >= this.lastActualVoiceAt && (handoffEnabled || this.whisperQuietMs >= 350) &&
+      const triggerPercent = this.state.handoff?.trigger_percent ?? 50;
+      const matched = evidence && (handoffEnabled ? evidence.progress * 100 + 1e-9 >= triggerPercent : evidence.matched);
+      if (this.heardSpeech && evidence && matched && !evidence.error && (handoffEnabled || evidence.captured_at >= this.lastActualVoiceAt) && (handoffEnabled || this.whisperQuietMs >= 350) &&
           this.now() - this.audioAt < 500 && this.now() - this.videoAt < 2000) {
         this.vadIdle = true;
         await this.finish('played', handoffEnabled
-          ? 'Whisper 台词匹配度达到70%，立即提交承接动作，不等待静音；提交成功后按设置等待'
-          : 'Whisper 台词匹配度达到70%，连续静音至少350毫秒；承接动作关闭，直接推进', true);
+          ? `语音台词匹配度达到${triggerPercent}%，立即提交承接动作，不等待静音；提交成功后按设置等待`
+          : `语音台词匹配度达到${this.state.recognition?.match_percent ?? 70}%，连续静音至少350毫秒；承接动作关闭，直接推进`, true);
       }
       return;
     }
@@ -442,6 +560,11 @@ export class InteractionQueue {
     }
   }
   private async markUncertain(reason: string, taskId?: string) {
+    const current = this.current();
+    if (current?.song && (!taskId || taskId === current.id)) {
+      try { await this.adapter.stopSong?.(current); }
+      catch (error) { reason += `；停止歌曲失败：${String(error)}`; }
+    }
     await this.mutate(next => {
       const task = next.tasks.find(item => item.status === 'playing' && (!taskId || item.id === taskId));
       if (!task) return false;
@@ -460,10 +583,11 @@ export class InteractionQueue {
     const liveId = current.live_id || '';
     try {
       clearTimeout(this.playbackTimer);
+      if (current.song) await this.adapter.stopSong?.(current);
       const direction = this.state.handoff?.direction || 'left_down';
-      const waitMs = this.state.handoff?.wait_ms ?? 1000;
-      const angleDeg = this.state.handoff?.angle_deg ?? 45;
-      if (outcome === 'played' && this.state.handoff?.enabled && this.adapter.handoff && this.state.handoff_action?.task_id !== taskId &&
+      const waitMs = this.state.handoff?.wait_ms ?? 1699;
+      const angleDeg = this.state.handoff?.angle_deg ?? 30;
+      if (!current.song && outcome === 'played' && this.state.handoff?.enabled && this.adapter.handoff && this.state.handoff_action?.task_id !== taskId &&
           liveId && liveId === this.activeLive && this.enabled && this.available && !this.disposed) {
         // Persist the attempt before sending. Retain this slot until submission
         // finishes so another tick cannot start the next reply first.
@@ -510,10 +634,10 @@ export class InteractionQueue {
     await this.mutate(next => {
       const task = next.tasks.find(item => item.id === id && ['failed', 'ready'].includes(item.status));
       if (!task) return false;
-      task.status = 'pending'; delete task.error; delete task.result; delete task.action_state; delete task.action_error; delete task.recognition; delete task.playback_token;
+      task.status = task.song ? 'ready' : 'pending'; delete task.error; delete task.result; delete task.action_state; delete task.action_error; delete task.recognition; delete task.answer; delete task.playback_token; delete task.song_playback;
       return true;
     });
     await this.tick();
   }
-  dispose() { this.disposed = true; this.enabled = false; clearTimeout(this.playbackTimer); }
+  dispose() { this.disposed = true; this.enabled = false; clearTimeout(this.playbackTimer); const task = this.current(); if (task?.song) void this.adapter.stopSong?.(task).catch(() => {}); }
 }

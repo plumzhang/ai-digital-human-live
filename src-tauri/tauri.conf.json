@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [{ "label": "main", "title": "数字人直播中控台", "width": 1500, "height": 920, "minWidth": 1100, "minHeight": 700 }],
-    "security": { "csp": null }
+    "security": { "csp": null, "assetProtocol": { "enable": true, "scope": ["$APPDATA/songs/videos/**", "$APPDATA/songs/directors/**"] } }
   },
   "bundle": {
     "active": true,

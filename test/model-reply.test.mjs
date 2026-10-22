@@ -15,9 +15,9 @@ function workflow(config, invoke) {
 
 const config = { baseUrl: 'https://api.deepseek.com', apiKey: 'test-only-key', selectedModel: 'deepseek-chat', persona: '你叫晚晚，只输出要说的话。' };
 
-test('saved model generates a personalized reply then sends that text for avatar speech', async () => {
+test('saved model optimizes a question then sends it for the avatar to answer', async () => {
   const requests = [];
-  const reply = workflow(config, async (name, args) => { requests.push({ name, args }); return name === 'generate_reply' ? '小杰，谢谢你呀！' : undefined; });
+  const reply = workflow(config, async (name, args) => { requests.push({ name, args }); return name === 'generate_reply' ? '小杰夸你今天好漂亮，你该如何回应？' : undefined; });
   let logged;
   assert.equal(await reply({ liveId: 'live-1', nickname: '小杰', comment: '姐姐今天好漂亮啊', isCurrent: () => true, onReply: text => { logged = text; } }), true);
   assert.deepEqual(requests.map(request => request.name), ['generate_reply', 'speak_text']);
@@ -25,8 +25,8 @@ test('saved model generates a personalized reply then sends that text for avatar
   assert.equal(requests[0].args.model, 'deepseek-chat');
   assert.equal(requests[0].args.nickname, '小杰');
   assert.equal(requests[1].args.liveId, 'live-1');
-  assert.equal(requests[1].args.content, '小杰，谢谢你呀！');
-  assert.equal(logged, '小杰，谢谢你呀！');
+  assert.equal(requests[1].args.content, '小杰夸你今天好漂亮，你该如何回应？');
+  assert.equal(logged, '小杰夸你今天好漂亮，你该如何回应？');
 });
 
 test('a reply arriving after interruption or session change is never spoken', async () => {

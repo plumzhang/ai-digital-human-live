@@ -9,7 +9,7 @@ const INTERACTION_SLOT_COUNT: usize = 6;
 pub struct QueueStorage(Mutex<Option<Store>>);
 struct Store { db: Connection, directory: PathBuf }
 
-fn atomic_write(directory: &Path, name: &str, text: &str) -> Result<(), String> {
+pub(crate) fn atomic_write(directory: &Path, name: &str, text: &str) -> Result<(), String> {
     let target = directory.join(name);
     let temporary = directory.join(format!(".{name}.tmp"));
     fs::write(&temporary, text).map_err(|error| error.to_string())?;
@@ -56,10 +56,10 @@ fn export_state(store: &Store, snapshot: &Value) -> Result<(), String> {
         let event = &task["event"];
         let nickname = clean_line(event["nickname"].as_str().unwrap_or("观众"));
         let content = clean_line(event["content"].as_str().unwrap_or(""));
-        let left = if event["type"] == "gift" { format!("[礼物][{nickname}][{content}]") } else { format!("[弹幕][{nickname}] {content}") };
-        let right = task.pointer("/result/speech").and_then(Value::as_str).map(clean_line).unwrap_or_else(|| match task["status"].as_str() {
+        let left = if event["type"] == "song" { format!("[歌曲][{nickname}] {content}") } else if event["type"] == "gift" { format!("[礼物][{nickname}][{content}]") } else { format!("[弹幕][{nickname}] {content}") };
+        let right = if let Some(duration) = task.pointer("/song/duration_ms").and_then(Value::as_u64) { format!("歌曲导播 · {:.1}秒", duration as f64 / 1000.0) } else { task.pointer("/result/speech").and_then(Value::as_str).map(clean_line).unwrap_or_else(|| match task["status"].as_str() {
             Some("generating") => "生成中", Some("failed") => "生成失败", Some("uncertain") => "等待确认", _ => "等待生成",
-        }.into());
+        }.into()) };
         lines.push(format!("{left}//{right}"));
     }
     lines.resize(INTERACTION_SLOT_COUNT, String::new());
@@ -102,6 +102,19 @@ pub async fn queue_load(app: tauri::AppHandle, storage: State<'_, QueueStorage>)
 #[tauri::command]
 pub async fn queue_commit(app: tauri::AppHandle, storage: State<'_, QueueStorage>, snapshot: Value) -> Result<(), String> {
     with_store(&app, &storage, |store| commit_snapshot(store, &snapshot))
+}
+
+pub(crate) fn ensure_song_not_queued(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    with_store(app, &app.state::<QueueStorage>(), |store| {
+        let snapshot = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get::<_, String>(0)).optional().map_err(|e| e.to_string())?;
+        if let Some(text) = snapshot {
+            let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if value["tasks"].as_array().is_some_and(|tasks| tasks.iter().any(|task| task.pointer("/song/id").and_then(Value::as_str) == Some(id))) {
+                return Err("歌曲已在互动队列中，请先完成或跳过，再编辑或删除".into());
+            }
+        }
+        Ok(())
+    })
 }
 
 fn commit_snapshot(store: &mut Store, snapshot: &Value) -> Result<(), String> {

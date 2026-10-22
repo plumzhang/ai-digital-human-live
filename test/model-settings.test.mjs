@@ -135,7 +135,7 @@ test('saved model is visible on reentry before querying and survives an empty mo
   summary = nodes(tree).find(node => node.props?.className === 'model-saved-summary');
   assert.ok(JSON.stringify(summary).includes('my-saved-model'));
   assert.equal(JSON.parse(p.storage.get('openai-model-config')).selectedModel, 'my-saved-model');
-  assert.ok(JSON.stringify(tree).includes('已保留选择'));
+  assert.ok(JSON.stringify(tree).includes('当前接口未返回所选模型'));
 });
 
 test('unsaved model selections do not overwrite the saved choice', async () => {
@@ -166,14 +166,31 @@ test('fixed persona defaults to 晚晚 and is saved with the selected model', as
   assert.equal(JSON.parse(p.storage.get('openai-model-config')).persona, '你是晚晚，只输出要说的话。');
 });
 
-test('the unchanged legacy default gains actions while custom personas are preserved', () => {
+test('all unchanged answer personas migrate to question optimization while custom personas are preserved', () => {
   const initial = mount(async () => [], config);
   const current = nodes(initial.render()).find(node => node.tag === 'textarea').props.value;
+  assert.ok(current.includes('提问优化助手'));
+  assert.ok(current.includes('不代替数字人回答'));
   assert.ok(current.includes('边说边做'));
-  const legacy = current.replace(/8\. 台词与动作配合：[\s\S]*$/, '8. 只输出要说的话，不输出动作或解释。');
-  const migrated = mount(async () => [], { ...config, persona: legacy });
-  assert.equal(nodes(migrated.render()).find(node => node.tag === 'textarea').props.value, current);
+  const versions = {};
+  const source = ts.transpileModule(fs.readFileSync('src/modelConfig.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  vm.runInNewContext(source + '\nexports.oldPersonas = [legacyModelPersona, previousModelPersona, previousIntentModelPersona, previousGazeModelPersona];', { exports: versions });
+  for (const persona of [...versions.oldPersonas, current]) {
+    const migrated = mount(async () => [], { ...config, persona });
+    assert.equal(nodes(migrated.render()).find(node => node.tag === 'textarea').props.value, current);
+  }
   const custom = '你是晚晚，请按我的自定义风格互动。';
   const retained = mount(async () => [], { ...config, persona: custom });
   assert.equal(nodes(retained.render()).find(node => node.tag === 'textarea').props.value, custom);
+});
+
+test('custom persona can be reset to question optimization and persisted explicitly', () => {
+  const p = mount(async () => [], { ...config, selectedModel: 'model', persona: '你是主播，只输出答案。' });
+  let tree = p.render();
+  nodes(tree).find(node => node.tag === 'button' && node.props.children === '恢复默认提问规则').props.onClick();
+  tree = p.render();
+  assert.match(nodes(tree).find(node => node.tag === 'textarea').props.value, /提问优化助手/);
+  assert.equal(JSON.parse(p.storage.get('openai-model-config')).persona, '你是主播，只输出答案。');
+  nodes(tree).find(node => node.tag === 'button' && node.props.children?.includes(' 保存配置')).props.onClick();
+  assert.match(JSON.parse(p.storage.get('openai-model-config')).persona, /不代替数字人回答/);
 });

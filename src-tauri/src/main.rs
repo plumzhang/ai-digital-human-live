@@ -4,6 +4,9 @@ mod model_api;
 mod obs_window;
 mod queue_store;
 mod signal_trace;
+mod tts_log;
+mod songs;
+mod song_director;
 mod whisper;
 
 use futures_util::{SinkExt, StreamExt};
@@ -90,6 +93,15 @@ struct Outbound {
     written: Option<oneshot::Sender<Result<(), String>>>,
 }
 
+// Bound every write, including heartbeats: a stalled socket must not prevent
+// the control loop from reading errors or reporting later lyrics as unsent.
+async fn write_control<W>(writer: &mut W, message: Message) -> Result<(), String>
+where W: futures_util::Sink<Message> + Unpin, W::Error: std::fmt::Display {
+    tokio::time::timeout(std::time::Duration::from_secs(3), writer.send(message)).await
+        .map_err(|_| "控制连接写入超时".to_string())?
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Serialize, Clone)]
 struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String }
 
@@ -151,6 +163,7 @@ fn session_signal(text: &str, live_id: &str) -> Option<Value> {
     // Transcription frames omit live_id. Bind all events to the trusted
     // WebSocket session before sending them to the console and OBS windows.
     signal.as_object_mut()?.insert("live_id".into(), json!(live_id));
+    signal.as_object_mut()?.insert("received_at".into(), json!(unix_ms()));
     Some(signal)
 }
 
@@ -223,7 +236,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let (mut writer, mut reader) = ws.split();
     let (sender, mut receiver) = unbounded_channel::<Outbound>();
     let init = json!({"type":1,"live_id":live_id,"conn_id":conn_id,"seq_id":1,"payload":{"conn_init":{"version":1}}});
-    writer.send(Message::Text(init.to_string().into())).await.map_err(|e| e.to_string())?;
+    write_control(&mut writer, Message::Text(init.to_string().into())).await?;
     let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: avatar.voice_provider.clone() };
     *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id, key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: avatar.voice_provider.clone() });
     let _ = app.emit("session-changed", snapshot.clone());
@@ -238,15 +251,16 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
-                    if writer.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                    if write_control(&mut writer, Message::Ping(Vec::new().into())).await.is_err() { break; }
                 }
                 outgoing = receiver.recv() => {
                     match outgoing {
                         Some(outbound) => {
                             let metadata = match &outbound.message { Message::Text(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null), _ => Value::Null };
-                            let result = writer.send(outbound.message).await.map_err(|e| e.to_string());
+                            let result = write_control(&mut writer, outbound.message).await;
                             let failed = result.is_err();
                             signal_trace::record(&app_for_task, &task_live_id, if failed { "write_failed" } else { "written" }, &metadata);
+                            tts_log::record(&app_for_task, &task_live_id, &metadata, result.as_ref().err().map(String::as_str));
                             if let Some(written) = outbound.written { let _ = written.send(result); }
                             if failed { break; }
                         }
@@ -258,6 +272,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                         Some(Ok(Message::Text(text))) => {
                             if let Some(value) = session_signal(&text, &task_live_id) {
                                 if matches!(value["type"].as_u64(), Some(2 | 6 | 103)) { signal_trace::record(&app_for_task, &task_live_id, "received", &value); }
+                                if value["type"].as_u64() == Some(103) { tts_log::record_rejection(&app_for_task, &task_live_id, &value); }
                                 if value.get("type").and_then(Value::as_u64) == Some(6) { forced = true; }
                                 if value.get("type").and_then(Value::as_u64) == Some(2)
                                     && value.pointer("/payload/conn_init_ack/error_code").and_then(Value::as_str) == Some("NOT_READY")
@@ -265,18 +280,28 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                                     retries += 1;
                                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     let retry = json!({"type":1,"live_id":value.get("live_id"),"conn_id":value.get("conn_id"),"seq_id":retries+1,"payload":{"conn_init":{"version":1}}});
-                                    if writer.send(Message::Text(retry.to_string().into())).await.is_err() { break; }
+                                    if write_control(&mut writer, Message::Text(retry.to_string().into())).await.is_err() { break; }
                                 }
                                 let _ = app_for_task.emit("vidu-signal", value);
                                 if forced { break; }
                             }
                         }
-                        Some(Ok(Message::Ping(data))) => { if writer.send(Message::Pong(data)).await.is_err() { break; } }
+                        Some(Ok(Message::Ping(data))) => { if write_control(&mut writer, Message::Pong(data)).await.is_err() { break; } }
                         Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                         _ => {}
                     }
                 }
             }
+        }
+        // Pending instructions were never written when the connection closed.
+        receiver.close();
+        while let Ok(outbound) = receiver.try_recv() {
+            if let Message::Text(text) = &outbound.message {
+                if let Ok(signal) = serde_json::from_str::<Value>(text) {
+                    tts_log::record(&app_for_task, &task_live_id, &signal, Some("控制连接已关闭，指令未发送"));
+                }
+            }
+            if let Some(written) = outbound.written { let _ = written.send(Err("控制连接已关闭".into())); }
         }
         signal_trace::record(&app_for_task, &task_live_id, if forced { "forced_closed" } else { "socket_closed" }, &json!({}));
         if forced {
@@ -285,7 +310,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
             }
             let _ = app_for_task.emit("session-ended", json!({"live_id":task_live_id}));
         }
-        let _ = writer.close().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), writer.close()).await;
         let _ = app_for_task.emit("vidu-disconnected", json!({"live_id":task_live_id,"forced":forced}));
         if !forced {
             if let Err(error) = end_session(app_for_task.clone(), app_for_task.state::<AppState>(), Some(task_live_id)).await {
@@ -296,21 +321,39 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     Ok(snapshot)
 }
 
-fn send_signal(session: &mut Session, kind: u64, payload: Value) -> Result<(), String> {
+fn send_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload: Value) -> Result<(), String> {
+    queue_signal(app, session, kind, payload, None)
+}
+
+fn queue_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload: Value, written: Option<oneshot::Sender<Result<(), String>>>) -> Result<(), String> {
     session.seq += 1;
     let message = json!({"type":kind,"live_id":session.live_id,"conn_id":session.conn_id,"seq_id":session.seq,"payload":payload});
-    session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written: None }).map_err(|e| e.to_string())
+    session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written }).map_err(|error| {
+        tts_log::record(app, &session.live_id, &message, Some("控制连接已关闭，指令未发送"));
+        error.to_string()
+    })
+}
+
+fn speech_message_signal(content: &str, task_id: Option<String>) -> Result<(u64, Value), String> {
+    let content = content.trim();
+    if content.is_empty() { return Err("播报文本不能为空".into()); }
+    // Retain task IDs so lyric observations and service errors still correlate.
+    let msg_id = task_id.filter(|id| !id.trim().is_empty()).map(|id| format!("tts-{id}")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    Ok((99, json!({"text_msg":{"msg_id":msg_id,"content":content,"timestamp":unix_ms()}})))
 }
 
 #[tauri::command]
-fn speak_text(state: State<'_, AppState>, live_id: String, content: String, task_id: Option<String>) -> Result<(), String> {
-    let content = content.trim();
-    if content.is_empty() { return Err("播报文本不能为空".into()); }
-    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次播报")?;
-    if session.voice_provider != "doubao" { return Err("指定台词播报需要豆包音色供应商，请结束会话后改为豆包再创建数字人".into()); }
-    let msg_id = task_id.filter(|id| !id.trim().is_empty()).map(|id| format!("tts-{id}")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    send_signal(session, 100, json!({"text_tts":{"msg_id":msg_id,"content":content}}))
+async fn speak_text(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, content: String, task_id: Option<String>) -> Result<(), String> {
+    let (kind, payload) = speech_message_signal(&content, task_id)?;
+    let (written, received) = oneshot::channel();
+    {
+        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次播报")?;
+        queue_signal(&app, session, kind, payload, Some(written))?;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(4), received).await
+        .map_err(|_| "文本写入确认超时，请检查控制连接".to_string())?
+        .map_err(|_| "控制连接已关闭，未收到写入结果".to_string())?
 }
 
 fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
@@ -325,11 +368,11 @@ fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn send_avatar_action(state: State<'_, AppState>, live_id: String, task_id: String, gesture: Option<String>, instruction: Option<String>) -> Result<(), String> {
+fn send_avatar_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, gesture: Option<String>, instruction: Option<String>) -> Result<(), String> {
     let payload = avatar_action_payload(&task_id, gesture.as_deref(), instruction.as_deref())?;
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次动作")?;
-    send_signal(session, 101, payload)
+    send_signal(&app, session, 101, payload)
 }
 
 fn avatar_action_payload(task_id: &str, gesture: Option<&str>, instruction: Option<&str>) -> Result<Value, String> {
@@ -350,33 +393,52 @@ fn handoff_action_payload(task_id: &str, direction: &str, angle_deg: u16) -> Res
     let content = match direction {
         "left_down" => format!("头部与视线朝向左下角，向左下方斜向下{angle_deg}度查看，像在查看左下方手机上的新消息。动作自然流畅，保持放松，随后自然抬眼看向镜头。只做动作，不要说话。"),
         "right_down" => format!("头部与视线朝向右下角，向右下方斜向下{angle_deg}度查看，像在查看右下方手机上的新消息。动作自然流畅，保持放松，随后自然抬眼看向镜头。只做动作，不要说话。"),
+        "left_up" => format!("头部与视线朝向左上角，向左上方斜向上{angle_deg}度查看。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "right_up" => format!("头部与视线朝向右上角，向右上方斜向上{angle_deg}度查看。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "left" => format!("头部与视线向左侧水平转动{angle_deg}度查看，保持平视，不抬头、不低头。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "right" => format!("头部与视线向右侧水平转动{angle_deg}度查看，保持平视，不抬头、不低头。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "up" => format!("头部与视线向正上方抬起，仰头{angle_deg}度查看，不向左右转头。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "down" => format!("头部与视线向正下方低下，低头{angle_deg}度查看，不向左右转头。动作自然流畅，保持放松，随后自然回到平视前方、看向镜头的姿态。只做动作，不要说话。"),
+        "front" => "头部保持端正，目光平视前方，自然看向镜头，肩颈放松，保持面对镜头的自然姿态。只做动作，不要说话。".to_string(),
         _ => return Err("未知的承接动作方向".into()),
     };
     Ok(json!({"text_action":{"msg_id":format!("handoff-{task_id}"),"content":content}}))
 }
 
 #[tauri::command]
-fn send_handoff_action(state: State<'_, AppState>, live_id: String, task_id: String, direction: String, angle_deg: Option<u16>) -> Result<(), String> {
-    let payload = handoff_action_payload(&task_id, &direction, angle_deg.unwrap_or(45))?;
+fn send_handoff_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, direction: String, angle_deg: Option<u16>) -> Result<(), String> {
+    let payload = handoff_action_payload(&task_id, &direction, angle_deg.unwrap_or(30))?;
     let mut guard = state.session.lock().map_err(|error| error.to_string())?;
     let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消承接动作")?;
-    send_signal(session, 101, payload)
+    send_signal(&app, session, 101, payload)
 }
 
-#[tauri::command]
-fn send_question(state: State<'_, AppState>, content: String) -> Result<(), String> {
+fn manual_question_signal(content: &str, message_type: Option<&str>) -> Result<(u64, Value), String> {
     let content = content.trim();
     if content.is_empty() { return Err("请输入问题".into()); }
-    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_mut().ok_or("Vidu 会话尚未启动")?;
-    send_signal(session, 99, json!({"text_msg":{"msg_id":uuid::Uuid::new_v4().to_string(),"content":content,"timestamp":unix_ms()}}))
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    match message_type.unwrap_or("text_msg") {
+        "text_msg" => Ok((99, json!({"text_msg":{"msg_id":msg_id,"content":content,"timestamp":unix_ms()}}))),
+        "text_dialog" => Ok((102, json!({"text_dialog":{"msg_id":msg_id,"content":content}}))),
+        _ => Err("手动提问仅支持 text_msg 或 text_dialog".into()),
+    }
 }
 
 #[tauri::command]
-fn interrupt_session(state: State<'_, AppState>) -> Result<(), String> {
+fn send_question(app: tauri::AppHandle, state: State<'_, AppState>, content: String, live_id: Option<String>, message_type: Option<String>) -> Result<(), String> {
+    let (kind, payload) = manual_question_signal(&content, message_type.as_deref())?;
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("Vidu 会话尚未启动")?;
-    send_signal(session, 7, json!({}))
+    if live_id.as_ref().is_some_and(|id| id != &session.live_id) { return Err("原会话已结束，已取消手动提问".into()); }
+    send_signal(&app, session, kind, payload)
+}
+
+#[tauri::command]
+fn interrupt_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id: Option<String>) -> Result<(), String> {
+    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+    let session = guard.as_mut().ok_or("Vidu 会话尚未启动")?;
+    if live_id.as_ref().is_some_and(|id| id != &session.live_id) { return Err("原会话已结束，已取消打断".into()); }
+    send_signal(&app, session, 7, json!({}))
 }
 
 async fn reconnect_and_hangup(key: &str, region: &str, live_id: &str, conn_id: &str, seq: u64) -> Result<(), String> {
@@ -572,7 +634,7 @@ async fn clone_live_voice(key: String, region: String, voice: String, audio_url:
     let key = normalized_key(&key)?;
     if voice.trim().is_empty() || audio_url.trim().is_empty() { return Err("请填写音色名称和可访问的音频 URL".into()); }
     if audio_url.chars().count() > 2048 { return Err("audio_url 超过 Vidu 的 2048 字符上限，请使用可访问的音频 URL".into()); }
-    let mut body = json!({"voice":voice,"audio_url":audio_url,"language":"zh","provider":"doubao"});
+    let mut body = json!({"voice":voice,"audio_url":audio_url,"language":"zh","provider":"qwen_omni"});
     if !transcript.trim().is_empty() { body["text"] = json!(transcript.trim()); }
     let response = reqwest::Client::new().post(format!("{}/live/v1/voices/clone", api_host(&region)))
         .header("Authorization", format!("Token {}", key))
@@ -682,7 +744,9 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(queue_store::QueueStorage::default())
+        .manage(songs::SongManager::default())
         .manage(whisper::WhisperRuntime::default())
+        .manage(song_director::DirectorRuntime::default())
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -711,7 +775,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, whisper::whisper_prepare, whisper::whisper_transcribe])
+        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }
@@ -721,11 +785,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manual_questions_route_message_and_dialogue_to_their_own_protocol_types() {
+        for (mode, expected_kind, field) in [(None, 99, "text_msg"), (Some("text_msg"), 99, "text_msg"), (Some("text_dialog"), 102, "text_dialog")] {
+            let (kind, payload) = manual_question_signal("  你好，今天聊什么？  ", mode).unwrap();
+            assert_eq!(kind, expected_kind);
+            assert_eq!(payload[field]["content"], "你好，今天聊什么？");
+            uuid::Uuid::parse_str(payload[field]["msg_id"].as_str().unwrap()).unwrap();
+            assert_eq!(payload.as_object().unwrap().len(), 1);
+            assert_eq!(payload[field].get("timestamp").is_some(), field == "text_msg");
+        }
+        assert!(manual_question_signal("  ", Some("text_dialog")).is_err());
+        for mode in ["text_action", "text_tts", "102", ""] { assert!(manual_question_signal("你好", Some(mode)).is_err()); }
+    }
+
+    #[test]
+    fn speech_uses_text_messages_with_task_ids_and_timestamps() {
+        let before = unix_ms();
+        let (kind, payload) = speech_message_signal("  第一行歌词\n第二行  ", Some("attempt-4".into())).unwrap();
+        assert_eq!(kind, 99);
+        assert_eq!(payload["text_msg"]["content"], "第一行歌词\n第二行");
+        assert_eq!(payload["text_msg"]["msg_id"], "tts-attempt-4");
+        let timestamp = payload["text_msg"]["timestamp"].as_u64().unwrap() as u128;
+        assert!(timestamp >= before && timestamp <= unix_ms());
+        assert!(payload.get("text_tts").is_none());
+        for task_id in [None, Some("  ".into())] {
+            let (kind, payload) = speech_message_signal("手动文字回复", task_id).unwrap();
+            assert_eq!(kind, 99);
+            assert_eq!(payload["text_msg"]["content"], "手动文字回复");
+            uuid::Uuid::parse_str(payload["text_msg"]["msg_id"].as_str().unwrap()).unwrap();
+        }
+        assert!(speech_message_signal(" \n ", None).is_err());
+    }
+
+    #[test]
     fn transcription_frames_are_bound_to_the_socket_session() {
         let frame = r#"{"payload":{"text_msg":{"content":"你好，请问你可以帮我做什么？"}},"type":9}"#;
         let signal = session_signal(frame, "live-123").unwrap();
         assert_eq!(signal["live_id"], "live-123");
         assert_eq!(signal["type"], 9);
+        assert!(signal["received_at"].as_u64().unwrap() > 0);
+        let output = session_signal(r#"{"type":10,"received_at":1,"payload":{"text_msg":{"content":"实际回答"}}}"#, "live-123").unwrap();
+        assert!(output["received_at"].as_u64().unwrap() > 1);
+        assert_eq!(output["payload"]["text_msg"]["content"], "实际回答");
         assert_eq!(signal["payload"]["text_msg"]["content"], "你好，请问你可以帮我做什么？");
         assert_eq!(session_signal(r#"{"type":10,"live_id":"wrong"}"#, "live-123").unwrap()["live_id"], "live-123");
         assert!(session_signal("[]", "live-123").is_none());
@@ -786,15 +887,29 @@ mod tests {
 
     #[test]
     fn handoff_actions_use_the_requested_direction_without_speech_or_arbitrary_commands() {
-        for (direction, expected) in [("left_down", "左下"), ("right_down", "右下")] {
+        for (direction, expected, angle_prefix) in [
+            ("left_down", "左下", "斜向下"), ("right_down", "右下", "斜向下"),
+            ("left_up", "左上", "斜向上"), ("right_up", "右上", "斜向上"),
+            ("left", "左侧", "水平转动"), ("right", "右侧", "水平转动"),
+            ("up", "正上方", "仰头"), ("down", "正下方", "低头"),
+            ("front", "平视前方", ""),
+        ] {
             for angle in [0, 30, 45, 90] {
                 let payload = handoff_action_payload("task-1", direction, angle).unwrap();
                 assert_eq!(payload["text_action"]["msg_id"], "handoff-task-1");
                 let text = payload["text_action"]["content"].as_str().unwrap();
-                assert!(text.contains(expected)); assert!(text.contains(&format!("斜向下{angle}度"))); assert!(text.contains("不要说话"));
+                assert!(text.contains(expected));
+                if direction == "front" {
+                    assert!(!text.contains("度"));
+                    assert!(!text.contains("下角"));
+                } else {
+                    assert!(text.contains(&format!("{angle_prefix}{angle}度")));
+                }
+                assert!(text.contains("不要说话"));
                 assert!(payload.get("text_tts").is_none());
             }
         }
+        assert_eq!(handoff_action_payload("task-1", "front", 0).unwrap(), handoff_action_payload("task-1", "front", 90).unwrap());
         assert!(handoff_action_payload("task-1", "left_down", 91).is_err());
         assert!(handoff_action_payload("task-1", "arbitrary-command", 45).is_err());
         assert!(handoff_action_payload("", "left_down", 45).is_err());

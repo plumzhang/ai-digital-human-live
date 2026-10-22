@@ -10,17 +10,25 @@ const actionsExports = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/giftActions.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
   { exports: actionsExports });
 const { avatarActionFor } = actionsExports;
+const outputExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/avatarOutput.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: outputExports });
 const recognitionExports = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: recognitionExports, require: name => { assert.equal(name, 'pinyin-pro'); return pinyinPro; } });
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/interactionQueue.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
   { exports, structuredClone, crypto, Date, setTimeout, clearTimeout, require: name => {
     if (name === './whisperRecognition') return recognitionExports;
+    if (name === './avatarOutput') return outputExports;
     assert.equal(name, './giftActions');
     return actionsExports;
   } });
 const { InteractionQueue, emptyQueue, normalizeInteraction } = exports;
+const manualExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/manualQuestions.ts', 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, { exports: manualExports, Date });
+const { ManualQuestions } = manualExports;
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
-const reply = text => ({ speech: text, emotion: 'happy', segments: [] });
+const reply = text => ({ speech: text, generation_mode: 'question', emotion: 'happy', segments: [] });
 
 function setup(initial = emptyQueue(), persistError = false, extras = {}) {
   let now = 100_000;
@@ -28,16 +36,190 @@ function setup(initial = emptyQueue(), persistError = false, extras = {}) {
   const spoken = [];
   const saved = [];
   const errors = [];
+  const { autoAnswer = true, ...adapterExtras } = extras;
   const engine = new InteractionQueue(initial, {
     persist: async state => { if (persistError) throw Error('disk full'); saved.push(structuredClone(state)); },
     generate: (task, history, diversity) => new Promise((resolve, reject) => jobs.set(task.event.event_id, { resolve, reject, task, history, diversity })),
-    speak: async task => { spoken.push(task.event.event_id); },
-    changed: () => {}, error: message => errors.push(message), now: () => now, ...extras,
+
+    changed: () => {}, error: message => errors.push(message), now: () => now, ...adapterExtras,
+    speak: async (task, liveId) => {
+      if (adapterExtras.speak) await adapterExtras.speak(task, liveId);
+      else spoken.push(task.event.event_id);
+      if (autoAnswer && !task.song) await engine.observeOutput({ live_id: liveId, text: task.result.speech, received_at: now, msg_id: `tts-${task.id}` });
+    },
   });
   const event = (id, type = 'chat', extra = {}) => ({ event_id: id, type, room_id: 'room', user_id: `user-${id}`, nickname: id, content: id, created_at: now, ...extra });
   const observe = async () => { engine.observeAudio(false, 'live'); engine.observeVideo('live'); await engine.tick(); await flush(); };
   return { engine, jobs, spoken, saved, errors, event, observe, advance: ms => { now += ms; }, now: () => now };
 }
+
+function operator(p, send) {
+  const sent = [];
+  let questions = [];
+  const manual = new ManualQuestions({
+    holdPlayback: held => p.engine.setPlaybackHeld(held),
+    canStart: quietMs => p.engine.canInsertPlayback(quietMs),
+    send: send || (async (content, liveId) => { sent.push({ content, liveId }); }),
+    changed: value => { questions = value; }, error: message => p.errors.push(message), now: p.now,
+  });
+  const idle = async (ms = 1600) => {
+    p.engine.observeVideo('live');
+    p.engine.observeVad({ speaking: false, ended: true, healthy: true }, 'live');
+    for (let elapsed = 0; elapsed < ms;) {
+      const step = Math.min(200, ms - elapsed);
+      elapsed += step; p.advance(step);
+      p.engine.observeVideo('live');
+      p.engine.observeVad({ speaking: false, ended: true, healthy: true }, 'live');
+      await manual.tick('live', true);
+      await p.engine.tick();
+    }
+  };
+  const voice = () => {
+    p.engine.observeVideo('live');
+    p.engine.observeVad({ speaking: true, ended: false, healthy: true }, 'live');
+    manual.observeSpeech('live');
+  };
+  return { manual, sent, idle, voice, questions: () => questions };
+}
+
+test('operator question reserves the next turn during playback and restores all six interaction slots afterward', async () => {
+  const p = setup();
+  const m = operator(p);
+  const ids = ['A', 'B', 'C', 'D', 'E', 'F'];
+  await p.engine.importTestBatch(ids.map(id => ({ event: p.event(id), result: reply(id) })));
+  await p.engine.setContext(true, 'live', true);
+  await m.idle();
+  assert.deepEqual(p.spoken, ['A']);
+  m.manual.enqueue('  请挥挥手  ', 'live');
+  await m.manual.tick('live', true);
+  assert.equal(m.sent.length, 0);
+  assert.equal(p.engine.snapshot().tasks.length, 6);
+  await p.engine.finish('played', 'operator confirmation');
+  await m.idle();
+  assert.deepEqual(m.sent, [{ content: '请挥挥手', liveId: 'live' }]);
+  assert.deepEqual(p.spoken, ['A']);
+  await m.idle(4000); // Silence without observed speech cannot consume a question.
+  assert.equal(m.questions()[0].status, 'playing');
+  m.voice();
+  await m.idle(2600);
+  assert.equal(m.questions().length, 0);
+  assert.deepEqual(p.spoken, ['A', 'B']);
+  assert.deepEqual(p.engine.snapshot().tasks.map(task => task.event.event_id), ids.slice(1));
+  p.engine.dispose();
+});
+
+test('operator question bypasses unfinished generation while generated replies wait for its answer', async () => {
+  const p = setup();
+  const m = operator(p);
+  await p.engine.setContext(true, 'live', true);
+  await p.engine.ingest(p.event('A'));
+  m.manual.enqueue('手动问题', 'live');
+  await m.idle();
+  assert.equal(m.sent.length, 1);
+  assert.ok(p.jobs.has('A'));
+  p.jobs.get('A').resolve(reply('generated answer'));
+  await flush(); await p.engine.tick();
+  assert.equal(p.engine.snapshot().tasks[0].status, 'ready');
+  assert.equal(p.spoken.length, 0);
+  m.voice(); await m.idle(2600);
+  assert.deepEqual(p.spoken, ['A']);
+  p.engine.dispose();
+});
+
+test('multiple operator questions remain FIFO ahead of the next ready interaction', async () => {
+  const p = setup(); const m = operator(p);
+  await p.engine.importTestBatch([{ event: p.event('A'), result: reply('A') }]);
+  await p.engine.setContext(true, 'live', true);
+  m.manual.enqueue('first', 'live'); m.manual.enqueue('second', 'live');
+  await m.idle();
+  assert.equal(m.sent.length, 1);
+  m.voice(); await m.idle(2600);
+  assert.equal(m.questions().length, 1);
+  assert.equal(p.spoken.length, 0);
+  await m.manual.tick('live', true);
+  assert.deepEqual(m.sent.map(item => item.content), ['first', 'second']);
+  m.voice(); await m.idle(2600);
+  assert.deepEqual(p.spoken, ['A']);
+  p.engine.dispose();
+});
+
+test('operator questions run with automatic replies off without enabling paused interactions', async () => {
+  const p = setup(); const m = operator(p);
+  await p.engine.importTestBatch([{ event: p.event('A'), result: reply('A') }]);
+  await p.engine.setContext(false, 'live', false);
+  m.manual.enqueue('standalone question', 'live');
+  await m.idle();
+  assert.equal(m.sent.length, 1);
+  m.voice(); await m.idle(2600);
+  assert.equal(m.questions().length, 0);
+  assert.equal(p.spoken.length, 0);
+  assert.equal(p.jobs.size, 0);
+  p.engine.dispose();
+});
+
+test('uncertain operator delivery blocks later playback until explicit confirmation', async () => {
+  const p = setup(); const m = operator(p, async () => { throw Error('write timeout'); });
+  await p.engine.importTestBatch([{ event: p.event('A'), result: reply('A') }]);
+  await p.engine.setContext(true, 'live', true);
+  m.manual.enqueue('question', 'live');
+  await m.idle();
+  assert.equal(m.questions()[0].status, 'uncertain');
+  await m.idle(10000);
+  assert.equal(p.spoken.length, 0);
+  assert.equal(p.errors.length, 1);
+  m.manual.confirm(); await p.engine.tick();
+  assert.deepEqual(p.spoken, ['A']);
+  p.engine.dispose();
+});
+
+test('operator answer requires fresh healthy media and a speech observation from the matching live', async () => {
+  const p = setup(); const m = operator(p);
+  await p.engine.setContext(false, 'live', false);
+  m.manual.enqueue('question', 'live'); await m.idle();
+  m.manual.observeSpeech('old-live'); await m.idle(3000);
+  assert.equal(m.questions().length, 1);
+  m.voice(); p.advance(3000);
+  await m.manual.tick('live', true); // Stale audio/video must not release the turn.
+  assert.equal(m.questions().length, 1);
+  p.engine.observeVideo('live');
+  p.engine.observeVad({ speaking: false, ended: true, healthy: false }, 'live');
+  await m.manual.tick('live', true);
+  assert.equal(m.questions().length, 1);
+  await m.idle(1000);
+  assert.equal(m.questions().length, 1);
+  await m.idle(1600);
+  assert.equal(m.questions().length, 0);
+  p.engine.dispose();
+});
+
+test('a missing operator answer becomes uncertain instead of releasing queued interactions on a timer', async () => {
+  const p = setup(); const m = operator(p);
+  await p.engine.setContext(true, 'live', true);
+  m.manual.enqueue('question', 'live'); await m.idle();
+  await m.idle(60001);
+  assert.equal(m.questions()[0].status, 'uncertain');
+  m.voice(); await m.idle(3000);
+  assert.equal(m.questions()[0].status, 'uncertain');
+  m.manual.cancel(); assert.equal(m.questions().length, 0);
+  p.engine.dispose();
+});
+
+test('session change cancels pending questions and ignores a late failure from the old submission', async () => {
+  let rejectSend;
+  const p = setup(); const m = operator(p, () => new Promise((_, reject) => { rejectSend = reject; }));
+  await p.engine.setContext(false, 'live', false);
+  m.manual.enqueue('first', 'live'); m.manual.enqueue('second', 'live');
+  for (let i = 0; i < 9; i++) { p.engine.observeVideo('live'); p.engine.observeAudio(false, 'live'); p.advance(200); }
+  p.engine.observeVideo('live'); p.engine.observeAudio(false, 'live');
+  const sending = m.manual.tick('live', true);
+  assert.equal(typeof rejectSend, 'function');
+  await m.manual.tick('new-live', false);
+  assert.equal(m.questions().length, 0);
+  rejectSend(Error('old session closed')); await sending;
+  assert.equal(p.errors.length, 0);
+  assert.equal(m.questions().length, 0);
+  p.engine.dispose();
+});
 
 test('test batch is persisted in input order, retains supplied answers and does not expire while waiting', async () => {
   const p = setup();
@@ -135,7 +317,7 @@ test('six slots include current speech, a seventh waits, only two generations ru
   p.engine.dispose();
 });
 
-test('concurrent replies use different opening styles and later generations avoid anonymized recent openings', async () => {
+test('concurrent questions vary response style without treating pre-generated questions as answers', async () => {
   const p = setup();
   await p.engine.importTestBatch(['A', 'B', 'C'].map(id => ({ event: p.event(id) })));
   await p.engine.setContext(true, 'live', true);
@@ -144,8 +326,7 @@ test('concurrent replies use different opening styles and later generations avoi
   p.jobs.get('A').resolve(reply('A，今天能来聊聊天就很好。')); await flush();
   const context = p.jobs.get('C').diversity;
   assert.notEqual(context.openingStyle, p.jobs.get('B').diversity.openingStyle);
-  assert.ok(context.recentOpenings[0].startsWith('观众，'));
-  assert.equal(context.recentOpenings[0].includes('A'), false);
+  assert.deepEqual(Array.from(context.recentOpenings), []);
   // Stylistic fragments do not become another viewer's conversation history.
   assert.equal(p.jobs.get('C').history.length, 0);
   p.engine.dispose();
@@ -308,7 +489,7 @@ test('ready replies can be regenerated without replaying another task or keeping
 });
 
 test('handoff directions persist and submit exactly once between completed speech and the next reply', async () => {
-  for (const direction of ['left_down', 'right_down']) {
+  for (const direction of ['left_down', 'right_down', 'left_up', 'right_up', 'left', 'right', 'up', 'down', 'front']) {
     const order = [];
     let release;
     const p = setup(emptyQueue(), false, {
@@ -321,6 +502,11 @@ test('handoff directions persist and submit exactly once between completed speec
     });
     await p.engine.configureHandoff(true, direction);
     assert.equal(p.saved.at(-1).handoff.direction, direction);
+    assert.equal(p.saved.at(-1).handoff.wait_ms, 1699);
+    assert.equal(p.saved.at(-1).handoff.angle_deg, 30);
+    const reopened = setup(p.saved.at(-1));
+    assert.equal(reopened.engine.snapshot().handoff.direction, direction);
+    reopened.engine.dispose();
     await p.engine.importTestBatch(['A', 'B', 'C'].map(id => ({ event: p.event(id), result: reply(id) })));
     await p.engine.setContext(true, 'live', true);
     p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true }, 'live');
@@ -336,9 +522,9 @@ test('handoff directions persist and submit exactly once between completed speec
     release(); await end;
     assert.deepEqual(order, ['speech:A', 'handoff:A']);
     assert.equal(p.engine.snapshot().handoff_action.status, 'submitted');
-    assert.equal(p.engine.snapshot().handoff_action.resume_at, p.now() + 1000);
+    assert.equal(p.engine.snapshot().handoff_action.resume_at, p.now() + 1699);
     assert.equal(p.engine.snapshot().history.length, 1);
-    p.advance(999); p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true }, 'live');
+    p.advance(1698); p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true }, 'live');
     await p.engine.tick();
     assert.deepEqual(order, ['speech:A', 'handoff:A']);
     p.advance(1); p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true }, 'live');
@@ -778,7 +964,7 @@ test('Whisper short-reply matching sends handoff without silence and waits from 
     handoff: task => { order.push(`handoff:${task.event.event_id}`); return new Promise(resolve => { release = resolve; }); },
   });
   await p.engine.configureRecognition(true);
-  await p.engine.configureHandoff(true, 'left_down', 1000);
+  await p.engine.configureHandoff(true, 'left_down', 1000, undefined, 70);
   const speech = '今天聊聊天，最后祝大家晚安。';
   await p.engine.importTestBatch(['A', 'B', 'C'].map(id => ({ event: p.event(id), result: reply(speech) })));
   await p.engine.setContext(true, 'live', true);
@@ -830,8 +1016,8 @@ test('Whisper rejects foreign attempts, late recognition before newer speech, st
     await p.engine.observeRecognition({ ...observation, live_id: 'old-live' });
     assert.equal(p.engine.snapshot().tasks[0].recognition, undefined);
     p.advance(10); vad(0); p.advance(400); vad(400);
-    await p.engine.observeRecognition(observation);
-    assert.deepEqual(p.spoken, ['A']); // Audio after this result still needs recognition.
+    await p.engine.observeRecognition(enabled ? { ...observation, captured_at: task.started_at - 1 } : observation);
+    assert.deepEqual(p.spoken, ['A']); // Invalid captures cannot complete the task; normal completion also requires the latest speech.
     vad(400, false);
     await p.engine.observeRecognition({ ...observation, captured_at: p.now() });
     assert.deepEqual(p.spoken, ['A']);
@@ -850,7 +1036,7 @@ test('Whisper with handoff disabled still requires 350ms of silence after matchi
   let handoffs = 0;
   const p = setup(undefined, false, { handoff: async () => { handoffs++; } });
   await p.engine.configureRecognition(true);
-  await p.engine.importTestBatch(['A', 'B'].map(id => ({ event: p.event(id), result: reply('欢迎来到我们的直播间。') })));
+  await p.engine.importTestBatch(['A', 'B'].map(id => ({ event: p.event(id), result: reply('ABCDEFGHIJ') })));
   await p.engine.setContext(true, 'live', true);
   const vad = (quiet_ms, speaking = true) => {
     p.engine.observeVideo('live');
@@ -858,6 +1044,10 @@ test('Whisper with handoff disabled still requires 350ms of silence after matchi
   };
   vad(1000, false); await p.engine.tick();
   const task = p.engine.snapshot().tasks[0];
+  vad(0);
+  await p.engine.observeRecognition({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text: 'ABCDE', captured_at: p.now(), inference_ms: 20 });
+  p.advance(350); vad(350); await p.engine.tick();
+  assert.deepEqual(p.spoken, ['A']); // The handoff threshold does not lower the normal completion threshold.
   vad(0);
   await p.engine.observeRecognition({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text: task.result.speech, captured_at: p.now(), inference_ms: 20 });
   assert.deepEqual(p.spoken, ['A']);
@@ -908,7 +1098,7 @@ test('restored homophone evidence is recalculated but never overrides manual con
   const initial = emptyQueue(); initial.recognition = { enabled: true };
   initial.tasks = [{ id: 'old-task', status: 'uncertain', live_id: 'old-live', playback_token: 'old-attempt', started_at: 99000,
     event: { event_id: 'A', type: 'chat', room_id: 'room', user_id: 'viewer', nickname: '观众', content: '你叫什么', created_at: 99000 },
-    result: reply('我叫晚晚，晚上的晚，好记吧？'), error: '会话已切换，需人工确认上一条是否已播报',
+    result: reply('我叫晚晚，晚上的晚，好记吧？'), answer: { text: '我叫晚晚，晚上的晚，好记吧？', received_at: 99400, message_ids: [] }, error: '会话已切换，需人工确认上一条是否已播报',
     recognition: { text: '我叫碗碗, 晚上的碗,好记吧!', matched: false, progress: 0.73, captured_at: 99500, inference_ms: 98 } }];
   const p = setup(initial);
   const restored = p.engine.snapshot().tasks[0];
@@ -923,7 +1113,7 @@ test('restored homophone evidence is recalculated but never overrides manual con
 test('long-reply tail matching at exactly 70 percent sends handoff with zero silence', async () => {
   const order = [];
   const p = setup(undefined, false, { speak: async task => order.push(`speech:${task.event.event_id}`), handoff: async task => order.push(`handoff:${task.event.event_id}`) });
-  await p.engine.configureRecognition(true); await p.engine.configureHandoff(true, 'left_down', 0);
+  await p.engine.configureRecognition(true); await p.engine.configureHandoff(true, 'left_down', 0, undefined, 70);
   const speech = '春夏秋冬东西南北天地甲乙丙丁戊己庚辛壬癸';
   await p.engine.importTestBatch(['A', 'B', 'C'].map(id => ({ event: p.event(id), result: reply(speech) })));
   await p.engine.setContext(true, 'live', true);
@@ -937,5 +1127,349 @@ test('long-reply tail matching at exactly 70 percent sends handoff with zero sil
   assert.deepEqual(order, ['speech:A', 'handoff:A', 'speech:B']);
   assert.equal(p.engine.snapshot().history[0].task.recognition.progress, 0.7);
   assert.equal(p.engine.snapshot().history[0].task.recognition.scope, 'tail');
+  p.engine.dispose();
+});
+
+test('handoff recognition threshold defaults to 50 percent, persists independently and validates its range', async () => {
+  const initial = emptyQueue(); initial.handoff = { enabled: true, direction: 'left_down', wait_ms: 800, angle_deg: 30 };
+  const p = setup(initial);
+  assert.equal(p.engine.snapshot().handoff.trigger_percent, 50);
+  await p.engine.configureHandoff(true, 'left_down', undefined, undefined, 83);
+  await p.engine.configureHandoff(false, 'right_down', 1200, 60);
+  assert.equal(p.saved.at(-1).handoff.trigger_percent, 83);
+  const reopened = setup(p.saved.at(-1));
+  assert.equal(reopened.engine.snapshot().handoff.trigger_percent, 83);
+  for (const value of [0, -1, 101, 1.5, NaN, Infinity]) {
+    await assert.rejects(p.engine.configureHandoff(true, 'left_down', undefined, undefined, value), /1–100%/);
+  }
+  assert.equal(p.engine.snapshot().handoff.trigger_percent, 83);
+  await p.engine.configureHandoff(true, 'left_down', undefined, undefined, 1);
+  await p.engine.configureHandoff(true, 'left_down', undefined, undefined, 100);
+  assert.equal(p.engine.snapshot().handoff.trigger_percent, 100);
+  p.engine.dispose(); reopened.engine.dispose();
+});
+
+test('handoff uses the configured recognition percentage without requiring the fixed 70 percent match or silence', async () => {
+  for (const [threshold, below, accepted] of [[undefined, 'ABCD', 'ABCDE'], [80, 'ABCDEFG', 'ABCDEFGH'], [100, 'ABCDEFGHI', 'ABCDEFGHIJ']]) {
+    const order = [];
+    const p = setup(undefined, false, {
+      speak: async task => order.push(`speech:${task.event.event_id}`),
+      handoff: async task => order.push(`handoff:${task.event.event_id}`),
+    });
+    await p.engine.configureRecognition(true, 95);
+    await p.engine.configureHandoff(true, 'left_down', 0, undefined, threshold);
+    await p.engine.importTestBatch(['A', 'B'].map(id => ({ event: p.event(id), result: reply('ABCDEFGHIJ') })));
+    await p.engine.setContext(true, 'live', true);
+    p.engine.observeVideo('live');
+    p.engine.observeVad({ speaking: false, ended: false, healthy: true, quiet_ms: 1000 }, 'live'); await p.engine.tick();
+    const task = p.engine.snapshot().tasks[0];
+    const observation = text => ({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text, captured_at: p.now(), inference_ms: 20 });
+    await p.engine.observeRecognition(observation(accepted));
+    assert.deepEqual(order, ['speech:A']); // Matching without observed speech cannot submit an action.
+    p.advance(10);
+    p.engine.observeVad({ speaking: true, ended: false, healthy: true, quiet_ms: 0 }, 'live');
+    await p.engine.observeRecognition(observation(below));
+    assert.deepEqual(order, ['speech:A']);
+    const recognizing = observation(accepted);
+    p.advance(100);
+    p.engine.observeVideo('live');
+    p.engine.observeVad({ speaking: true, ended: false, healthy: true, quiet_ms: 0 }, 'live');
+    await p.engine.observeRecognition(recognizing); // Speech may continue while this recognition request runs.
+    assert.deepEqual(order, ['speech:A', 'handoff:A', 'speech:B']);
+    const recognition = p.engine.snapshot().history[0].task.recognition;
+    assert.equal(recognition.progress * 100, threshold ?? 50);
+    if (threshold === undefined) assert.equal(recognition.matched, false);
+    await p.engine.observeRecognition(observation(accepted)); await p.engine.tick();
+    assert.deepEqual(order, ['speech:A', 'handoff:A', 'speech:B']);
+    p.engine.dispose();
+  }
+});
+
+test('normal recognition percentage defaults to 70, validates changes and survives disabling and reopening', async () => {
+  const p = setup();
+  await p.engine.configureRecognition(true);
+  assert.equal(p.engine.snapshot().recognition.match_percent, 70);
+  await p.engine.configureRecognition(true, 83);
+  await p.engine.configureRecognition(false);
+  assert.equal(p.saved.at(-1).recognition.match_percent, 83);
+  const reopened = setup(p.saved.at(-1));
+  assert.equal(reopened.engine.snapshot().recognition.match_percent, 83);
+  await reopened.engine.configureRecognition(true);
+  assert.equal(reopened.engine.snapshot().recognition.match_percent, 83);
+  for (const value of [0, -1, 1, 49, 101, 50.5, NaN, Infinity]) {
+    await assert.rejects(p.engine.configureRecognition(true, value), /50–100%/);
+  }
+  assert.equal(p.engine.snapshot().recognition.match_percent, 83);
+  await p.engine.configureRecognition(true, 50);
+  await p.engine.configureRecognition(true, 100);
+  p.engine.dispose(); reopened.engine.dispose();
+});
+
+test('normal recognition uses the configured percentage and still waits for 350ms of silence', async () => {
+  for (const [threshold, below, accepted] of [[50, 'ABCD', 'ABCDE'], [80, 'ABCDEFG', 'ABCDEFGH'], [100, 'ABCDEFGHI', 'ABCDEFGHIJ']]) {
+    const p = setup();
+    await p.engine.configureRecognition(true, threshold);
+    await p.engine.importTestBatch(['A', 'B'].map(id => ({ event: p.event(id), result: reply('ABCDEFGHIJ') })));
+    await p.engine.setContext(true, 'live', true);
+    const vad = (quiet_ms, speaking = true) => {
+      p.engine.observeVideo('live');
+      p.engine.observeVad({ speaking, ended: false, healthy: true, quiet_ms }, 'live');
+    };
+    vad(1000, false); await p.engine.tick();
+    const task = p.engine.snapshot().tasks[0];
+    const observation = text => ({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text, captured_at: p.now(), inference_ms: 20 });
+    await assert.rejects(p.engine.configureRecognition(true, 60), /当前播报/);
+    assert.equal(p.engine.snapshot().recognition.match_percent, threshold);
+    vad(0); await p.engine.observeRecognition(observation(below));
+    p.advance(350); vad(350); await p.engine.tick();
+    assert.deepEqual(p.spoken, ['A']);
+    assert.equal(p.engine.snapshot().tasks[0].recognition.matched, false);
+    vad(0); await p.engine.observeRecognition(observation(accepted));
+    assert.equal(p.engine.snapshot().tasks[0].recognition.matched, true);
+    assert.deepEqual(p.spoken, ['A']);
+    p.advance(349); vad(349); await p.engine.tick();
+    assert.deepEqual(p.spoken, ['A']);
+    p.advance(1); vad(350); await p.engine.tick();
+    assert.deepEqual(p.spoken, ['A', 'B']);
+    assert.equal(p.engine.snapshot().history[0].task.recognition.progress * 100, threshold);
+    assert.equal(p.engine.snapshot().handoff_action, undefined);
+    p.engine.dispose();
+  }
+});
+
+const songDirector = { id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
+test('manually queued songs start with auto replies off and no remote audio, and never generate pending chat', async () => {
+  const p = setup();
+  await p.engine.configureRecognition(true);
+  await p.engine.setContext(false, 'live', true);
+  p.engine.observeVideo('live');
+  await p.engine.enqueueSong(songDirector);
+  const song = p.engine.snapshot().tasks[0];
+  assert.equal(song.status, 'playing'); assert.equal(song.song_playback, 'starting');
+  assert.equal(p.spoken.length, 1); assert.equal(p.jobs.size, 0);
+  // Ready chat behind this song must stay paused when automatic replies are off.
+  await p.engine.ingest(p.event('chat-waiting'));
+  await p.engine.observeSong({ live_id:'live', task_id:song.id, playback_token:song.playback_token, state:'ended' });
+  assert.equal(p.jobs.size, 0); assert.equal(p.spoken.length, 1);
+  p.engine.dispose();
+});
+test('manual songs wait for live availability and video, and never bypass an earlier uncertain task', async () => {
+  const p = setup();
+  await p.engine.enqueueSong(songDirector);
+  await p.engine.setContext(false, 'live', false); p.engine.observeVideo('live'); await p.engine.tick();
+  assert.equal(p.spoken.length, 0);
+  p.advance(3000); await p.engine.setContext(false, 'live', true);
+  assert.equal(p.spoken.length, 0);
+  p.engine.observeVideo('live'); await p.engine.tick(); assert.equal(p.spoken.length, 1);
+  const song = p.engine.snapshot().tasks[0];
+  await p.engine.observeSong({ live_id:'live', task_id:song.id, playback_token:song.playback_token, state:'error', error:'audio failed' });
+  await p.engine.enqueueSong({ ...songDirector, id:'next-song' });
+  assert.equal(p.engine.snapshot().tasks[0].status,'uncertain'); assert.equal(p.spoken.length, 1);
+  p.engine.dispose();
+});
+test('a manual song does not generate or speak later chat slots while automatic replies are off', async () => {
+  const initial = emptyQueue();
+  initial.tasks = [
+    { id:'manual-song', status:'ready', song:{ id:songDirector.id, title:songDirector.title, duration_ms:songDirector.duration_ms }, event:{ event_id:'manual-song-event', type:'song', room_id:'room', user_id:'', nickname:'歌曲导播', content:'测试歌曲', created_at:100000 } },
+    { id:'pending-chat', status:'pending', event:{ event_id:'pending-chat-event', type:'chat', source:'test', room_id:'room', user_id:'viewer', nickname:'观众', content:'你好', created_at:100000 } },
+  ];
+  const p = setup(initial); await p.engine.setContext(false,'live',true); p.engine.observeVideo('live'); await p.engine.tick();
+  assert.deepEqual(p.spoken,['manual-song-event']); assert.equal(p.jobs.size,0);
+  const task = p.engine.snapshot().tasks[0];
+  await p.engine.observeSong({ live_id:'live', task_id:task.id, playback_token:task.playback_token, state:'ended' });
+  assert.equal(p.engine.snapshot().tasks[0].status,'pending'); assert.equal(p.jobs.size,0); assert.equal(p.spoken.length,1);
+  p.engine.dispose();
+});
+test('blocked song remains in its slot and resumes only on a matching OBS started event', async () => {
+  const p = setup(); await p.engine.setContext(false,'live',true); p.engine.observeVideo('live');
+  await p.engine.enqueueSong(songDirector); const task = p.engine.snapshot().tasks[0];
+  const identity = { live_id:'live', task_id:task.id, playback_token:task.playback_token };
+  await p.engine.observeSong({ ...identity, state:'blocked' });
+  assert.equal(p.engine.snapshot().tasks[0].song_playback,'blocked'); assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+  await p.engine.observeSong({ ...identity, playback_token:'old', state:'started' });
+  assert.equal(p.engine.snapshot().tasks[0].song_playback,'blocked');
+  await p.engine.observeSong({ ...identity, state:'started' });
+  assert.equal(p.engine.snapshot().tasks[0].song_playback,'playing'); p.engine.dispose();
+});
+test('songs remain durable beyond 60 seconds and finish only on their own original audio ended identity', async () => {
+  const stops = []; const actions = [];
+  const p = setup(emptyQueue(), false, { stopSong: async task => stops.push(task.id), act: async task => actions.push(task.id), handoff: async task => actions.push(task.id) });
+  await p.engine.enqueueSong(songDirector);
+  await p.engine.configureRecognition(true);
+  await p.engine.configureHandoff(true, 'left_down');
+  p.advance(31000); await p.engine.setContext(true, 'live', true);
+  await p.observe(); p.advance(1600); await p.observe();
+  let task = p.engine.snapshot().tasks[0]; assert.equal(task.status, 'playing'); assert.equal(p.jobs.size, 0);
+  p.advance(61000); await p.observe(); assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
+  const identity = { task_id: task.id, playback_token: task.playback_token, live_id: 'live', state: 'ended' };
+  await p.engine.observeSong({ ...identity, live_id: 'old' });
+  await p.engine.observeSong({ ...identity, playback_token: 'old' });
+  await p.engine.observeRecognition({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, text: '歌词', captured_at: p.now(), error: 'must be ignored' });
+  assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
+  await p.engine.observeSong(identity);
+  assert.equal(p.engine.snapshot().tasks.length, 0); assert.equal(stops.length, 1); assert.equal(actions.length, 0);
+  assert.equal(p.engine.snapshot().history[0].outcome, 'played'); p.engine.dispose();
+});
+test('full song queue rejects additions without faulting and gifts cannot displace songs', async () => {
+  const p = setup();
+  for (let i=0;i<6;i++) await p.engine.enqueueSong({ ...songDirector, id: 'song-'+i });
+  await assert.rejects(p.engine.enqueueSong(songDirector), /槽位已满/);
+  await p.engine.ingest(p.event('gift', 'gift', { gift: { name:'花', count:1, gift_id:'flower', combo_id:'combo', is_final:true } }));
+  await p.engine.setContext(true, 'live', true);
+  assert.equal(p.engine.snapshot().tasks.length, 6); assert.ok(p.engine.snapshot().tasks.every(t => t.song));
+  assert.equal(p.errors.length, 0); p.engine.dispose();
+});
+test('song playback error retains the slot as uncertain and operator skip stops the original audio', async () => {
+  const stopped = [];
+  const p = setup(emptyQueue(), false, { stopSong: async task => stopped.push(task.id) });
+  await p.engine.enqueueSong(songDirector); await p.engine.setContext(true,'live',true);
+  await p.observe(); p.advance(1600); await p.observe();
+  const task = p.engine.snapshot().tasks[0];
+  await p.engine.observeSong({ task_id:task.id, playback_token:task.playback_token, live_id:'live', state:'error', error:'audio missing' });
+  assert.equal(p.engine.snapshot().tasks[0].status,'uncertain'); assert.equal(stopped.length,1);
+  await p.engine.finish('skipped','操作员跳过'); assert.equal(stopped.length,2); assert.equal(p.engine.snapshot().history[0].outcome,'skipped');
+  p.engine.dispose();
+});
+
+
+test('text_msg completion matches the type=10 answer instead of the sent prompt', async () => {
+  const p = setup(undefined, false, { autoAnswer: false });
+  await p.engine.configureRecognition(true, 100);
+  await p.engine.importTestBatch([{ event: p.event('宝子'), result: reply('来，头发往上拢一拢，扎个高马尾给你看看，这样是不是精神多了？') }]);
+  await p.engine.setContext(true, 'live', true);
+  p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true, quiet_ms: 1000 }, 'live'); await p.engine.tick();
+  const task = p.engine.snapshot().tasks[0];
+  const vad = (speaking, quiet_ms) => { p.engine.observeVideo('live'); p.engine.observeVad({ speaking, quiet_ms, ended: quiet_ms >= 900, healthy: true }, 'live'); };
+  const heard = text => ({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text, captured_at: p.now(), inference_ms: 20 });
+  vad(true, 0); await p.engine.observeRecognition(heard(task.result.speech));
+  assert.equal(p.engine.snapshot().tasks[0].recognition.progress, 0);
+  p.advance(350); vad(false, 350);
+  const answer = '好呀，我已经扎好高马尾了，宝子觉得怎么样？';
+  await p.engine.observeOutput(outputExports.parseAvatarOutput({ type: 10, live_id: 'live', received_at: p.now(), payload: { text_msg: { content: answer, msg_id: 'response-1' } } }));
+  assert.equal(p.engine.snapshot().tasks[0].answer.text, answer);
+  assert.ok(p.engine.snapshot().tasks[0].recognition.progress < 1);
+  await p.engine.observeRecognition(heard(answer));
+  assert.equal(p.engine.snapshot().tasks.length, 0);
+  const completed = p.engine.snapshot().history[0].task;
+  assert.equal(completed.result.speech, task.result.speech);
+  assert.equal(completed.answer.text, answer);
+  assert.equal(completed.recognition.progress, 1);
+  assert.equal(p.saved.at(-1).history[0].task.answer.text, answer);
+  p.engine.dispose();
+});
+
+test('audio recognition received before type=10 is rechecked against the actual output', async () => {
+  const p = setup(undefined, false, { autoAnswer: false });
+  await p.engine.configureRecognition(true, 100);
+  await p.engine.importTestBatch([{ event: p.event('A'), result: reply('请介绍自己') }]);
+  await p.engine.setContext(true, 'live', true);
+  p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true, quiet_ms: 1000 }, 'live'); await p.engine.tick();
+  const task = p.engine.snapshot().tasks[0];
+  const answer = '我是晚晚，欢迎来到直播间。';
+  p.engine.observeVad({ speaking: true, ended: false, healthy: true, quiet_ms: 0 }, 'live');
+  await p.engine.observeRecognition({ live_id: 'live', task_id: task.id, capture_id: task.playback_token, enabled: true, text: answer, captured_at: p.now(), inference_ms: 20 });
+  assert.equal(p.engine.snapshot().tasks[0].recognition.matched, false);
+  await p.engine.observeOutput({ live_id: 'live', text: answer, received_at: p.now(), final: false });
+  assert.equal(p.engine.snapshot().tasks[0].recognition.progress, 1);
+  p.advance(350); p.engine.observeVideo('live'); p.engine.observeVad({ speaking: false, ended: false, healthy: true, quiet_ms: 350 }, 'live'); await p.engine.tick();
+  assert.equal(p.engine.snapshot().tasks.length, 1); // An explicitly partial transcript cannot confirm completion.
+  await p.engine.observeOutput({ live_id: 'live', text: answer, received_at: p.now(), final: true });
+  assert.equal(p.engine.snapshot().history[0].task.recognition.matched, true);
+  p.engine.dispose();
+});
+
+test('output fragments persist once and late old replies cannot contaminate the next slot or session', async () => {
+  const p = setup(undefined, false, { autoAnswer: false });
+  await p.engine.configureRecognition(true);
+  await p.engine.importTestBatch(['A', 'B'].map(id => ({ event: p.event(id), result: reply('发送内容') })));
+  await p.engine.setContext(true, 'live', true);
+  await p.observe(); p.advance(1600); await p.observe();
+  const first = p.engine.snapshot().tasks[0];
+  const output = extra => ({ live_id: 'live', text: '你好', received_at: p.now(), msg_id: 'response-a', ...extra });
+  for (const rejected of [{ live_id: 'old' }, { received_at: first.started_at - 1 }, { received_at: p.now() + 1001 }, { request_id: 'wrong-task' }, { msg_id: 'tts-wrong-task' }]) await p.engine.observeOutput(output(rejected));
+  assert.equal(p.engine.snapshot().tasks[0].answer, undefined);
+  await p.engine.observeOutput(output({}));
+  const writes = p.saved.length;
+  await p.engine.observeOutput(output({}));
+  assert.equal(p.saved.length, writes);
+  p.advance(1);
+  await p.engine.observeOutput(output({ text: '你好，欢迎来到直播间。' }));
+  p.advance(1); await p.engine.observeOutput(output({ text: '欢迎来到直播间。' }));
+  assert.equal(p.engine.snapshot().tasks[0].answer.text, '你好，欢迎来到直播间。');
+  await p.engine.finish('played', '人工确认');
+  p.advance(1600); await p.observe(); p.advance(1600); await p.observe();
+  const second = p.engine.snapshot().tasks[0];
+  assert.equal(second.event.event_id, 'B'); assert.equal(second.status, 'playing');
+  await p.engine.observeOutput(output({ text: '上一条回答的迟到结果' }));
+  await p.engine.observeOutput(output({ msg_id: 'tts-' + first.id }));
+  assert.equal(p.engine.snapshot().tasks[0].answer, undefined);
+  await p.engine.observeOutput(output({ msg_id: 'response-b', text: '这是第二条回答' }));
+  await p.engine.setContext(true, 'new-live', true);
+  await p.engine.observeOutput({ live_id: 'new-live', text: '新会话的声音', received_at: p.now() });
+  assert.equal(p.engine.snapshot().tasks[0].answer.text, '这是第二条回答');
+  assert.equal(p.engine.snapshot().tasks[0].status, 'uncertain');
+  assert.equal(p.engine.snapshot().history.length, 1);
+  const restored = setup(p.engine.snapshot());
+  assert.equal(restored.engine.snapshot().tasks[0].answer.text, '这是第二条回答');
+  assert.equal(restored.engine.snapshot().tasks[0].status, 'uncertain');
+  p.engine.dispose(); restored.engine.dispose();
+});
+
+
+test('manual messages and dialogue preserve their protocol while sharing FIFO priority and interruption', async () => {
+  const p = setup(); const sent = [];
+  const m = operator(p, async (content, liveId, messageType) => sent.push({ content, liveId, messageType }));
+  await p.engine.importTestBatch([{ event: p.event('A'), result: reply('自动回复') }]);
+  await p.engine.setContext(true, 'live', true);
+  m.manual.enqueue('文本消息草稿', 'live');
+  m.manual.enqueue('只聊聊天', 'live', 'text_dialog');
+  assert.equal(m.questions()[0].message_type, 'text_msg'); assert.equal(m.questions()[1].message_type, 'text_dialog');
+  await m.idle();
+  assert.deepEqual(sent, [{ content: '文本消息草稿', liveId: 'live', messageType: 'text_msg' }]);
+  m.voice(); await m.idle(2600); await m.manual.tick('live', true);
+  assert.equal(sent[1].content, '只聊聊天'); assert.equal(sent[1].messageType, 'text_dialog');
+  assert.equal(p.spoken.length, 0);
+  m.manual.enqueue('下一条文本对话', 'live', 'text_dialog');
+  m.manual.cancel();
+  await m.idle(); assert.equal(sent.length, 2); assert.equal(m.questions().length, 0);
+  p.engine.dispose();
+});
+
+
+test('restoring old prepared answers regenerates only unsent interactions', () => {
+  const initial = emptyQueue();
+  const event = type => ({ event_id: type, type, nickname: '观众', content: '你好' });
+  const old = { speech: '没有哦，一个人挺自在。', emotion: 'happy', segments: [] };
+  initial.tasks = [
+    { id: 'old-chat', event: event('chat'), status: 'ready', result: old, answer: { text: '旧残留' }, action_state: 'failed', error: '旧错误' },
+    { id: 'old-gift', event: event('gift'), status: 'ready', result: old },
+    { id: 'sent', event: event('gift'), status: 'playing', result: old, answer: { text: '已收到礼物' } },
+    { id: 'new', event: event('chat'), status: 'ready', result: reply('小宇问你有没有男朋友，你该如何回答？') },
+    { id: 'song', event: event('song'), status: 'ready', song: { id: 'song', title: '测试', duration_ms: 1000 } },
+  ];
+  initial.history = [{ task: { id: 'history', event: event('chat'), result: old }, outcome: 'played' }];
+  const p = setup(initial);
+  const state = p.engine.snapshot();
+  for (const task of state.tasks.slice(0, 2)) {
+    assert.equal(task.status, 'pending'); assert.equal(task.result, undefined);
+    assert.equal(task.answer, undefined); assert.equal(task.action_state, undefined); assert.equal(task.error, undefined);
+  }
+  assert.equal(state.tasks[2].status, 'uncertain'); assert.equal(state.tasks[2].answer.text, '已收到礼物');
+  assert.equal(state.tasks[3].status, 'ready'); assert.equal(state.tasks[3].result.generation_mode, 'question');
+  assert.equal(state.tasks[4].status, 'ready'); assert.equal(state.history[0].task.result.speech, old.speech);
+  p.engine.dispose();
+});
+
+test('response style context uses actual avatar answers and excludes archived questions or old drafts', async () => {
+  const initial = emptyQueue();
+  initial.history = ['actual', 'question-only', 'old-answer-draft'].map((id, index) => ({
+    task: { id, event: { user_id: id, nickname: '阿豪' }, result: reply(index === 1 ? '阿豪送了礼物，你如何谢谢他？' : '旧模型生成内容'), ...(index === 0 ? { answer: { text: '阿豪，谢谢你的心意。' } } : {}) },
+    outcome: 'played',
+  }));
+  const p = setup(initial);
+  await p.engine.importTestBatch([{ event: p.event('new') }]);
+  await p.engine.setContext(true, 'live', true);
+  assert.deepEqual(Array.from(p.jobs.get('new').diversity.recentOpenings), ['观众，谢谢你的心意。']);
+  assert.equal(p.jobs.get('new').history.length, 0);
   p.engine.dispose();
 });

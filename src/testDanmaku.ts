@@ -29,7 +29,7 @@ export function parseTestDanmaku(input: string): TestDanmaku[] {
       content: match ? match[2].trim() : `${giftMatch![2].trim()}×${Number(giftMatch![3])}`,
       ...(match ? {} : { gift: { name: giftMatch![2].trim(), count: Number(giftMatch![3]), gift_id: '', combo_id: '', is_final: true } }),
       ...(!speech || ['等待生成', '生成中'].includes(speech) ? {} : {
-        result: { speech, emotion: 'neutral', segments: [] },
+        result: { speech, generation_mode: 'question', emotion: 'neutral', segments: [] },
       }),
     };
   });

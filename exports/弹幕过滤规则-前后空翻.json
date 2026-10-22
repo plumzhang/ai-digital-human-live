@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "type": "danmaku-filter-rules",
+  "rules": [
+    {
+      "kind": "regex",
+      "value": "[前后][\\s\\p{P}\\p{S}]*空[\\s\\p{P}\\p{S}]*翻",
+      "enabled": true
+    }
+  ]
+}
