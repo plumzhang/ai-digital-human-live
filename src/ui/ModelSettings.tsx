@@ -78,9 +78,9 @@ export function ModelSettings({ active = true }: { active?: boolean } = {}) {
           <span><strong>{model.id}</strong>{model.owned_by && <small>{model.owned_by}</small>}</span><span className="model-selection">{config.selectedModel === model.id ? '已选择' : '选择'}</span>
         </button>) : <div className="empty">{error ? '查询失败，请检查配置后重试。' : queried ? models.length ? '没有匹配的模型。' : '接口未返回可用模型。' : '暂无可用模型'}</div>}
     </div>
-    <label className="model-persona-field">固定人设（提问优化助手）<textarea rows={15} value={config.persona} onChange={event => { setConfig(old => ({ ...old, persona: event.target.value })); setSaveNotice(''); }} placeholder="填写提问优化规则、数字人背景和期望回应风格；只生成提问，不生成答案"/></label>
-    <p className="hint">大语言模型负责整理观众问题和礼物致谢请求，再交给 Vidu 回答。数字人的身份与回答风格请在“形象设定”中配置。</p>
-    <button type="button" onClick={() => { setConfig(old => ({ ...old, persona: defaultModelPersona })); setSaveNotice(''); }}>恢复默认提问规则</button>
+    <label className="model-persona-field">固定人设与回复规则<textarea rows={15} value={config.persona} onChange={event => { setConfig(old => ({ ...old, persona: event.target.value })); setSaveNotice(''); }} placeholder="填写主播人设和回答风格，模型直接生成最终口播台词"/></label>
+    <p className="hint">大语言模型直接生成回答，按句交给 OmniVoice 合成；“形象设定”的人设作为当前数字人的身份背景。</p>
+    <button type="button" onClick={() => { setConfig(old => ({ ...old, persona: defaultModelPersona })); setSaveNotice(''); }}>恢复默认回复规则</button>
 
     <div className="button-row"><button type="button" className="primary" disabled={!config.selectedModel || !config.apiKey.trim() || !config.baseUrl.trim() || !config.persona.trim()} onClick={saveConfig}><Save size={16}/> 保存配置</button></div>
     {saveNotice && <div className="voice-notice success" role="status">{saveNotice}</div>}

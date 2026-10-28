@@ -1,3 +1,4 @@
+import { loadTtsConfig } from '../ttsConfig';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import { FolderOpen, Music2, RefreshCw, Trash2, Upload } from 'lucide-react';
@@ -95,7 +96,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
             {queued && <p className="hint">已在队列中，请先完成或跳过，再编辑或删除。</p>}
             <div className="button-row">
               {!!song.raw_segments.length && <button disabled={!!busy || queued} onClick={() => void work('大语言模型正在校正歌词…', () => correct(song))}>校正歌词</button>}
-              <button disabled={!!busy || queued || !song.available} onClick={() => void work('正在重新识别整首歌曲…', async () => { const result = await invoke<SongDirector>('director_transcribe', { id: song.id }); loadEditorCues(result.raw_segments); await correct(result); })}>重新识别并校正</button>
+              <button disabled={!!busy || queued || !song.available} onClick={() => void work('正在重新识别整首歌曲…', async () => { const result = await invoke<SongDirector>('director_transcribe', { id: song.id, tts: loadTtsConfig() }); loadEditorCues(result.raw_segments); await correct(result); })}>重新识别并校正</button>
               <button onClick={() => void invoke('director_open_folder', { id: song.id }).catch(e => setError(String(e)))}><FolderOpen size={14}/> 字幕与文件</button>
               <label className="song-bulk-lead">提前量（毫秒）<input type="number" min={0} max={5000} step={50} value={leadDraft} placeholder="各段不同" disabled={!!busy || queued || !cues.length} title="修改后覆盖全部歌词段，保存时间轴后生效" onChange={event => {
                 const value = event.target.value; setLeadDraft(value);
@@ -128,9 +129,9 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
       })}</div>
     </section>
     <section id="songs-generate" role="tabpanel" aria-labelledby="songs-generate-tab" hidden={tab !== 'generate'}>
-      <form className="card song-form" onSubmit={e => { e.preventDefault(); void work('Whisper 正在转录整首歌曲，请等待…', async () => {
+      <form className="card song-form" onSubmit={e => { e.preventDefault(); void work('FunASR 正在转录整首歌曲，请等待…', async () => {
         if (!audio || !lyrics.trim() || !title.trim()) throw new Error('请填写歌名、上传歌曲并输入完整歌词');
-        const song = await invoke<SongDirector>('director_create', { request: { title:title.trim(), audio_name:audio.name, audio_data:audio.data, duration_ms:audio.duration_ms, lyrics:lyrics.trim() } });
+        const song = await invoke<SongDirector>('director_create', { tts: loadTtsConfig(), request: { title:title.trim(), audio_name:audio.name, audio_data:audio.data, duration_ms:audio.duration_ms, lyrics:lyrics.trim() } });
         setTab('library'); setBusy('大语言模型正在校正歌词…'); await correct(song);
       }); }}>
         <div className="section-title"><h2>生成歌曲导播</h2><Music2 size={22}/></div>
@@ -138,7 +139,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
         <label className="song-upload-picker"><Upload size={24}/><span>{audio ? `${audio.name} · ${clock(audio.duration_ms)}` : '上传原歌曲（包含人声和伴奏）'}</span><input type="file" accept=".mp3,.wav,.aac,.m4a" disabled={!!busy || !desktop} onChange={e => { const file = e.target.files?.[0]; e.target.value = ''; if (file) void work('读取歌曲…', async () => { setAudio(null); const result = await readDirectorAudio(file); setAudio(result); if (!title.trim()) setTitle(file.name.replace(/\.[^.]+$/, '').slice(0,100)); }); }}/></label>
         <p className="hint">MP3、WAV、AAC、M4A · 小于100 MB · 最长30分钟</p>
         <label>完整歌词（必填）<textarea rows={12} value={lyrics} required disabled={!!busy} maxLength={30000} placeholder="粘贴与歌曲版本一致的完整歌词，保留重复演唱部分" onChange={e => setLyrics(e.target.value)}/></label>
-        <p className="hint">先生成 Whisper 原始 SRT，再使用大语言模型参照输入的歌词纠错并保留时间。播放时每段默认提前500毫秒发送给数字人，屏蔽数字人声音，只播放原歌曲。</p>
+        <p className="hint">先生成 FunASR 原始 SRT，再使用大语言模型参照输入的歌词纠错并保留时间。播放时每段默认提前500毫秒发送给数字人，屏蔽数字人声音，只播放原歌曲。</p>
         <div className="button-row"><button className="primary" type="submit" disabled={!!busy || !desktop || !audio || !title.trim() || !lyrics.trim()}>生成字幕并校正歌词</button><button type="button" onClick={onConfigureModel}>配置大语言模型</button></div>
       </form>
     </section>

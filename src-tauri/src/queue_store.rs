@@ -57,7 +57,7 @@ fn export_state(store: &Store, snapshot: &Value) -> Result<(), String> {
         let nickname = clean_line(event["nickname"].as_str().unwrap_or("观众"));
         let content = clean_line(event["content"].as_str().unwrap_or(""));
         let left = if event["type"] == "song" { format!("[歌曲][{nickname}] {content}") } else if event["type"] == "gift" { format!("[礼物][{nickname}][{content}]") } else { format!("[弹幕][{nickname}] {content}") };
-        let right = if let Some(duration) = task.pointer("/song/duration_ms").and_then(Value::as_u64) { format!("歌曲导播 · {:.1}秒", duration as f64 / 1000.0) } else { task.pointer("/result/speech").and_then(Value::as_str).map(clean_line).unwrap_or_else(|| match task["status"].as_str() {
+        let right = if let Some(duration) = task.pointer("/song/duration_ms").and_then(Value::as_u64) { format!("歌曲导播 · {:.1}秒", duration as f64 / 1000.0) } else { task.pointer("/result/prepared_reply").or_else(||task.pointer("/result/speech")).and_then(Value::as_str).map(clean_line).unwrap_or_else(|| match task["status"].as_str() {
             Some("generating") => "生成中", Some("failed") => "生成失败", Some("uncertain") => "等待确认", _ => "等待生成",
         }.into()) };
         lines.push(format!("{left}//{right}"));

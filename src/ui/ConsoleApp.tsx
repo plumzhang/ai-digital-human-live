@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { Activity, Cpu, CircleStop, Clapperboard, Mic2, MicOff, Music2, Play, Plus, Radio, Send, Settings2, Shield, Square, Trash2, Video } from 'lucide-react';
 import { blockReason, parseDyhubEvent, type Danmaku, type Rule } from '../domain';
-import { defaultAvatarConfig, initialAdvanced, validateAdvanced, type AvatarConfig, type AvatarProfile } from '../avatarProfiles';
+import { defaultAvatarConfig, initialAdvanced, type AvatarConfig, type AvatarProfile } from '../avatarProfiles';
 import { useAvatarLibrary } from '../useAvatarLibrary';
 import { AvatarSettings } from './AvatarSettings';
 import { ModelConfiguration, type ModelSettingsTab } from './ModelConfiguration';
@@ -15,14 +15,17 @@ import { TaskDialogue } from './TaskDialogue';
 import { TtsLog } from './TtsLog';
 import { FilterRules } from './FilterRules';
 import { loadCaptionSettings } from '../captionSettings';
+import { loadTtsConfig, ttsStorageKey } from '../ttsConfig';
+import { TtsSettings } from './TtsSettings';
 import { loadModelConfig } from '../modelConfig';
-import { ManualQuestions, type ManualQuestion, type ManualMessageType } from '../manualQuestions';
+import { ManualQuestions, type ManualQuestion } from '../manualQuestions';
 import { HANDOFF_DIRECTIONS, handoffActionLabel, INTERACTION_SLOT_COUNT, InteractionQueue, emptyQueue, normalizeInteraction, type HandoffDirection, type QueueSnapshot, type GeneratedReply } from '../interactionQueue';
 import { countTestDanmaku, defaultTestDanmaku, parseTestDanmaku } from '../testDanmaku';
 import { formatQueueCaption } from '../queueCaption';
-import { avatarActionFor, giftActionFor } from '../giftActions';
+import { avatarActionFor } from '../giftActions';
+import { planComponentInteraction } from '../componentInteraction';
 import { builtinVoices } from '../voiceCatalog';
-import { normalizeStoredVoice, validateVoiceSelection, qwenClonedVoices, type ClonedVoice } from '../voiceSelection';
+import { normalizeStoredVoice } from '../voiceSelection';
 import { SessionRecovery } from '../sessionRecovery';
 import type { RecognitionObservation } from '../whisperRecognition';
 import type { SongPlaybackState, SongPlaybackIdentity } from '../songDirector';
@@ -85,6 +88,12 @@ function avatarConfigOfProfile(profile: AvatarProfile): AvatarConfig {
 const call = <T,>(name: string, args?: Record<string, unknown>) => invoke<T>(name, args);
 
 export function ConsoleApp() {
+  useEffect(() => {
+    if (loadTtsConfig().ref_audio.trim()) return;
+    void call<{ ref_audio: string; ref_text: string } | null>('component_local_voice').then(voice => {
+      if (voice && !loadTtsConfig().ref_audio.trim()) localStorage.setItem(ttsStorageKey, JSON.stringify({ ...loadTtsConfig(), ...voice }));
+    }).catch(() => {});
+  }, []);
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [apiKey, setApiKey] = useState(loadApiKey);
   const [keyStorageError, setKeyStorageError] = useState(false);
@@ -98,11 +107,9 @@ export function ConsoleApp() {
     setSettings(old => ({ ...old, ...avatarConfigOfProfile(profile) }));
     setImageFileData(profile.image?.data || '');
   });
-  const [cloneTarget, setCloneTarget] = useState<{ region: AvatarConfig['region']; select: (voice: string) => void } | null>(null);
   const [tab, setTab] = useState<'live' | 'rules' | 'songs' | 'settings' | 'voice' | 'models'>('live');
   const [modelTab, setModelTab] = useState<ModelSettingsTab>('reply');
   const openViduSettings = () => { setModelTab('vidu'); setTab('models'); };
-  const voiceRegion = tab === 'voice' && cloneTarget ? cloneTarget.region : settings.region;
   const [roomConnected, setRoomConnected] = useState(false);
   const [session, setSession] = useState<Session | null>(null);
   const [liveState, setLiveState] = useState<LiveState | null>(null);
@@ -129,7 +136,6 @@ export function ConsoleApp() {
   const [busy, setBusy] = useState(false);
   const [auto, setAuto] = useState(false);
   const [question, setQuestion] = useState('');
-  const [dialogue, setDialogue] = useState('');
   const [messages, setMessages] = useState<Danmaku[]>([]);
   const [showTestDanmaku, setShowTestDanmaku] = useState(false);
   const [testDanmakuInput, setTestDanmakuInput] = useState(defaultTestDanmaku);
@@ -138,39 +144,18 @@ export function ConsoleApp() {
   const [interactionState, setInteractionState] = useState<QueueSnapshot>(emptyQueue);
   const [queueDirectory, setQueueDirectory] = useState('');
   const interactionQueueRef = useRef<InteractionQueue | null>(null);
-  const [whisperStatus, setWhisperStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  const [whisperMessage, setWhisperMessage] = useState('');
-  const whisperEnabled = interactionState.recognition?.enabled === true;
-  const loadWhisper = async (reload = false) => {
-    setWhisperStatus('loading'); setWhisperMessage('正在加载语音识别模型…');
+  const [asrStatus, setAsrStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [asrMessage, setAsrMessage] = useState('');
+  const asrEnabled = interactionState.recognition?.enabled === true;
+  const checkAsr = async () => {
+    setAsrStatus('loading'); setAsrMessage('正在检查 FunASR 服务…');
     try {
-      const info = await call<{ ready: boolean; device: string; model: string }>('whisper_prepare', { reload });
-      if (!info.ready) throw new Error('语音识别模型未就绪');
-      setWhisperStatus('ready'); setWhisperMessage('语音识别已就绪');
-    } catch (error) { setWhisperStatus('error'); setWhisperMessage(errorText(error)); }
+      const info = await call<{ ready: boolean; device: string; model: string }>('speech_prepare', { tts: loadTtsConfig() });
+      if (!info.ready) throw new Error('FunASR 尚未就绪，请先启动本机语音服务');
+      setAsrStatus('ready'); setAsrMessage('FunASR 已就绪');
+    } catch (error) { setAsrStatus('error'); setAsrMessage(errorText(error)); }
   };
-  useEffect(() => { if (whisperEnabled) void loadWhisper(); }, [whisperEnabled]);
-  const [voiceName, setVoiceName] = useState('');
-  const [voiceUrl, setVoiceUrl] = useState('');
-  const [voiceTranscript, setVoiceTranscript] = useState('');
-  const [voices, setVoices] = useState<string[]>([]);
-  const [voicesLoading, setVoicesLoading] = useState(false);
-  const [voicesError, setVoicesError] = useState('');
-  const [voiceLinks, setVoiceLinks] = useState<Record<string, VoiceLink>>(loadVoiceLinks);
-  const cloneProvider = (voice: string, region: Settings['region']): 'qwen_omni' | 'doubao' => {
-    const link = voiceLinks[voiceLinkKey(region, voice)];
-    return link ? link.provider || 'doubao' : 'qwen_omni';
-  };
-  const [voiceNotice, setVoiceNotice] = useState<{ kind: 'error' | 'success'; message: string } | null>(null);
-  const [voiceSampleText, setVoiceSampleText] = useState('你好，欢迎来到直播间。');
-  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
-  const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
-  const [voicePreviewName, setVoicePreviewName] = useState('');
-  const [voicePreviewError, setVoicePreviewError] = useState('');
-  const audioPreviewRef = useRef<HTMLAudioElement>(null);
-  const playRequestedRef = useRef(false);
-  const voicePreviewCache = useRef(new Map<string, string>());
-  const activePreviewCacheKey = useRef('');
+  useEffect(() => { if (asrEnabled) void checkAsr(); }, [asrEnabled]);
   const [pending, setPending] = useState(false);
   const busyRef = useRef(false);
   const manualQuestionsRef = useRef<ManualQuestions | null>(null);
@@ -196,47 +181,42 @@ export function ConsoleApp() {
   useEffect(() => {
     let disposed = false;
     let timer: number | undefined;
+    let detachVoice: (() => void) | undefined;
     void call<{ snapshot: QueueSnapshot | null; directory: string; pending_events: { event_id: string; raw: unknown }[] }>('queue_load').then(async saved => {
       if (disposed) return;
       const initial = saved.snapshot || emptyQueue();
-      initial.recognition ??= { enabled: true };
+      initial.recognition = { ...initial.recognition, enabled: false };
+      const audioOwner = call<string>('component_audio_open');
       const queue = new InteractionQueue(initial, {
         persist: snapshot => call('queue_commit', { snapshot }),
-        generate: async (task, history, diversity) => {
+        generate: async (task, history, diversity, liveId) => {
           const config = loadModelConfig();
           if (!config.apiKey.trim() || !config.selectedModel || !config.persona.trim()) throw new Error('请先在“模型配置 → 大语言模型”保存有效的模型配置和固定人设');
-          const context = history.map(entry => ({ comment: entry.task.event.content, question: entry.task.result?.generation_mode === 'question' ? entry.task.result.speech : undefined, answer: entry.task.answer?.text }));
-          return call<GeneratedReply>('generate_interaction', {
-            baseUrl: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona,
-            nickname: task.event.nickname, comment: task.event.content, history: context,
-            openingStyle: diversity.openingStyle, recentOpenings: diversity.recentOpenings,
-            eventType: task.event.type, suggestedGesture: giftActionFor(task)?.kind,
-          });
+          return planComponentInteraction(task, history, diversity, config, call, liveId);
         },
+        retainAudio: async (liveId, tokens) => call('component_audio_retain', { owner: await audioOwner, liveId, tokens }),
+        prepareAudio: (task, liveId) => call('component_prepare_audio', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig() }),
         speak: async (task, liveId) => {
           if (task.song) {
             await controlSong({ action: 'start', live_id: liveId, task_id: task.id, playback_token: task.playback_token!, song_id: task.song.id });
             log(`歌曲导播 · ${task.song.title}`); return;
           }
-          await emit('whisper-task', { live_id: liveId, task_id: task.id, capture_id: task.playback_token, enabled: queue.snapshot().recognition?.enabled === true });
-          await call('speak_text', { liveId, taskId: task.id, content: task.result!.speech });
-          log(`队列提问已发送 · ${task.event.nickname}：${task.result!.speech}`);
+          const config = loadModelConfig();
+          await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          const gesture = avatarActionFor(task);
+          if (gesture) {
+            let actionError: string | undefined;
+            try { await call('send_avatar_action', { liveId, taskId: task.id, gesture: gesture.kind, instruction: gesture.instruction }); }
+            catch (error) { actionError = errorText(error); log('互动动作提交失败：' + actionError); }
+            await queue.observeAction(task.id, task.playback_token!, liveId, actionError);
+          }
+          await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig() });
+          log(`队列回答音频已发送 · ${task.event.nickname}，等待实际播放结束`);
         },
         stopSong: async task => {
           const control = { action: 'stop' as const, live_id: task.live_id!, task_id: task.id, playback_token: task.playback_token! };
           if (!readyRef.current || activeLiveIdRef.current !== task.live_id) await emit('song-control', control);
           else await controlSong(control);
-        },
-        act: async (task, liveId) => {
-          const gesture = avatarActionFor(task);
-          if (!gesture) return;
-          try {
-            await call('send_avatar_action', { liveId, taskId: task.id, gesture: gesture.kind, instruction: gesture.instruction });
-            log(`互动动作已提交 · ${task.event.nickname} · ${gesture.label}`);
-          } catch (error) {
-            log(`互动动作发送失败 · ${task.event.nickname}：${errorText(error)}`);
-            throw error;
-          }
         },
         handoff: async (task, liveId, direction, angleDeg) => {
           const label = handoffActionLabel(direction, angleDeg);
@@ -251,14 +231,19 @@ export function ConsoleApp() {
         changed: snapshot => { if (!disposed) setInteractionState(snapshot); },
         error: message => { if (!disposed) { setAuto(false); reportError(message); log(message); } },
       });
+      const invalidateVoice = () => { void queue.invalidatePreparedAudio().catch(error => reportError(errorText(error))); };
+      window.addEventListener('speech-config-updated', invalidateVoice);
+      detachVoice = () => window.removeEventListener('speech-config-updated', invalidateVoice);
       interactionQueueRef.current = queue;
       const manual = new ManualQuestions({
         holdPlayback: held => queue.setPlaybackHeld(held),
         canStart: quietMs => queue.canInsertPlayback(quietMs),
-        send: async (content, liveId, messageType) => {
+        send: async (content, liveId) => {
           if (!readyRef.current || activeLiveIdRef.current !== liveId) throw new Error('原会话已结束，已取消手动提问');
-          await call('send_question', { content, liveId, messageType });
-          log(`手动提问（${messageType}）已发送：${content}`);
+          const config = loadModelConfig();
+          await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          await call('send_question', { content, liveId });
+          log(`文本消息已发送：${content}`);
         },
         changed: questions => { if (!disposed) setManualQuestions(questions); },
         error: message => { if (!disposed) { reportError(message); log(message); } },
@@ -281,7 +266,7 @@ export function ConsoleApp() {
         })().catch(error => reportError(`队列调度失败：${errorText(error)}`));
       }, 250);
     }).catch(error => reportError(`初始化互动队列失败：${errorText(error)}`));
-    return () => { disposed = true; if (timer !== undefined) clearInterval(timer); manualQuestionsRef.current?.cancel(); manualQuestionsRef.current = null; interactionQueueRef.current?.dispose(); interactionQueueRef.current = null; };
+    return () => { disposed = true; detachVoice?.(); if (timer !== undefined) clearInterval(timer); manualQuestionsRef.current?.cancel(); manualQuestionsRef.current = null; interactionQueueRef.current?.dispose(); interactionQueueRef.current = null; };
   }, []);
   const queuePlaying = interactionState.tasks.some(task => task.status === 'playing' || task.status === 'uncertain');
   const manualPlaying = !!manualQuestions[0] && manualQuestions[0].status !== 'waiting';
@@ -297,7 +282,7 @@ export function ConsoleApp() {
       reportError('台词匹配度需为50–100%的整数');
       return;
     }
-    void manageQueue(() => interactionQueueRef.current?.configureRecognition(whisperEnabled, matchPercent));
+    void manageQueue(() => interactionQueueRef.current?.configureRecognition(asrEnabled, matchPercent));
   };
   const [handoffWaitDraft, setHandoffWaitDraft] = useState('1699');
   const [handoffAngleDraft, setHandoffAngleDraft] = useState('30');
@@ -337,8 +322,8 @@ export function ConsoleApp() {
     const liveId = session?.live_id;
     if (!liveId) return;
     const task = captionTask?.status === 'playing' && captionTask.live_id === liveId ? captionTask : undefined;
-    void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', enabled: whisperEnabled && !!task && !task.song });
-  }, [session?.live_id, captionTask?.id, captionTask?.status, captionTask?.playback_token, whisperEnabled]);
+    void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', enabled: asrEnabled && !!task && !task.song });
+  }, [session?.live_id, captionTask?.id, captionTask?.status, captionTask?.playback_token, asrEnabled]);
   useEffect(() => {
     const liveId = session?.live_id;
     if (!liveId) return;
@@ -351,15 +336,15 @@ export function ConsoleApp() {
     setBusyState(queuePlaying || manualPlaying);
   }, [queuePlaying, manualPlaying]);
   useEffect(() => {
-    void interactionQueueRef.current?.setContext(auto, session?.live_id || '', ready && rtcJoined && !micEnabled && !micPending && (!busy || queuePlaying || manualPlaying) && (!!interactionState.tasks[0]?.song || !whisperEnabled || whisperStatus === 'ready')).catch(error => reportError(`更新队列状态失败：${errorText(error)}`));
-  }, [auto, session?.live_id, ready, rtcJoined, micEnabled, micPending, busy, queuePlaying, manualPlaying, queueDirectory, whisperEnabled, whisperStatus, interactionState.tasks[0]?.id]);
+    void interactionQueueRef.current?.setContext(auto, session?.live_id || '', ready && rtcJoined && !micEnabled && !micPending && (!busy || queuePlaying || manualPlaying)).catch(error => reportError(`更新队列状态失败：${errorText(error)}`));
+  }, [auto, session?.live_id, ready, rtcJoined, micEnabled, micPending, busy, queuePlaying, manualPlaying, queueDirectory, asrEnabled, asrStatus, interactionState.tasks[0]?.id]);
   useEffect(() => {
     const states: Record<string, string> = {
       'RTC 入会': rtcJoined ? '已入会' : session ? '等待播放窗口入会' : '未入会',
       '远端音频': rtcAudioSubscribed ? '已订阅' : rtcJoined ? '等待订阅' : '未连接',
       '远端视频': rtcVideoSubscribed ? '已订阅' : rtcJoined ? '等待订阅' : '未连接',
       '实际画面': videoPlaying ? '播放中' : session ? '等待视频画面' : '未播放',
-      '本地麦克风': micPending ? '正在切换…' : micEnabled ? '推流中' : '未推流',
+      '本地麦克风': micPending ? '正在切换…' : micEnabled ? '本地识别中' : '未开启',
     };
     const liveId = liveState?.live_id;
     const previous = mediaLogRef.current.liveId === liveId ? mediaLogRef.current.states : {};
@@ -392,20 +377,6 @@ export function ConsoleApp() {
     const message = '数字人已自动恢复；中断台词未重播，未播任务将继续。';
     setAvatarNotice({ kind: 'success', message }); log(message);
   }, [ready, rtcJoined, videoPlaying, session?.live_id]);
-  useEffect(() => {
-    if (tab !== 'voice') return;
-    setVoices([]); setVoicesError('');
-    if (!apiKey.trim().startsWith('vda_')) { setVoicesLoading(false); setVoicesError('请先在“模型配置 → Vidu数字人”填写 Vidu API Key，再查询已创建的克隆音色。'); return; }
-    setVoicesLoading(true);
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void call<{ voices?: ClonedVoice[] }>('list_voices', { key: apiKey, region: voiceRegion })
-        .then(result => { if (!cancelled) setVoices(qwenClonedVoices(result.voices || [], voice => cloneProvider(voice, voiceRegion))); })
-        .catch(error => { if (!cancelled) { setVoices([]); setVoicesError(errorText(error)); reportError(`读取音色列表失败：${errorText(error)}`); } })
-        .finally(() => { if (!cancelled) setVoicesLoading(false); });
-    }, 400);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [tab, apiKey, voiceRegion]);
   useEffect(() => {
     setCredits(null);
     setCreditsError('');
@@ -465,11 +436,6 @@ export function ConsoleApp() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showCreditDetails]);
   useEffect(() => {
-    if (!playRequestedRef.current || !voicePreviewUrl) return;
-    playRequestedRef.current = false;
-    void audioPreviewRef.current?.play().catch(() => {});
-  }, [voicePreviewUrl, tab]);
-  useEffect(() => {
     const cleanup: Array<() => void> = [];
     recoveryRef.current = new SessionRecovery<Session>({
       prepare: async liveId => {
@@ -521,6 +487,14 @@ export function ConsoleApp() {
         setLiveState(old => old?.live_id === liveId ? old : { live_id: liveId, status: 'waiting' });
         setInitStage('控制连接已建立，等待初始化确认');
       }));
+      cleanup.push(await listen<{ state: string }>('tts-service-state', event => {
+        if (!['starting', 'stopping', 'stopped'].includes(event.payload.state)) return;
+        setAuto(false); modelRequestRef.current++;
+        manualQuestionsRef.current?.cancel();
+        void interactionQueueRef.current?.speechUnavailable('TTS 服务已关闭或切换，当前播报完成情况待人工确认').catch(error => reportError(errorText(error)));
+        if (micRef.current && activeLiveIdRef.current) void emitTo('obs', 'mic-control', { live_id: activeLiveIdRef.current, enabled: false });
+        log(event.payload.state === 'starting' ? 'TTS 模型加载中，自动回答已暂停' : 'TTS 服务关闭或切换，自动回答已暂停');
+      }));
       cleanup.push(await listen<any>('vidu-signal', event => {
         const signal = event.payload;
         const liveId = String(signal.live_id || '');
@@ -566,6 +540,27 @@ export function ConsoleApp() {
         }
       }));
       cleanup.push(await listen<{ live_id: string; forced: boolean }>('vidu-disconnected', event => { const liveId = event.payload.live_id; if (activeLiveIdRef.current && liveId !== activeLiveIdRef.current) return; disconnectedLiveIdsRef.current.add(liveId); modelRequestRef.current += 1; generatingReplyRef.current = false; setReady(false); setBusyState(false); setRtcJoined(false); setMicEnabled(false); micRef.current = false; if (!expectedDisconnectRef.current && !event.payload.forced && !endedLiveIdsRef.current.has(liveId)) { const message = 'Vidu 控制连接断开，请点击“结束会话”清理当前会话。'; setAvatarNotice({ kind: 'error', message }); reportError(message); } expectedDisconnectRef.current = false; log('Vidu 控制连接断开'); }));
+      cleanup.push(await listen<{ live_id: string }>('microphone-speech-start', event => {
+        if (event.payload.live_id !== activeLiveIdRef.current) return;
+        modelRequestRef.current++;
+        manualQuestionsRef.current?.cancel();
+        void interactionQueueRef.current?.finish('skipped', '用户开口，打断当前队列');
+      }));
+      cleanup.push(await listen<{ live_id: string; error: string }>('microphone-error', event => {
+        if (event.payload.live_id === activeLiveIdRef.current) reportError(event.payload.error);
+      }));
+      cleanup.push(await listen<{ live_id: string; text: string; capture_id: string }>('microphone-input', event => {
+        const input = event.payload;
+        if (input.live_id !== activeLiveIdRef.current || !micRef.current || !readyRef.current) return;
+        const generation = ++modelRequestRef.current;
+        const config = loadModelConfig();
+        log('麦克风识别：' + input.text);
+        void (async () => {
+          await call('component_configure', { liveId: input.live_id, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          if (generation !== modelRequestRef.current || !micRef.current || input.live_id !== activeLiveIdRef.current) return;
+          await call('component_respond', { liveId: input.live_id, taskId: 'microphone-' + input.capture_id, content: input.text });
+        })().catch(error => { if (generation === modelRequestRef.current) reportError('语音互动失败：' + errorText(error)); });
+      }));
       cleanup.push(await listen<RecognitionObservation>('whisper-recognition', event => {
         if (event.payload.live_id !== activeLiveIdRef.current) return;
         void interactionQueueRef.current?.observeRecognition(event.payload).catch(error => reportError(`语音识别匹配失败：${errorText(error)}`));
@@ -643,7 +638,7 @@ export function ConsoleApp() {
         setMicPending(false);
         setMicError(event.payload.error || '');
         if (event.payload.error) { reportError(event.payload.error); log(event.payload.error); }
-        else log(event.payload.enabled ? '麦克风推流已开启，自动弹幕提问已暂停' : '麦克风推流已关闭');
+        else log(event.payload.enabled ? '麦克风本地识别已开启，自动弹幕提问已暂停' : '麦克风本地识别已关闭');
       }));
     })().catch(error => reportError(`注册实时事件失败：${errorText(error)}`));
     return () => { recoveryRef.current?.cancel(); cleanup.forEach(fn => fn()); };
@@ -696,11 +691,6 @@ export function ConsoleApp() {
     if (runtimeBusy || creatingAvatarRef.current || recoveryRef.current?.pending) throw new Error('请先结束当前数字人会话，再切换数字人');
     await avatars.selectProfile(id);
   }
-  async function selectClonedVoice(voice: string) {
-    if (!voices.includes(voice)) throw new Error('请选择列表中的千问 qwen_omni 克隆音色');
-    if (cloneTarget) cloneTarget.select(voice);
-    else await avatars.patchActive({ voice, voiceProvider: 'qwen_omni', voiceSource: 'clone' });
-  }
   const startDanmaku = () => action(async () => {
     if (!settings.roomId.trim()) throw new Error('请先输入直播间号');
     await call('start_dyhub');
@@ -732,16 +722,11 @@ export function ConsoleApp() {
       if (!apiKey.trim()) throw new Error('请先在“模型配置 → Vidu数字人”填写 Vidu API Key');
       if (!(imageFileData || settings.imageUri.trim())) throw new Error('请先在“形象设定”设置形象图片');
       if (!settings.persona.trim()) throw new Error('请先在“形象设定”填写人设');
-      let confirmedClones: string[] = [];
-      if (settings.voiceSource === 'clone') {
-        const data = await call<{ voices?: ClonedVoice[] }>('list_voices', { key: apiKey, region: settings.region });
-        confirmedClones = qwenClonedVoices(data.voices || [], voice => cloneProvider(voice, settings.region));
-        setVoices(confirmedClones);
-      }
-      validateVoiceSelection(settings, confirmedClones);
-      validateAdvanced(settings.advanced);
-      const a = settings.advanced;
-      const creation: SessionCreation = { key: apiKey, region: settings.region, avatar: { model: settings.avatarModel, image_uri: imageFileData || settings.imageUri, persona: settings.persona, voice: settings.voice, voice_provider: settings.voiceProvider, greeting_instruction: settings.greeting, advanced: { persona_enhance: a.personaEnhance, idle_action: a.idleAction, enable_transcription: true, vad_type: a.vadType, vad_threshold: a.vadThreshold, silence_duration_ms: a.silenceDurationMs, vad_idle_timeout_ms: a.vadIdleTimeoutMs, temperature: a.temperature, top_p: a.topP, top_k: a.topK, max_tokens: a.maxTokens, idle_timeout_seconds: a.idleTimeoutSeconds } } };
+      const tts = loadTtsConfig();
+      const modelConfig = loadModelConfig();
+      if (!tts.ref_audio.trim() || !tts.ref_text.trim()) throw new Error('请在“模型配置 → OmniVoice 语音”保存参考音频路径和参考文字');
+      if (!modelConfig.apiKey.trim() || !modelConfig.selectedModel.trim()) throw new Error('请先保存大语言模型配置');
+      const creation: SessionCreation = { key: apiKey, region: settings.region, avatar: { tts, llm: { base_url: modelConfig.baseUrl, key: modelConfig.apiKey, model: modelConfig.selectedModel, persona: modelConfig.persona }, model: settings.avatarModel, image_uri: imageFileData || settings.imageUri, persona: settings.persona } };
       sessionCreationRef.current = creation;
       const result = await call<Session>('create_session', creation);
       if (endedLiveIdsRef.current.has(result.live_id)) return;
@@ -776,16 +761,15 @@ export function ConsoleApp() {
       await emitTo('obs', 'mic-control', { live_id: session.live_id, enabled: !micEnabled });
     } catch (error) { const message = `麦克风操作失败：${errorText(error)}`; setMicPending(false); setMicError(message); reportError(message); log(message); }
   };
-  const manualSend = (messageType: ManualMessageType) => action(async () => {
-    const content = (messageType === 'text_dialog' ? dialogue : question).trim();
+  const manualSend = () => action(async () => {
+    const content = question.trim();
     const liveId = activeLiveIdRef.current;
     if (!content || !liveId || !readyRef.current) return;
     const manual = manualQuestionsRef.current;
     if (!manual) throw new Error('调度器尚未初始化，请稍后重试');
-    manual.enqueue(content, liveId, messageType);
-    log(`手动提问（${messageType}）优先待发：${content}`);
-    const clearInput = messageType === 'text_dialog' ? setDialogue : setQuestion;
-    clearInput(old => old.trim() === content ? '' : old);
+    manual.enqueue(content, liveId);
+    log(`文本消息优先待发：${content}`);
+    setQuestion(old => old.trim() === content ? '' : old);
   });
   const interrupt = () => action(async () => { modelRequestRef.current += 1; generatingReplyRef.current = false; await call('interrupt_session'); manualQuestionsRef.current?.cancel(); await interactionQueueRef.current?.finish('skipped', '操作员打断'); setBusyState(false); log('已发送打断指令，已清除待发手动提问'); });
   async function manageQueue(task: () => Promise<void> | undefined) {
@@ -811,7 +795,7 @@ export function ConsoleApp() {
     const queue = interactionQueueRef.current;
     if (!queue) throw new Error('互动队列尚未初始化，请稍后重试');
     if (!session || !ready || !rtcJoined) throw new Error('请先创建数字人并等待播放窗口入会');
-    if (micEnabled || micPending) throw new Error('请先关闭麦克风推流，再测试弹幕播报');
+    if (micEnabled || micPending) throw new Error('请先关闭麦克风识别，再测试弹幕播报');
     if (busyRef.current || queue.isGenerating()) throw new Error('请等待当前提问或生成结束后再测试');
     const config = loadModelConfig();
     if (entries.some(entry => !entry.result) && (!config.apiKey.trim() || !config.selectedModel || !config.persona.trim())) {
@@ -837,79 +821,6 @@ export function ConsoleApp() {
     setAuto(true);
     log(`测试批次 ${batchId} · 会话 ${liveId} · 已按输入顺序导入 ${items.length} 条互动，新一轮等待下行音频静音确认后串行播报；协议诊断记录在应用数据目录 douyin-live/data/vidu-signals.jsonl`);
   });
-  const cloneVoice = async () => {
-    setVoiceNotice(null);
-    setPending(true);
-    let ttsReady = false;
-    try {
-      if (!apiKey.trim()) throw new Error('请先在“模型配置 → Vidu数字人”填写 Vidu API Key');
-      const voice = voiceName.trim();
-      if (!/^[A-Za-z][A-Za-z0-9_]{6,14}[A-Za-z0-9]$/.test(voice)) throw new Error('音色名称需为 8–16 位，以字母开头、字母或数字结尾，仅使用字母、数字和下划线');
-      const audioUrl = voiceUrl.trim();
-      if (!audioUrl) throw new Error('请填写 Vidu 可访问的公网音频 URL');
-      if (!/^https?:\/\//i.test(audioUrl)) throw new Error('音频 URL 需以 http:// 或 https:// 开头');
-      if (audioUrl.length > 2048) throw new Error('音频 URL 不能超过 2048 个字符');
-      const sampleText = voiceSampleText.trim();
-      if (!sampleText || sampleText.length > 200) throw new Error('试听文本需为 1–200 个字');
-      const linkKey = voiceLinkKey(voiceRegion, voice);
-      const existingLink = voiceLinks[linkKey];
-      let ttsVoiceId = existingLink?.ttsVoiceId || '';
-      ttsReady = !!existingLink;
-      if (existingLink && existingLink.audioUrl !== audioUrl) throw new Error('此名称已关联其他参考音频。请换一个新音色名称，避免复用已有语音合成音色。');
-      if (!existingLink) {
-        setVoiceNotice({ kind: 'success', message: '正在创建试听音色…' });
-        const ttsResult = await call<{ state?: string; voice_id?: string; demo_audio?: string; task_id?: string }>('clone_tts_voice', { key: apiKey, region: voiceRegion, voiceId: voice, audioUrl, text: sampleText });
-        if (ttsResult.state !== 'success' || !ttsResult.voice_id) throw new Error(`试听音色尚未创建成功（${ttsResult.state || '未知状态'}${ttsResult.task_id ? `，任务 ${ttsResult.task_id}` : ''}），未提交直播音色。`);
-        ttsVoiceId = ttsResult.voice_id;
-        const nextLinks = { ...voiceLinks, [linkKey]: { ttsVoiceId: ttsResult.voice_id, audioUrl } };
-        setVoiceLinks(nextLinks);
-        ttsReady = true;
-        try { localStorage.setItem('vidu-voice-links', JSON.stringify(nextLinks)); }
-        catch { throw new Error('试听音色已创建，但本机保存音色关联失败。请检查应用存储权限后重试。'); }
-        if (ttsResult.demo_audio && /^https?:\/\//i.test(ttsResult.demo_audio)) {
-          activePreviewCacheKey.current = '';
-          setVoicePreviewName(voice);
-          setVoicePreviewUrl(ttsResult.demo_audio);
-        }
-      }
-      setVoiceNotice({ kind: 'success', message: '试听音色已创建，正在创建直播音色…' });
-      await call('clone_live_voice', { key: apiKey, region: voiceRegion, voice, audioUrl, transcript: voiceTranscript });
-      const nextLinks = { ...loadVoiceLinks(), [linkKey]: { ttsVoiceId, audioUrl, provider: 'qwen_omni' as const } };
-      localStorage.setItem('vidu-voice-links', JSON.stringify(nextLinks));
-      setVoiceLinks(nextLinks);
-      setVoices(old => old.includes(voice) ? old : [...old, voice]);
-      if (cloneTarget) cloneTarget.select(voice);
-      else if (avatars.library) await avatars.patchProfile(avatars.library.activeId, { voice, voiceProvider: 'qwen_omni', voiceSource: 'clone' });
-      setVoicesError('');
-      setVoiceNotice({ kind: 'success', message: `音色 ${voice} 克隆成功，已设为当前音色，可点击试听` });
-      log(`音色 ${voice} 克隆成功，已设为当前音色`);
-    } catch (error) {
-      const message = errorText(error);
-      setVoiceNotice({ kind: 'error', message: `${message}${ttsReady ? '；试听音色已创建，再次提交会直接重试直播音色。' : ''}` });
-      reportError(`音色克隆失败：${message}`);
-      log(`音色克隆失败：${message}`);
-    } finally {
-      setPending(false);
-    }
-  };
-  const refreshVoices = async () => {
-    setVoiceNotice(null);
-    setVoicesLoading(true); setVoicesError('');
-    setPending(true);
-    try {
-      if (!apiKey.trim()) throw new Error('请先在“模型配置 → Vidu数字人”填写 Vidu API Key');
-      const result = await call<{ voices?: ClonedVoice[] }>('list_voices', { key: apiKey, region: voiceRegion });
-      setVoices(qwenClonedVoices(result.voices || [], voice => cloneProvider(voice, voiceRegion)));
-    } catch (error) {
-      const message = errorText(error);
-      setVoicesError(message);
-      setVoiceNotice({ kind: 'error', message });
-      reportError(`刷新音色列表失败：${message}`);
-      log(`刷新音色列表失败：${message}`);
-    } finally {
-      setPending(false); setVoicesLoading(false);
-    }
-  };
   const refreshCredits = async () => {
     setCreditsError('');
     setCreditsLoading(true);
@@ -917,61 +828,6 @@ export function ConsoleApp() {
     catch (error) { const message = `查询账户积分失败：${errorText(error)}`; setCredits(null); setCreditsError(errorText(error)); reportError(message); }
     finally { setCreditsLoading(false); }
   };
-  const deleteVoice = async (voice: string) => {
-    setVoiceNotice(null);
-    if (session) { const message = '请先结束数字人会话，再删除音色。'; setVoiceNotice({ kind: 'error', message }); reportError(message); return; }
-    if (!window.confirm(`确定从 Vidu 账户删除直播音色“${voice}”吗？删除后无法恢复。`)) return;
-    setPending(true);
-    try {
-      await call('delete_voice', { key: apiKey, region: voiceRegion, voice });
-      setVoices(old => old.filter(item => item !== voice));
-      if (avatars.library && settings.region === voiceRegion && settings.voice === voice) await avatars.patchProfile(avatars.library.activeId, { voice: initialSettings.voice, voiceProvider: initialSettings.voiceProvider, voiceSource: 'builtin' });
-      if (voicePreviewName === voice) { setVoicePreviewUrl(''); setVoicePreviewName(''); }
-      const nextLinks = { ...voiceLinks };
-      delete nextLinks[voiceLinkKey(voiceRegion, voice)];
-      setVoiceLinks(nextLinks);
-      let storageWarning = '';
-      try { localStorage.setItem('vidu-voice-links', JSON.stringify(nextLinks)); }
-      catch { storageWarning = '；本机音色关联清理失败，请检查应用存储权限'; reportError('本机音色关联清理失败，请检查应用存储权限。'); }
-      setVoiceNotice({ kind: 'success', message: `已从 Vidu 删除直播音色 ${voice}${settings.voice === voice ? '，当前音色已切换为默认千问音色 Tina' : ''}${storageWarning}` });
-      log(`已删除直播音色 ${voice}`);
-    } catch (error) {
-      const message = `删除音色失败：${errorText(error)}`; setVoiceNotice({ kind: 'error', message }); reportError(message);
-    } finally { setPending(false); }
-  };
-  const previewVoice = async (voice: string, region: Settings['region'] = voiceRegion) => {
-    setVoicePreviewError('');
-    const link = voiceLinks[voiceLinkKey(region, voice)];
-    if (!link) { const message = '此直播音色没有关联的试听音色。请用双接口流程重新克隆一个新名称。'; setVoicePreviewError(message); reportError(message); return; }
-    const cacheKey = JSON.stringify([region, voice, voiceSampleText.trim()]);
-    const cachedUrl = voicePreviewCache.current.get(cacheKey);
-    if (cachedUrl) {
-      activePreviewCacheKey.current = cacheKey;
-      setVoicePreviewName(voice);
-      if (audioPreviewRef.current?.src === cachedUrl) {
-        audioPreviewRef.current.currentTime = 0;
-        void audioPreviewRef.current.play().catch(() => {});
-      } else {
-        playRequestedRef.current = true;
-        setVoicePreviewUrl(cachedUrl);
-      }
-      return;
-    }
-    setPreviewingVoice(voice);
-    try {
-      if (!apiKey.trim()) throw new Error('请先在“模型配置 → Vidu数字人”填写 Vidu API Key');
-      const url = await call<string>('preview_voice', { key: apiKey, region: region, voiceId: link.ttsVoiceId, text: voiceSampleText });
-      if (!/^https?:\/\//i.test(url)) throw new Error('Vidu 返回的试听音频地址无效');
-      voicePreviewCache.current.set(cacheKey, url);
-      activePreviewCacheKey.current = cacheKey;
-      setVoicePreviewName(voice);
-      playRequestedRef.current = true;
-      setVoicePreviewUrl(url);
-    } catch (error) {
-      const message = `试听失败：${errorText(error)}`; setVoicePreviewError(message); reportError(message);
-    } finally { setPreviewingVoice(null); }
-  };
-  const voicePlayer = voicePreviewUrl && <div className="voice-preview-player"><span>试听音频：{voicePreviewName}</span><audio ref={audioPreviewRef} src={voicePreviewUrl} controls preload="none" onError={() => { const message = '试听音频加载失败，请重试。'; voicePreviewCache.current.delete(activePreviewCacheKey.current); setVoicePreviewError(message); reportError(message); }}/></div>;
   const creditItems = credits?.remains || credits?.remaining_credits || [];
   const totalCredits = creditItems.reduce((sum, item) => sum + (Number(item.credit_remain) || 0), 0);
 
@@ -982,7 +838,7 @@ export function ConsoleApp() {
       <button className={tab === 'live' ? 'nav active' : 'nav'} onClick={() => setTab('live')}><Radio size={18}/> 直播中控</button>
       <button className={tab === 'rules' ? 'nav active' : 'nav'} onClick={() => setTab('rules')}><Shield size={18}/> 弹幕配置</button>
       <button className={tab === 'songs' ? 'nav active' : 'nav'} onClick={() => setTab('songs')}><Music2 size={18}/> 唱歌模块</button>
-      <button className={tab === 'voice' ? 'nav active' : 'nav'} onClick={() => { setCloneTarget(null); setTab('voice'); }}><Mic2 size={18}/> 音色克隆</button>
+      <button className={tab === 'voice' ? 'nav active' : 'nav'} onClick={() => setTab('voice')}><Mic2 size={18}/> 音色克隆</button>
       <button className={tab === 'models' ? 'nav active' : 'nav'} onClick={() => setTab('models')}><Cpu size={18}/> 模型配置</button>
       <button className={tab === 'settings' ? 'nav active' : 'nav'} onClick={() => setTab('settings')}><Settings2 size={18}/> 形象设定</button>
       <div className="sidebar-bottom">
@@ -1004,27 +860,22 @@ export function ConsoleApp() {
         <section className="card control-card"><div className="section-title"><div><h2>生成与播放</h2></div><Video size={19}/></div><div className="active-avatar-summary"><span>当前数字人：<strong>{avatars.library?.profiles.find(profile => profile.id === avatars.library?.activeId)?.name || (avatars.loading ? '读取中…' : '未选择')}</strong></span><button type="button" onClick={() => setTab('settings')}>管理数字人</button></div><div className="button-row"><button className="primary" disabled={pending || recoveringSession || !!session || avatars.loading || avatars.saving || !avatars.library} onClick={() => void startAvatar()}><Play size={16}/> {creatingAvatar ? '启动中…' : '启动数字人'}</button><button disabled={!session} onClick={() => void call('open_obs_window').catch(error => reportError(`打开 OBS 窗口失败：${errorText(error)}`))}><Clapperboard size={16}/> 打开 OBS 窗口</button><button disabled={creatingAvatar || (!recoveringSession && !session && !ready && avatarNotice?.message !== '数字人已就绪，可以开始提问。')} onClick={stopAvatar}><CircleStop size={16}/> 结束会话</button></div>{avatarNotice && <div className={`voice-notice ${avatarNotice.kind}`} role={avatarNotice.kind === 'error' ? 'alert' : 'status'}>{avatarNotice.message}</div>}<div className="session-info" role="status" aria-live="polite"><span>创建阶段</span><strong>{initStage || '尚未创建'}</strong><span>Vidu 状态</span><strong>{liveState ? liveStatusText(liveState.status) : creatingAvatar ? '等待创建接口返回' : '—'}</strong><span>会话 ID</span><strong>{liveState?.live_id || session?.live_id || '—'}</strong><span>控制连接</span><strong>{ready ? '就绪' : session ? disconnectedLiveIdsRef.current.has(session.live_id) ? '已断开' : '连接中' : '未连接'}</strong>{liveState?.trace_id && <><span>Trace ID</span><strong>{liveState.trace_id}</strong></>}</div>{liveStatusError && <p className="hint">会话状态查询失败：{liveStatusError}</p>}</section>
         <section className="card ask-card">
           <div className="section-title"><div><h2>提问与打断</h2></div><Send size={19}/></div>
-          <QuestionInputs question={question} dialogue={dialogue} onQuestionChange={setQuestion} onDialogueChange={setDialogue}
-            canSend={!pending && ready && !!queueDirectory} canInterrupt={ready} onSend={messageType => void manualSend(messageType)} onInterrupt={() => void interrupt()}/>
+          <QuestionInputs question={question} onQuestionChange={setQuestion}
+            canSend={!pending && ready && !!queueDirectory} canInterrupt={ready} onSend={() => void manualSend()} onInterrupt={() => void interrupt()}/>
           <p className="hint">手动提问在当前播报结束后优先发送，回答结束后继续互动队列。</p>
           {manualQuestions.length > 0 && <div role="status">
-            <p className="hint">{manualQuestions[0].status === 'waiting' ? '优先等待发送' : manualQuestions[0].status === 'uncertain' ? '等待确认' : '正在回答手动提问'}（{manualQuestions[0].message_type}）：{manualQuestions[0].content} · 共 {manualQuestions.length} 条{manualQuestions[0].error && ' · ' + manualQuestions[0].error}</p>
+            <p className="hint">{manualQuestions[0].status === 'waiting' ? '优先等待发送' : manualQuestions[0].status === 'uncertain' ? '等待确认' : '正在回答手动提问'}：{manualQuestions[0].content} · 共 {manualQuestions.length} 条{manualQuestions[0].error && ' · ' + manualQuestions[0].error}</p>
             {manualQuestions[0].status === 'uncertain' && <button onClick={() => manualQuestionsRef.current?.confirm()}>确认手动回答完成</button>}
           </div>}
           <div className="button-row">
-            <button disabled={!rtcJoined || micPending} onClick={() => void toggleMicrophone()}>{micEnabled ? <MicOff size={16}/> : <Mic2 size={16}/>} {micPending ? '麦克风连接中…' : micEnabled ? '关闭麦克风' : '开启麦克风推流'}</button>
+            <button disabled={!rtcJoined || micPending} onClick={() => void toggleMicrophone()}>{micEnabled ? <MicOff size={16}/> : <Mic2 size={16}/>} {micPending ? '麦克风连接中…' : micEnabled ? '关闭麦克风' : '开启麦克风识别'}</button>
             <span className="hint">{micError || (micEnabled ? '麦克风已开启' : '麦克风已关闭')}</span>
           </div>
           <div className="auto-row"><div><strong>自动回答弹幕</strong></div><button className={auto ? 'switch on' : 'switch'} onClick={toggleAutomaticQueue} aria-label="切换自动回答" aria-pressed={auto}><span/></button></div>
         </section>
         <section className="card interaction-queue-card"><div className="section-title"><div><h2>互动任务队列</h2></div><span className="count">{interactionState.tasks.length}/{INTERACTION_SLOT_COUNT} 槽位</span></div>
           <p className="hint">候选弹幕 {interactionState.candidates.filter(event => event.type === 'chat').length} · 待感谢礼物 {interactionState.candidates.filter(event => event.type === 'gift').length + Object.keys(interactionState.combos).length} · 模型生成 {interactionState.tasks.filter(task => task.status === 'generating').length}/2 · 已播报 {interactionState.totals?.played ?? 0}</p>
-          <div className="queue-handoff-controls">
-            <div className="auto-row"><div><strong>语音识别与台词末尾匹配</strong></div><button className={whisperEnabled ? 'switch on' : 'switch'} disabled={!queueDirectory || queuePlaying || interactionState.tasks.some(task => task.status === 'uncertain')} aria-label="切换语音识别结束检测" aria-pressed={whisperEnabled} onClick={() => void manageQueue(() => interactionQueueRef.current?.configureRecognition(!whisperEnabled))}><span/></button></div>
-            <div className="fields-row"><label>台词匹配度（%）<input type="number" min={50} max={100} step={1} disabled={!whisperEnabled || !queueDirectory || queuePlaying} value={recognitionMatchDraft} onChange={event => setRecognitionMatchDraft(event.target.value)} onBlur={saveRecognitionMatch} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
-            {whisperEnabled && <div className="button-row"><button disabled={whisperStatus === 'loading' || queuePlaying} onClick={() => void loadWhisper(true)}>{whisperStatus === 'loading' ? '加载中…' : '重新加载语音识别'}</button><span className="hint" role="status">{whisperMessage || '等待加载语音识别'}</span></div>}
-
-          </div>
+          <div className="queue-handoff-controls"><strong>本地语音输入</strong><p className="hint">FunASR 中文麦克风识别；播报结束由全部 PCM 发送完成和 RTC 实际下行静音共同判断。</p><div className="button-row"><button disabled={asrStatus === 'loading' || micEnabled} onClick={() => void checkAsr()}>{asrStatus === 'loading' ? '加载中…' : '检查 FunASR 服务'}</button><span className="hint" role="status">{asrMessage || '请先启动本机语音服务'}</span></div></div>
           <div className="queue-handoff-controls">
             <div className="auto-row"><div><strong>承接动作</strong></div><button className={handoff.enabled ? 'switch on' : 'switch'} disabled={!queueDirectory} aria-label="切换承接动作" aria-pressed={handoff.enabled} onClick={() => void manageQueue(() => interactionQueueRef.current?.configureHandoff(!handoff.enabled, handoff.direction))}><span/></button></div>
             <div className="fields-row"><label>当前槽位语音识别匹配度（%）<input type="number" min={1} max={100} step={1} disabled={!handoff.enabled || !queueDirectory} value={handoffTriggerDraft} onChange={event => setHandoffTriggerDraft(event.target.value)} onBlur={saveHandoffTrigger} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>承接动作方向<select disabled={!handoff.enabled || !queueDirectory} value={handoff.direction} onChange={event => void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, event.target.value as HandoffDirection))}>{HANDOFF_DIRECTIONS.map(direction => <option key={direction.value} value={direction.value}>{direction.label}</option>)}</select></label><label>查看角度（度）<input type="number" min={0} max={90} step={1} disabled={!handoff.enabled || !queueDirectory || handoff.direction === 'front'} value={handoffAngleDraft} onChange={event => setHandoffAngleDraft(event.target.value)} onBlur={saveHandoffAngle} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>动作提交后的等待时间（毫秒）<input type="number" min={0} max={3000} step={1} disabled={!handoff.enabled || !queueDirectory} value={handoffWaitDraft} onChange={event => setHandoffWaitDraft(event.target.value)} onBlur={saveHandoffWait} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
@@ -1033,11 +884,11 @@ export function ConsoleApp() {
           </div>
           <div className="interaction-slots">{Array.from({ length: INTERACTION_SLOT_COUNT }, (_, index) => { const task = interactionState.tasks[index]; const gesture = task?.result ? avatarActionFor(task) : null; return <div className={task ? 'interaction-slot occupied' : 'interaction-slot'} key={index}>
             <strong>槽位 {index + 1}{task && ' · ' + task.event.nickname}</strong>
-            {task ? <><span className="tag">{task.song ? '播放歌曲' : task.event.type === 'gift' ? '礼物优先' : '弹幕'} · {task.song && task.status === 'ready' ? '等待播放' : task.song && task.status === 'playing' ? task.song_playback === 'blocked' ? '等待点击恢复播放' : task.song_playback === 'playing' ? '正在播放原歌曲' : '正在启动原歌曲' : lastHandoff?.task_id === task.id && lastHandoff.status === 'pending' ? '承接动作中' : { pending: '等待优化提问', generating: '优化提问中', ready: '提问已优化', playing: '正在播报', uncertain: '等待人工确认', failed: '生成失败' }[task.status]}</span><p>{task.event.content}</p>{task.song ? <p className="interaction-reply">{`原歌曲时长 ${(task.song.duration_ms / 1000).toFixed(1)} 秒 · 使用预生成歌词时间轴`}</p> : <TaskDialogue task={task}/>}{task.error && <p className="hint">{errorText(task.error)}</p>}
-              {task.song && task.status === 'ready' && <p className="hint">{!session || !ready ? '等待数字人连接就绪' : !rtcJoined ? '等待 OBS 播放窗口连接' : micEnabled || micPending ? '请先关闭麦克风推流' : index > 0 ? '等待前面的槽位播放完成；自动回答关闭时，需先处理前面的弹幕任务' : busy && !queuePlaying ? '等待当前提问结束' : !videoPlaying ? '等待 OBS 实时画面恢复' : '等待 OBS 启动原歌曲，无需开启自动回答'}</p>}
+            {task ? <><span className="tag">{task.song ? '播放歌曲' : task.event.type === 'gift' ? '礼物优先' : '弹幕'} · {task.song && task.status === 'ready' ? '等待播放' : task.song && task.status === 'playing' ? task.song_playback === 'blocked' ? '等待点击恢复播放' : task.song_playback === 'playing' ? '正在播放原歌曲' : '正在启动原歌曲' : lastHandoff?.task_id === task.id && lastHandoff.status === 'pending' ? '承接动作中' : { pending: '等待生成', generating: '后台生成回答中', ready: task.prepared_audio?.state === 'ready' ? '声音已就绪，等待播放' : task.prepared_audio?.state === 'preparing' ? '正在预合成声音' : '回答已生成，等待合成', playing: '正在播报', uncertain: '等待人工确认', failed: '生成失败' }[task.status]}</span><p>{task.event.content}</p>{task.song ? <p className="interaction-reply">{`原歌曲时长 ${(task.song.duration_ms / 1000).toFixed(1)} 秒 · 使用预生成歌词时间轴`}</p> : <TaskDialogue task={task}/>}{task.error && <p className="hint">{errorText(task.error)}</p>}
+              {task.song && task.status === 'ready' && <p className="hint">{!session || !ready ? '等待数字人连接就绪' : !rtcJoined ? '等待 OBS 播放窗口连接' : micEnabled || micPending ? '请先关闭麦克风识别' : index > 0 ? '等待前面的槽位播放完成；自动回答关闭时，需先处理前面的弹幕任务' : busy && !queuePlaying ? '等待当前提问结束' : !videoPlaying ? '等待 OBS 实时画面恢复' : '等待 OBS 启动原歌曲，无需开启自动回答'}</p>}
               {task.song && task.status === 'playing' && task.song_playback === 'blocked' && <p className="hint">请在 OBS 窗口点击“恢复播放”，歌曲将从头开始。</p>}
-              {!task.song && whisperEnabled && ['playing', 'uncertain'].includes(task.status) && <p className="hint">语音识别：{task.recognition?.error ? errorText(task.recognition.error) : task.status === 'uncertain' ? '等待人工确认' : (task.recognition?.progress || 0) * 100 + 1e-9 >= (handoff.enabled ? handoff.trigger_percent ?? 50 : recognitionMatchPercent) ? '匹配通过' : !task.answer?.text ? '等待数字人返回回答' : '匹配实际回答中'} · 匹配度 {Math.floor((task.recognition?.progress || 0) * 100 + 1e-9)}%{task.recognition?.text && <span> · {task.recognition.text}</span>}</p>}
-              {gesture && <p className="interaction-action">[动作] {gesture.label} · {task.action_state === 'submitted' ? '已提交' : task.action_state === 'failed' ? '发送失败' : '播报时触发'}{task.action_error && <span>：{task.action_error}</span>}</p>}
+              {!task.song && asrEnabled && ['playing', 'uncertain'].includes(task.status) && <p className="hint">语音识别：{task.recognition?.error ? errorText(task.recognition.error) : task.status === 'uncertain' ? '等待人工确认' : (task.recognition?.progress || 0) * 100 + 1e-9 >= (handoff.enabled ? handoff.trigger_percent ?? 50 : recognitionMatchPercent) ? '匹配通过' : !task.answer?.text ? '等待数字人返回回答' : '匹配实际回答中'} · 匹配度 {Math.floor((task.recognition?.progress || 0) * 100 + 1e-9)}%{task.recognition?.text && <span> · {task.recognition.text}</span>}</p>}
+              {gesture && <p className="interaction-action">[动作] {gesture.label} · {task.action_state === 'submitted' ? '已发送' : task.action_state === 'failed' ? '发送失败' : '播报时触发'}{task.action_error && <span>：{task.action_error}</span>}</p>}
               <div className="button-row">{task.status === 'uncertain' && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.finish('played', '操作员确认完成'))}>确认完成</button>}{!task.song && ['failed', 'ready'].includes(task.status) && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.retry(task.id))}>重新生成</button>}{['playing', 'uncertain'].includes(task.status) ? <button onClick={() => void skipCurrentQueue()}>打断并跳过</button> : <button onClick={() => void manageQueue(() => interactionQueueRef.current?.skip(task.id))}>跳过</button>}</div></> : <p className="hint">等待最新候选事件补位</p>}
           </div>; })}</div>{queueDirectory && <p className="hint queue-directory">文件目录：{queueDirectory}</p>}
         </section>
@@ -1047,29 +898,10 @@ export function ConsoleApp() {
       {tab === 'rules' && <DanmakuSettings avatarSrc={previewSrc} filters={<FilterRules rules={settings.rules} onChange={rules => update({ rules })} onError={message => { reportError(message); log(message); }}/>}/>}
       <SingingModule active={tab === 'songs'} onConfigureModel={() => { setModelTab('reply'); setTab('models'); }} queueAvailable={!!queueDirectory && interactionState.tasks.length < INTERACTION_SLOT_COUNT} queuedSongIds={interactionState.tasks.flatMap(task => task.song ? [task.song.id] : [])} onEnqueue={async song => { const queue = interactionQueueRef.current; if (!queue) throw new Error('互动任务队列尚未加载'); await queue.enqueueSong(song); }}/>
       {tab === 'models' && <ModelConfiguration tab={modelTab} onTabChange={setModelTab} apiKey={apiKey} onApiKeyChange={setApiKey} storageError={keyStorageError}/>}
-      <AvatarSettings cloneProvider={cloneProvider} active={tab === 'settings'} library={avatars.library} loading={avatars.loading} saving={avatars.saving} error={avatars.error} runtimeBusy={runtimeBusy}
-        apiKey={apiKey} onConfigureApi={openViduSettings} preview={tab === 'settings' ? voicePlayer : null} previewError={voicePreviewError} previewingVoice={previewingVoice}
-        canPreview={(voice, region) => !!voiceLinks[voiceLinkKey(region, voice)]} onPreview={(voice, region) => void previewVoice(voice, region)}
-        onClone={(region, select) => { setCloneTarget({ region, select }); setTab('voice'); }}
+      <AvatarSettings active={tab === 'settings'} library={avatars.library} loading={avatars.loading} saving={avatars.saving} error={avatars.error} runtimeBusy={runtimeBusy}
+        apiKey={apiKey} onConfigureApi={openViduSettings}
         onSave={saveProfile} onSelect={selectProfile} onRetry={avatars.retry}/>
-      {tab === 'voice' && <div className="content narrow"><section className="card">
-        <div className="section-title"><div className="voice-clone-title"><h2>克隆音色</h2><span className="voice-clone-title-note">使用自定义音色的数字人需要先克隆音色，使用平台已有音色无需克隆。</span></div><Mic2 size={19}/></div><div className="voice-clone-cost" role="note">音色克隆每次899积分（约28元），每个客户前十次克隆免费。</div>
-        <p className="hint">音色供应商：千问（qwen_omni）。克隆成功后用于千问数字人。</p>
-
-        <div className="form-grid">
-          <label>新音色名称<input value={voiceName} onChange={e => setVoiceName(e.target.value)} placeholder="8–16 位，以字母开头"/></label>
-          <label>参考音频文字<input value={voiceTranscript} onChange={e => setVoiceTranscript(e.target.value)} placeholder="可选，填写录音对应文本"/></label>
-          <label className="full">公网音频 URL<input value={voiceUrl} onChange={e => setVoiceUrl(e.target.value)} placeholder="https://.../reference.wav"/></label>
-        </div>
-        <div className="button-row"><button className="primary" disabled={pending} onClick={cloneVoice}><Mic2 size={16}/> {pending ? '提交中…' : '提交克隆'}</button><button disabled={pending} onClick={refreshVoices}>刷新音色列表</button></div>
-        {voiceNotice && <div className={`voice-notice ${voiceNotice.kind}`} role="alert">{voiceNotice.message}{voiceNotice.kind === 'error' && !apiKey.trim() && <button type="button" onClick={openViduSettings}>前往填写 API Key</button>}</div>}
-
-        <label className="voice-sample-label">试听文本<input value={voiceSampleText} maxLength={200} onChange={e => setVoiceSampleText(e.target.value)} placeholder="输入试听时朗读的文字"/></label>
-
-        <div className="voice-list">{voices.map(v => <div className="voice-item" key={v}><button onClick={() => void selectClonedVoice(v).catch(error => reportError(errorText(error)))}>{v}{settings.voice === v && <span>当前使用</span>}</button><button disabled={!!previewingVoice || !voiceLinks[voiceLinkKey(voiceRegion, v)]} onClick={() => void previewVoice(v)}><Play size={14}/>{previewingVoice === v ? '生成中…' : voiceLinks[voiceLinkKey(voiceRegion, v)] ? '试听' : '未关联试听'}</button><button className="danger" disabled={pending || !!session} onClick={() => void deleteVoice(v)} title={session ? '请先结束数字人会话' : `删除 ${v}`}><Trash2 size={14}/>删除</button></div>)}</div>
-        {voicePreviewError && <div className="voice-notice error" role="alert">{voicePreviewError}</div>}
-        {voicePlayer}
-      </section></div>}
+      {tab === 'voice' && <div className="content narrow"><TtsSettings/></div>}
     </main>
     {showCreditDetails && credits && <div className="credits-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowCreditDetails(false); }}><section className="credits-modal" role="dialog" aria-modal="true" aria-labelledby="credits-modal-title"><div className="credits-modal-heading"><h2 id="credits-modal-title">账户积分</h2><button type="button" onClick={() => setShowCreditDetails(false)} aria-label="关闭积分详情">关闭</button></div><div className="credits-total">{totalCredits.toLocaleString('zh-CN')} <small>积分</small></div>{creditItems.length > 0 && <div className="credits-modal-section"><h3>余额与并发</h3>{creditItems.map((item, i) => <div className="credits-modal-row" key={`${item.type || 'balance'}-${i}`}><strong>{item.type || '资源包'}</strong><span>{Number(item.credit_remain || 0).toLocaleString('zh-CN')} 积分{item.concurrency_limit != null && ` · 并发 ${item.current_concurrency || 0}/${item.concurrency_limit}`}</span></div>)}</div>}{credits.packages && credits.packages.length > 0 && <div className="credits-modal-section"><h3>资源包详情（{credits.packages.length}）</h3>{credits.packages.map((item, i) => <div className="credits-modal-row" key={item.id || i}><strong>{item.name || item.type || item.id || '资源包'}</strong><span>{Number(item.credit_remain || 0).toLocaleString('zh-CN')} 积分{item.valid_to && ` · 有效期至 ${item.valid_to}`}</span></div>)}</div>}</section></div>}
   </div>;

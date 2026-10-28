@@ -8,6 +8,12 @@ mod tts_log;
 mod songs;
 mod song_director;
 mod whisper;
+mod speech_runtime;
+mod speech_stt;
+mod speech_text;
+mod component;
+mod component_action;
+mod prepared_speech;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -86,11 +92,20 @@ struct Session {
     seq: u64,
     last_video_frame_ms: u128,
     voice_provider: String,
+    ready: bool,
+    speaking: bool,
+    external_audio: Option<(String, u64)>,
+    conversation: Vec<Value>,
+    speech_cancel: tokio::sync::watch::Sender<u64>,
+    tts: component::TtsConfig,
+    llm: component::LlmConfig,
+    persona: String,
 }
 
 struct Outbound {
     message: Message,
     written: Option<oneshot::Sender<Result<(), String>>>,
+    epoch: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
 }
 
 // Bound every write, including heartbeats: a stalled socket must not prevent
@@ -107,30 +122,12 @@ struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String }
 
 #[derive(Deserialize)]
 struct AvatarSettings {
+    tts: component::TtsConfig,
+    llm: component::LlmConfig,
     #[serde(default)]
     model: Option<String>,
     image_uri: String,
     persona: String,
-    voice: String,
-    voice_provider: String,
-    greeting_instruction: String,
-    advanced: AdvancedSettings,
-}
-
-#[derive(Deserialize)]
-struct AdvancedSettings {
-    persona_enhance: bool,
-    idle_action: bool,
-    enable_transcription: bool,
-    vad_type: String,
-    vad_threshold: f64,
-    silence_duration_ms: u32,
-    vad_idle_timeout_ms: u32,
-    temperature: f64,
-    top_p: f64,
-    top_k: u32,
-    max_tokens: u32,
-    idle_timeout_seconds: u32,
 }
 
 fn api_host(region: &str) -> &'static str {
@@ -182,64 +179,45 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let key = normalized_key(&key)?;
     let model = avatar_model(avatar.model.as_deref())?;
     if avatar.image_uri.trim().is_empty() || avatar.persona.trim().is_empty() { return Err("请填写形象图片和人设".into()); }
-    if avatar.greeting_instruction.chars().count() > 200 { return Err("开场白指令不能超过 200 字".into()); }
-    if avatar.voice_provider != "qwen_omni" && avatar.voice_provider != "doubao" { return Err("音色供应商无效，请在形象与配置中重新选择".into()); }
-    let advanced = &avatar.advanced;
-    if advanced.vad_type != "server" && advanced.vad_type != "semantic" { return Err("语音打断模式无效".into()); }
-    if !(0.0..=1.0).contains(&advanced.vad_threshold) || !(200..=6000).contains(&advanced.silence_duration_ms)
-        || (advanced.vad_idle_timeout_ms != 0 && !(500..=30000).contains(&advanced.vad_idle_timeout_ms))
-        || !(0.0..2.0).contains(&advanced.temperature) || !(0.0..=1.0).contains(&advanced.top_p) || advanced.top_p == 0.0
-        || advanced.top_k > 100 || !(1..=65536).contains(&advanced.max_tokens)
-        || !(10..=7200).contains(&advanced.idle_timeout_seconds) {
-        return Err("高级配置超出 Vidu 允许的范围，请检查输入值".into());
-    }
+    component::validate(&avatar.tts, &avatar.llm)?;
+    component::component_preflight(avatar.tts.clone()).await?;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(90))
         .build().map_err(|e| e.to_string())?;
-    let voice_model = if avatar.voice_provider == "doubao" {
-        json!({"provider":"doubao","doubao":{"voice":avatar.voice}})
-    } else {
-        json!({"provider":"qwen_omni","qwen":{"voice":avatar.voice}})
-    };
-    let body = json!({
-        "model": model,
-        "call_mode": "video",
-        "rtc": {"provider": "artc"},
-        "character_id": "1",
-        "voice_model": voice_model,
-        "avatar": {
-            "image_uri": avatar.image_uri,
-            "persona": avatar.persona,
-            "voice": avatar.voice,
-            "greeting_instruction": avatar.greeting_instruction,
-            "persona_enhance": advanced.persona_enhance,
-            "idle_action": advanced.idle_action
-        },
-        "audio": {"enable_transcription": advanced.enable_transcription},
-        "action": {"enabled":true,"library_id":"0"},
-        "vad": {"type":advanced.vad_type,"threshold":advanced.vad_threshold,"silence_duration_ms":advanced.silence_duration_ms,"idle_timeout_ms":advanced.vad_idle_timeout_ms},
-        "llm": {"temperature":advanced.temperature,"top_p":advanced.top_p,"top_k":advanced.top_k,"max_tokens":advanced.max_tokens},
-        "idle_timeout_seconds": advanced.idle_timeout_seconds
-    });
-    let response = client.post(format!("{}/live/s_avatar/realtime", api_host(&region)))
+    let body = json!({"model":model,"image_uri":avatar.image_uri,"managed_rtc":{"provider":"artc"},"action":{"enabled":true,"library_id":"0"}});
+    let response = client.post(format!("{}/live/s_avatar/component", api_host(&region)))
         .header("Authorization", format!("Token {}", key)).json(&body).send().await.map_err(|e| e.to_string())?;
     let data = response_json(response).await?;
     let live_id = data.pointer("/live/id").and_then(Value::as_str).ok_or("Vidu 响应缺少 live.id")?.to_string();
-    let rtc = data.get("rtc").cloned().ok_or("Vidu 响应缺少 RTC 凭证")?;
+    let rtc = data.get("managed_rtc").cloned().ok_or("Vidu 响应缺少 RTC 凭证")?;
     let _ = app.emit("live-created", json!({"live_id": live_id, "status": data.pointer("/live/status")}));
     let conn_id = format!("desktop-{}", uuid::Uuid::new_v4());
-    let url = format!("{}/live/ws/live/connect?live_id={}&conn_id={}", ws_host(&region), live_id, conn_id);
+    let url = format!("{}/live/v1/external-lives/{}/stream?conn_id={}", ws_host(&region), live_id, conn_id);
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Token {}", key)).map_err(|e| e.to_string())?);
-    let (ws, _) = tokio::time::timeout(std::time::Duration::from_secs(30), connect_async(request))
-        .await.map_err(|_| "Vidu WebSocket 连接超时，请检查网络后重试".to_string())?
-        .map_err(|e| format!("Vidu WebSocket 连接失败: {e}"))?;
-    let (mut writer, mut reader) = ws.split();
     let (sender, mut receiver) = unbounded_channel::<Outbound>();
-    let init = json!({"type":1,"live_id":live_id,"conn_id":conn_id,"seq_id":1,"payload":{"conn_init":{"version":1}}});
-    write_control(&mut writer, Message::Text(init.to_string().into())).await?;
-    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: avatar.voice_provider.clone() };
-    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id, key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: avatar.voice_provider.clone() });
+    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: "qwen3_tts".into() };
+    let task_conn_id = conn_id.clone();
+    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id: conn_id.clone(), key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: "qwen3_tts".into(), ready: false, speaking: false, external_audio: None, conversation: Vec::new(), speech_cancel: tokio::sync::watch::channel(0).0, tts: avatar.tts, llm: avatar.llm, persona: avatar.persona });
+    // Retain the live ID before connecting so a failed handshake can still be
+    // ended and cannot silently leave an untracked billable session behind.
     let _ = app.emit("session-changed", snapshot.clone());
+    let connection = tokio::time::timeout(std::time::Duration::from_secs(30), connect_async(request)).await;
+    let (ws, _) = match connection {
+        Ok(Ok(connection)) => connection,
+        failure => {
+            drop(receiver);
+            let reason = match failure { Ok(Err(error)) => format!("Vidu WebSocket 连接失败：{error}"), _ => "Vidu WebSocket 连接超时".into() };
+            let cleanup = end_session(app.clone(), state.clone(), Some(live_id)).await;
+            return Err(format!("{reason}{}", cleanup.err().map(|error| format!("；会话尚未确认结束，请重试结束会话：{error}")).unwrap_or_default()));
+        }
+    };
+    let (mut writer, mut reader) = ws.split();
+    let init = json!({"type":1,"live_id":live_id,"conn_id":conn_id,"seq_id":1,"payload":{"conn_init":{"version":1}}});
+    if let Err(error) = write_control(&mut writer, Message::Text(init.to_string().into())).await {
+        drop(receiver); drop(writer); drop(reader);
+        let cleanup = end_session(app.clone(), state.clone(), Some(live_id)).await;
+        return Err(format!("{error}{}", cleanup.err().map(|error| format!("；请重试结束会话：{error}")).unwrap_or_default()));
+    }
     let app_for_task = app.clone();
     let task_live_id = live_id.clone();
     tauri::async_runtime::spawn(async move {
@@ -248,18 +226,26 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(10), std::time::Duration::from_secs(10));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut forced = false;
+        let mut initialized = false;
+        let initialization_timeout = tokio::time::sleep(std::time::Duration::from_secs(60));
+        tokio::pin!(initialization_timeout);
         loop {
             tokio::select! {
+                _ = &mut initialization_timeout, if !initialized => { let _ = app_for_task.emit("session-cleanup-error", "组件初始化超过60秒，正在结束会话"); break; }
                 _ = heartbeat.tick() => {
                     if write_control(&mut writer, Message::Ping(Vec::new().into())).await.is_err() { break; }
                 }
                 outgoing = receiver.recv() => {
                     match outgoing {
                         Some(outbound) => {
+                            if outbound.epoch.as_ref().is_some_and(|(receiver, epoch)| *receiver.borrow() != *epoch) {
+                                if let Some(written) = outbound.written { let _ = written.send(Err("播报已取消".into())); }
+                                continue;
+                            }
                             let metadata = match &outbound.message { Message::Text(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null), _ => Value::Null };
                             let result = write_control(&mut writer, outbound.message).await;
                             let failed = result.is_err();
-                            signal_trace::record(&app_for_task, &task_live_id, if failed { "write_failed" } else { "written" }, &metadata);
+                            if !metadata.is_null() || failed { signal_trace::record(&app_for_task, &task_live_id, if failed { "write_failed" } else { "written" }, &metadata); }
                             tts_log::record(&app_for_task, &task_live_id, &metadata, result.as_ref().err().map(String::as_str));
                             if let Some(written) = outbound.written { let _ = written.send(result); }
                             if failed { break; }
@@ -278,9 +264,15 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                                     && value.pointer("/payload/conn_init_ack/error_code").and_then(Value::as_str) == Some("NOT_READY")
                                     && retries < 20 {
                                     retries += 1;
-                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                    let retry = json!({"type":1,"live_id":value.get("live_id"),"conn_id":value.get("conn_id"),"seq_id":retries+1,"payload":{"conn_init":{"version":1}}});
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    let retry = json!({"type":1,"live_id":value.get("live_id"),"conn_id":task_conn_id,"seq_id":retries+1,"payload":{"conn_init":{"version":1}}});
                                     if write_control(&mut writer, Message::Text(retry.to_string().into())).await.is_err() { break; }
+                                }
+                                if value["type"].as_u64() == Some(2) && value.pointer("/payload/conn_init_ack/success").and_then(Value::as_bool) == Some(true) {
+                                    initialized = true;
+                                    if let Ok(mut guard) = app_for_task.state::<AppState>().session.lock() {
+                                        if let Some(session) = guard.as_mut().filter(|s| s.live_id == task_live_id) { session.ready = true; }
+                                    }
                                 }
                                 let _ = app_for_task.emit("vidu-signal", value);
                                 if forced { break; }
@@ -292,6 +284,9 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
                     }
                 }
             }
+        }
+        if let Ok(mut guard) = app_for_task.state::<AppState>().session.lock() {
+            if let Some(session) = guard.as_mut().filter(|s| s.live_id == task_live_id) { session.ready = false; session.speaking = false; session.speech_cancel.send_modify(|value| *value += 1); }
         }
         // Pending instructions were never written when the connection closed.
         receiver.close();
@@ -328,12 +323,13 @@ fn send_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload
 fn queue_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload: Value, written: Option<oneshot::Sender<Result<(), String>>>) -> Result<(), String> {
     session.seq += 1;
     let message = json!({"type":kind,"live_id":session.live_id,"conn_id":session.conn_id,"seq_id":session.seq,"payload":payload});
-    session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written }).map_err(|error| {
+    session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written, epoch: None }).map_err(|error| {
         tts_log::record(app, &session.live_id, &message, Some("控制连接已关闭，指令未发送"));
         error.to_string()
     })
 }
 
+#[cfg(test)]
 fn speech_message_signal(content: &str, task_id: Option<String>) -> Result<(u64, Value), String> {
     let content = content.trim();
     if content.is_empty() { return Err("播报文本不能为空".into()); }
@@ -344,16 +340,8 @@ fn speech_message_signal(content: &str, task_id: Option<String>) -> Result<(u64,
 
 #[tauri::command]
 async fn speak_text(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, content: String, task_id: Option<String>) -> Result<(), String> {
-    let (kind, payload) = speech_message_signal(&content, task_id)?;
-    let (written, received) = oneshot::channel();
-    {
-        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-        let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次播报")?;
-        queue_signal(&app, session, kind, payload, Some(written))?;
-    }
-    tokio::time::timeout(std::time::Duration::from_secs(4), received).await
-        .map_err(|_| "文本写入确认超时，请检查控制连接".to_string())?
-        .map_err(|_| "控制连接已关闭，未收到写入结果".to_string())?
+    let _ = state;
+    component::run(app, live_id, content, task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()), false).await
 }
 
 fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
@@ -368,11 +356,16 @@ fn gift_action_payload(task_id: &str, gesture: &str) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn send_avatar_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, gesture: Option<String>, instruction: Option<String>) -> Result<(), String> {
+async fn send_avatar_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, gesture: Option<String>, instruction: Option<String>) -> Result<(), String> {
     let payload = avatar_action_payload(&task_id, gesture.as_deref(), instruction.as_deref())?;
-    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消本次动作")?;
-    send_signal(&app, session, 101, payload)
+    let receipts = {
+        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_mut().filter(|s| s.live_id == live_id).ok_or("原会话已结束，动作未发送")?;
+        component_action::enqueue(session, payload)?
+    };
+    let result = component_action::wait(receipts).await;
+    if let Err(error) = &result { let _ = app.emit("component-action-error", json!({"live_id":live_id,"task_id":task_id,"error":error})); }
+    result
 }
 
 fn avatar_action_payload(task_id: &str, gesture: Option<&str>, instruction: Option<&str>) -> Result<Value, String> {
@@ -406,13 +399,19 @@ fn handoff_action_payload(task_id: &str, direction: &str, angle_deg: u16) -> Res
 }
 
 #[tauri::command]
-fn send_handoff_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, direction: String, angle_deg: Option<u16>) -> Result<(), String> {
+async fn send_handoff_action(app: tauri::AppHandle, state: State<'_, AppState>, live_id: String, task_id: String, direction: String, angle_deg: Option<u16>) -> Result<(), String> {
     let payload = handoff_action_payload(&task_id, &direction, angle_deg.unwrap_or(30))?;
-    let mut guard = state.session.lock().map_err(|error| error.to_string())?;
-    let session = guard.as_mut().filter(|session| session.live_id == live_id).ok_or("原会话已结束，已取消承接动作")?;
-    send_signal(&app, session, 101, payload)
+    let receipts = {
+        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_mut().filter(|s| s.live_id == live_id).ok_or("原会话已结束，动作未发送")?;
+        component_action::enqueue(session, payload)?
+    };
+    let result = component_action::wait(receipts).await;
+    if let Err(error) = &result { let _ = app.emit("component-action-error", json!({"live_id":live_id,"task_id":task_id,"error":error})); }
+    result
 }
 
+#[cfg(test)]
 fn manual_question_signal(content: &str, message_type: Option<&str>) -> Result<(u64, Value), String> {
     let content = content.trim();
     if content.is_empty() { return Err("请输入问题".into()); }
@@ -425,12 +424,15 @@ fn manual_question_signal(content: &str, message_type: Option<&str>) -> Result<(
 }
 
 #[tauri::command]
-fn send_question(app: tauri::AppHandle, state: State<'_, AppState>, content: String, live_id: Option<String>, message_type: Option<String>) -> Result<(), String> {
-    let (kind, payload) = manual_question_signal(&content, message_type.as_deref())?;
-    let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-    let session = guard.as_mut().ok_or("Vidu 会话尚未启动")?;
-    if live_id.as_ref().is_some_and(|id| id != &session.live_id) { return Err("原会话已结束，已取消手动提问".into()); }
-    send_signal(&app, session, kind, payload)
+async fn send_question(app: tauri::AppHandle, state: State<'_, AppState>, content: String, live_id: Option<String>, message_type: Option<String>) -> Result<(), String> {
+    let _ = message_type;
+    let live_id = {
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        let session = guard.as_ref().ok_or("组件会话尚未启动")?;
+        if live_id.as_ref().is_some_and(|id| id != &session.live_id) { return Err("原会话已结束".into()); }
+        session.live_id.clone()
+    };
+    component::run(app, live_id, content, format!("manual-{}", uuid::Uuid::new_v4()), true).await
 }
 
 #[tauri::command]
@@ -438,11 +440,14 @@ fn interrupt_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id:
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().ok_or("Vidu 会话尚未启动")?;
     if live_id.as_ref().is_some_and(|id| id != &session.live_id) { return Err("原会话已结束，已取消打断".into()); }
+    session.speech_cancel.send_modify(|value| *value += 1);
+    session.speaking = false;
+    session.external_audio = None;
     send_signal(&app, session, 7, json!({}))
 }
 
 async fn reconnect_and_hangup(key: &str, region: &str, live_id: &str, conn_id: &str, seq: u64) -> Result<(), String> {
-    let url = format!("{}/live/ws/live/connect?live_id={}&conn_id={}", ws_host(region), live_id, conn_id);
+    let url = format!("{}/live/v1/external-lives/{}/stream?conn_id={}", ws_host(region), live_id, conn_id);
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Token {}", key)).map_err(|e| e.to_string())?);
     let (mut ws, _) = tokio::time::timeout(std::time::Duration::from_secs(8), connect_async(request))
@@ -461,6 +466,8 @@ async fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id:
     let current = {
         let mut guard = state.session.lock().map_err(|e| e.to_string())?;
         guard.as_mut().filter(|session| live_id.as_ref().is_none_or(|id| *id == session.live_id)).map(|session| {
+            session.speech_cancel.send_modify(|value| *value += 1);
+            session.speaking = false;
             session.seq += 1;
             let message = json!({"type":5,"live_id":session.live_id,"conn_id":session.conn_id,"seq_id":session.seq,"payload":{"hangup":{"hangup_reason":"user_end"}}});
             (session.live_id.clone(), session.conn_id.clone(), session.key.clone(), session.region.clone(), session.seq, session.sender.clone(), Message::Text(message.to_string().into()))
@@ -468,18 +475,16 @@ async fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id:
     };
     if let Some((live_id, conn_id, key, region, seq, sender, message)) = current {
         let (written, received) = oneshot::channel();
-        let sent = sender.send(Outbound { message, written: Some(written) }).is_ok()
+        let sent = sender.send(Outbound { message, written: Some(written), epoch: None }).is_ok()
             && matches!(tokio::time::timeout(std::time::Duration::from_secs(5), received).await, Ok(Ok(Ok(()))));
-        if !sent {
-            reconnect_and_hangup(&key, &region, &live_id, &conn_id, seq + 1).await?;
-        }
+        let reconnect_error = if !sent { reconnect_and_hangup(&key, &region, &live_id, &conn_id, seq + 1).await.err() } else { None };
         let mut final_live = None;
         for _ in 0..10 {
             let result = live_status(key.clone(), region.clone(), live_id.clone()).await?;
             if result.pointer("/live/status").and_then(Value::as_str) == Some("ended") { final_live = result.get("live").cloned(); break; }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
-        let final_live = final_live.ok_or("已发送挂断，但 Vidu 尚未确认 ended；请重试结束会话")?;
+        let final_live = final_live.ok_or_else(|| format!("Vidu 尚未确认 ended，请重试结束会话{}", reconnect_error.map(|error| format!("：{error}")).unwrap_or_default()))?;
         let mut guard = state.session.lock().map_err(|e| e.to_string())?;
         if guard.as_ref().is_some_and(|session| session.live_id == live_id) { guard.take(); }
         let _ = app.emit("session-ended", json!({"live_id":live_id,"live":final_live}));
@@ -743,9 +748,11 @@ fn main() {
     let Some(_instance_guard) = single_instance::Guard::acquire() else { return; };
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(prepared_speech::PreparedSpeech::default())
         .manage(queue_store::QueueStorage::default())
         .manage(songs::SongManager::default())
         .manage(whisper::WhisperRuntime::default())
+        .manage(speech_runtime::LocalTtsRuntime::default())
         .manage(song_director::DirectorRuntime::default())
         .on_window_event(|window, event| {
             if window.label() == "main" {
@@ -775,7 +782,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
+        .invoke_handler(tauri::generate_handler![prepared_speech::component_audio_open, prepared_speech::component_audio_retain, prepared_speech::component_prepare_audio, prepared_speech::component_play_prepared, component::component_prepare_reply, speech_runtime::component_local_status, speech_runtime::component_stop_local, component::component_tts_preview, speech_runtime::component_start_local, component::component_audio_begin, component::component_audio_push, component::component_transcription, component::component_local_voice, component::component_preflight, component::component_respond, component::component_configure, create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, speech_stt::speech_prepare, speech_stt::speech_transcribe, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }

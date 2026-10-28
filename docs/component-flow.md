@@ -1,0 +1,75 @@
+# S2-Avatar 组件版实现
+
+协议来源：[Vidu 组件版详细参数](https://platform.vidu.cn/vidu-stream/doc/s2-avatar/component/parameters)、[OmniVoice 官方仓库](https://github.com/k2-fsa/OmniVoice)、[FunASR 官方仓库](https://github.com/modelscope/FunASR)。
+
+## 会话与媒体
+
+Rust 使用 `POST /live/s_avatar/component`，请求包含 model、image_uri、`managed_rtc: {provider: "artc"}` 和动作库配置。返回的 managed_rtc 适配现有 AliRTC 播放窗口；凭证不会进入模型请求或诊断日志。
+
+控制与音频共享 `/live/v1/external-lives/{live_id}/stream?conn_id=...` WebSocket，服务端 Header 使用 `Authorization: Token ...`。首帧发送 type=1 conn_init，收到成功的 type=2 后才允许音频。NOT_READY 在同一连接中重试，并响应 ping/pong；初始化最长60秒。
+
+创建后立即保存 live ID，再尝试控制连接；握手失败仍能查询和挂断该会话。结束操作先取消本地生成，再发送 type=5；必须查询到 ended 才清除会话，不用本地断开推断计费已结束。
+
+## 手动提问与麦克风的三段流水线
+
+`component.rs` 将每次回答分成三个并行 future，用有界通道相连：
+
+1. 读取 LLM 的 OpenAI SSE，按中文句号、问号、感叹号、分号、换行切句；无标点时最多100字符。通道最多保留两句。保留 UTF-8 字节直到完整 SSE 行，不把 reasoning_content 送去朗读。异常断流或非 stop 结束会取消本次回答。
+2. 逐句请求本机 OmniVoice，缓存的 voice_clone_prompt 保持音色。当前实现使用官方 OmniVoice 的完整句子推理，音频通道最多保留一句；当前句发送期间可合成下一句。这里的流式是句子级流水线，不宣称官方 Python 函数逐块返回音频。
+3. 校验 HTTP 返回的 X-Audio-Sample-Rate=24000、X-Audio-Channels=1、X-Audio-Format=s16le，拒绝 WAV/MP3 容器和半个采样。将 PCM 按20ms/960字节切分，每块等待 WS 写入确认，并按音频时长节流。声音不通过前端重复播放，正常互动统一播放 RTC 返回的音视频。
+
+TTS 服务把浮点波形裁剪、量化为有符号16位小端；必要时重采样到24kHz。每句的文字通过 type=10 output_transcription 上送 Vidu，同时本地发送带 request_id 的累计台词事件供字幕和持久化使用。最终事件只表示全部 PCM 已发送，不表示观众已经听完。
+
+LLM 的口播协议优先于人设中遗留的 JSON 输出规则。普通纯文本回答仍按句立即进入 TTS；若模型返回 JSON 或 JSON 代码块，先等待完整对象，仅提取 speech（兼容 answer、text、segments[].text），不朗读 emotion、动作字段、花括号或思考过程。无有效台词或截断 JSON 会明确失败，不把结构片段当成回答。TTS 接口另行拒绝结构化字段和纯标点，异常波形区分空音频、超长和非有限采样并返回502，不用静音替代失败。
+
+弹幕先由模型判断动作意图，不再以关键字筛选决定是否规划，因此“札一下马尾”“笑一下”等请求也进入判断；普通问题仍默认看向镜头。礼物沿用固定的比心、亲吻手势或飞吻。
+
+## 槽位提前准备回答与 PCM
+
+后台最多同时准备两条回答。`component_prepare_reply` 在当前组件会话的主播人设下生成实际口播文字，不占用播报通道。回答完成即显示在槽位中；同观众历史仍只采用已完成的互动，预生成回答不冒充已经说过的内容。
+
+`component_prepare_audio` 使用 TTS 全局互斥锁的 try_lock：TTS 忙则保留回答并稍后重试，空闲则按句合成整条回答的24kHz单声道s16le PCM。预合成只访问本机语音服务，不发送 Vidu 指令或音频。后台任务一次一个；当前槽位发送缓存 PCM 时不占用 TTS，其他槽位可继续预合成。手动提问、麦克风和试听优先，可以取消正在预合成的任务。
+
+PCM 由 `prepared_speech.rs` 保存在 Rust 进程内存中，最多六个缓存、合计24MB、单条不超过60秒；前端和持久化文件只保存句子、状态、时长与句柄。轮到当前槽位时才发送动作，并由 `component_play_prepared` 一次性取出缓存，复用原来的逐帧节流、写入确认、字幕和最终发送事件，不再请求 LLM 或 TTS。回答生成和音频准备的调度独立于正在等待完成的音频发送任务。
+
+缓存绑定会话、槽位、回答原文、TTS配置和参考录音的修改时间。跳过、礼物挤出、重新生成、会话切换、关闭语音服务或修改音色后删除对应缓存并取消过期推理；迟到结果不能写回新任务。刷新前端后不复用旧句柄，新窗口的缓存所有权也防止旧窗口迟到的清理删除新缓存。生成失败保留可见错误，缓存不会当作已播出证据。
+
+槽位和承接动作由 component_action 在同一会话锁内依次排入两条信令：type=97 / payload.session_update.action_description 设置底层动作提示词；type=9 / payload.text_msg 提交动作驱动文本，并携带对应槽位或承接任务 msg_id。只有两条均写入 WebSocket 后才显示“已发送”。未就绪、连接断开、写入超时或打断会返回错误；Vidu 没有为这两种信令提供动作完成回执，实际执行以画面为准。动作发送失败仍保留错误并继续口播，不自动重复动作。手动和麦克风输入继续通过 type=9 上送原始文字，并维护本次会话最近六轮历史；弹幕历史只使用同观众的已完成互动，不混用其他观众经历。
+
+对于 api.deepseek.com 的实时回答和动作规划请求，显式关闭 thinking（deepseek-reasoner 除外），防止默认思考消耗短输出预算后返回空内容；结构化规划采用1024 token预算，达到长度上限时明确失败。其他服务商不注入 DeepSeek 专用参数。
+
+## 打断与错误
+
+每次回答占用一个会话级 generation。打断、会话结束、WS断开都会使旧 generation 失效。LLM、TTS、发送 future 一起取消；排队但尚未写出的旧 PCM 帧也检查 generation。只有仍属于当前 generation 的完成回调能释放发送占用或追加对话历史。
+
+本地 TTS 支持 `/api/tts/cancel`，在每个扩散推理步骤的 _predict_tokens_with_scoring 检查取消标志（包括 CUDA Graph 路径），尽快中止旧推理；线程服务器可在推理期间接收取消和健康检查，模型推理始终串行。开始生成后出现 LLM/TTS 错误时，向 Vidu type=7 清理可能已开始渲染的局部回复。错误不自动重试已发出的声音。
+
+队列持久化 audio_sent_at 和实际台词 final。组件回答不会在句间停顿时完成：全部 PCM 发送完并经过至少1500毫秒后，还必须观察到下行发声、持续静音至少1200毫秒，以及新鲜音频回调和视频画面。它是本地播放观测，不是供应商精确播放结束回执。60秒仍不能确认时保留任务供人工处理。
+
+## 麦克风
+
+OBS 窗口通过 getUserMedia 采集，不向 RTC 发布。AudioWorklet 获取波形，本地 VAD 检测开口，首先取消旧回答；保留约300毫秒前滚，句尾静音约900毫秒后把16kHz PCM交给常驻 FunASR /api/stt。
+
+每段最多20秒；关闭麦克风、新一段开口或会话切换后，旧识别结果不能触发回答。音频分析分支保持静音。原有下行匹配代码保留供旧队列恢复，识别请求同样走 FunASR，但新版组件队列使用发送完成与实际下行静音，不再依靠下行转写猜测台词。
+
+## 本机运行环境
+
+setup:speech 创建独立 InnoTechx-Speech WSL2 发行版，Linux 运行环境位于 /opt/innotechx-speech，Windows 配置与日志位于 %LOCALAPPDATA%/com.innotechx.digitalhuman.live/speech。FunASR 使用 CPU 和独立 transformers 4 环境；OmniVoice 使用 GPU、transformers 5、CUDA 12.8、FlashInfer。PyPI 的 OmniVoice 0.2.1 不包含加速模块，安装器固定官方源码 revision，详见 [语音服务](speech-service.md)。
+
+应用的 component_start_local 启动 Linux 服务，通过 /health 等待真实 GPU 预热、FlashInfer、CUDA Graph 和 FunASR 全部就绪。component_stop_local 通过 Linux 控制器验证 PID、启动时间和命令行后停止进程组，加载期间也可关闭；不调用 wsl --terminate，不影响 Docker。generation 防止迟到的启动或试听回调覆盖关闭状态。终端启动的同一服务也可在软件内显式关闭。应用退出只释放自己管理的实例。
+
+关闭服务会取消普通语音、暂停自动回答和麦克风，并保留当前任务人工确认。原歌曲 PCM 不依赖 TTS。迁移时只允许停止已核实解释器和脚本路径的旧 Windows Qwen 服务。新服务固定模型 k2-fsa/OmniVoice，UI 回显真实设备、FunASR 和已验证的加速状态；模型加载或加速失败不会冒充已就绪。
+
+`voice.json` 可提供本机预设参考，首次启动且尚无已保存参考时导入。后续以界面保存的配置为准；自定义参考文件不会被安装脚本覆盖。组件、模型、TTS Key 分别使用自己的配置，不把 Vidu Key 发到 LLM/TTS。
+
+## 歌曲
+
+SongAudioBridge 在24kHz AudioContext中读取原歌曲的真实波形，每100毫秒发送一帧 PCM，后端核对播放 token 和递增序号；最多缓存500毫秒。歌词导播只发送 type=10 文字并更新字幕，不调用TTS。切歌、打断、播放结束或错误会释放音频图并取消旧帧。
+
+本地原歌曲保留为可听声音，RTC下行静音以防重音。文字提前量仍属于歌词调度；实际视频渲染延迟需要目标环境试听测量，不应宣称已保证逐帧同步。
+
+## 迁移与验证
+
+保留旧形象卡片、声音关联和历史数据，不调用旧付费克隆接口。原 Qwen 参考录音和原话自动保留，服务地址迁移为基础地址、模型改为 OmniVoice。旧版默认模型人设迁移为直接回答；自定义人设保留。曾经正在播放的任务恢复为人工确认，不重播。
+
+自动验证覆盖 SSE 首句在完整回答结束前发出、截断流拒绝、PCM格式拒绝、句间静音不完成任务、断流不确认完成、麦克风开口先打断、迟到识别丢弃、权限拒绝及本地采集释放。真实模型克隆和付费 Vidu 端到端验证须分别记录，构建通过不代表已完成在线口型测试。

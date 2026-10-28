@@ -7,3 +7,5 @@ vendor/dyhub/node_modules/
 vendor/dyhub/dist/
 .env
 .build-tmp/
+__pycache__/
+*.py[cod]

@@ -12,6 +12,9 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/songDirector.ts', 'ut
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/captionSettings.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: captionSettingsExports });
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: recognitionExports, require: name => { assert.equal(name, 'pinyin-pro'); return pinyinPro; } });
 
+const microphoneExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/microphoneInput.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: microphoneExports, crypto, Date, require: () => recognitionExports });
+
 async function player(options = {}) {
   const handlers = new Map();
   const rtcHandlers = new Map();
@@ -47,7 +50,7 @@ async function player(options = {}) {
     'react/jsx-runtime': { jsx: (tag, props) => ({ tag, props }), jsxs: (tag, props) => ({ tag, props }) },
     '@tauri-apps/api/core': { convertFileSrc: path => `asset://${path}`, invoke: async (name, args) => {
       calls.push([name, args]);
-      if (name === 'whisper_transcribe' && options.transcribe) return options.transcribe(args.request);
+      if (name === 'speech_transcribe' && options.transcribe) return options.transcribe(args.request);
       if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
       return name === 'session_snapshot' ? snapshot : undefined;
     } },
@@ -59,7 +62,10 @@ async function player(options = {}) {
     './ObsCaption': { ObsCaption: 'ObsCaption' },
     '../captionSettings': captionSettingsExports,
     '../whisperRecognition': recognitionExports,
+    '../microphoneInput': microphoneExports,
+    '../ttsConfig': { loadTtsConfig: () => ({ base_url: 'http://127.0.0.1:8766', model: 'k2-fsa/OmniVoice' }) },
     '../songDirector': songDirectorExports,
+    '../songAudioBridge': { createSongAudioBridge: async (audio, send) => ({ dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {} }) },
     '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
       const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
@@ -70,7 +76,13 @@ async function player(options = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const exports = {};
-  vm.runInNewContext(source, { exports, require: name => imports[name], Date, Audio: class {
+  vm.runInNewContext(source, { exports, require: name => imports[name], Date, navigator: { mediaDevices: { getUserMedia: async constraints => {
+    calls.push(['getUserMedia', constraints]);
+    if (options.captureError) throw new Error(options.captureError);
+    if (options.captureWait) await options.captureWait;
+    const track = { kind: 'audio', stop: () => calls.push(['stopMicrophoneTrack']) };
+    return { getTracks: () => [track], getAudioTracks: () => [track] };
+  } } }, Audio: class {
     constructor(src) { this.src = src; this.paused = true; this.currentTime = 0; songs.push(this); }
     async play() {
       if (options.blockSongAutoplay && !this.tried) { this.tried=true; const error=new Error('user gesture required'); error.name='NotAllowedError'; throw error; }
@@ -94,9 +106,9 @@ test('OBS song control plays original audio, mutes RTC, submits exact lyrics and
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(p.songs.length,1); assert.equal(p.songs[0].src,'asset://song.mp3'); assert.equal(p.songs[0].paused,false);
   assert.ok(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === true));
-  const tts = p.calls.find(([name]) => name === 'speak_text')[1];
+  const tts = p.calls.find(([name]) => name === 'component_transcription')[1];
   assert.equal(tts.content, '原歌词'); assert.equal(tts.taskId,'attempt-0');
-  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length,0);
+  assert.equal(p.calls.filter(([name]) => name === 'speech_transcribe').length,0);
   p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
   const interrupt = p.calls.findIndex(([name]) => name === 'interrupt_session');
   const unmute = p.calls.findIndex(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false);
@@ -115,7 +127,7 @@ test('OBS ignores stale song commands and cancelling a pending load never starts
   p.handlers.get('song-control')({ payload:{ ...control, action:'stop' } });
   resolveDirector({ status:'ready', available:true, audio_path:'song.mp3', cues:[{ start_ms:0,end_ms:1000,lead_ms:500,text:'不要发送' }] });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(p.songs.length,0); assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,0);
+  assert.equal(p.songs.length,0); assert.equal(p.calls.filter(([name]) => name === 'component_transcription').length,0);
   assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'stopped'));
 });
 
@@ -142,13 +154,13 @@ test('OBS retains the song resume button across video frames and resumes the ori
   const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
   p.handlers.get('song-control')({ payload:control }); await new Promise(resolve => setImmediate(resolve));
   assert.ok(p.calls.some(([name,state]) => name === 'song-playback-state' && state.state === 'blocked'));
-  assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,0);
+  assert.equal(p.calls.filter(([name]) => name === 'component_transcription').length,0);
   const frame = p.render().props.children[0]; frame.props.onTimeUpdate({ currentTarget:p.video });
   const overlay = p.render().props.children[1];
   const button = overlay.props.children.find(child => child && child.tag === 'button');
   assert.ok(button); button.props.onClick(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(p.songs[0].paused,false);
-  assert.equal(p.calls.filter(([name]) => name === 'speak_text').length,1);
+  assert.equal(p.calls.filter(([name]) => name === 'component_transcription').length,1);
   assert.ok(p.calls.some(([name,state]) => name === 'song-playback-state' && state.state === 'started'));
   p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
 });
@@ -188,7 +200,7 @@ test('OBS binds Whisper PCM and recognition results to the current task and igno
   const target = { live_id: '123', task_id: 'task', capture_id: 'attempt', enabled: true };
   p.handlers.get('whisper-task')({ payload: { ...target, live_id: 'other-live' } });
   for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
-  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length, 0);
+  assert.equal(p.calls.filter(([name]) => name === 'speech_transcribe').length, 0);
   p.handlers.get('whisper-task')({ payload: target });
   for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
   await new Promise(resolve => setImmediate(resolve));
@@ -197,9 +209,9 @@ test('OBS binds Whisper PCM and recognition results to the current task and igno
   assert.equal(result.text, '大家晚上好');
   p.handlers.get('session-ended')({ payload: { live_id: '123' } });
   await new Promise(resolve => setImmediate(resolve));
-  const count = p.calls.filter(([name]) => name === 'whisper_transcribe').length;
+  const count = p.calls.filter(([name]) => name === 'speech_transcribe').length;
   for (let i = 0; i < 20; i++) p.monitors[0].pcm(new Float32Array(1600).fill(0.1), 16000, 0);
-  assert.equal(p.calls.filter(([name]) => name === 'whisper_transcribe').length, count);
+  assert.equal(p.calls.filter(([name]) => name === 'speech_transcribe').length, count);
 });
 
 test('ending a session closes the PCM observer and ignores late VAD results', async () => {
@@ -274,14 +286,14 @@ test('microphone starts only on request and closing it releases local capture', 
   assert.equal(p.calls.filter(([name]) => name === 'startAudioCapture').length, 0);
   p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(p.calls.filter(([name]) => name === 'startAudioCapture').length, 1);
-  assert.ok(p.calls.some(([name, enabled]) => name === 'publishLocalAudioStream' && enabled));
+  assert.equal(p.calls.filter(([name]) => name === 'getUserMedia').length, 1);
+  assert.equal(p.calls.some(([name, enabled]) => name === 'publishLocalAudioStream' && enabled), false);
   assert.ok(p.calls.some(([name, state]) => name === 'mic-state' && state.enabled && state.live_id === '123'));
   p.calls.length = 0;
   p.handlers.get('mic-control')({ payload: { enabled: false, live_id: '123' } });
   await new Promise(resolve => setImmediate(resolve));
-  assert.ok(p.calls.some(([name, enabled]) => name === 'publishLocalAudioStream' && !enabled));
-  assert.ok(p.calls.some(([name]) => name === 'stopAudioCapture'));
+  assert.ok(p.calls.some(([name]) => name === 'stopMicrophoneTrack'));
+  assert.ok(p.monitors.some(monitor => monitor.disposed));
   assert.ok(p.calls.some(([name, state]) => name === 'mic-state' && !state.enabled && !state.error));
 });
 
@@ -420,14 +432,14 @@ test('OBS displays server microphone transcription as 我：内容 and replaces 
   assert.equal(caption(p), '我：第二句话');
 });
 
-test('OBS ignores avatar replies, foreign sessions, empty results, and results while the microphone is off', async () => {
+test('OBS ignores foreign sessions, empty results, and results while the microphone is off', async () => {
   const p = await player();
   const signal = { type: 9, live_id: '123', payload: { text_msg: { content: '你好' } } };
   p.handlers.get('vidu-signal')({ payload: signal });
   assert.equal(caption(p), '');
   p.handlers.get('mic-control')({ payload: { enabled: true, live_id: '123' } });
   await new Promise(resolve => setImmediate(resolve));
-  for (const payload of [{ ...signal, type: 10 }, { ...signal, live_id: 'old' }, { ...signal, payload: { text_msg: { content: ' ' } } }]) {
+  for (const payload of [{ ...signal, live_id: 'old' }, { ...signal, payload: { text_msg: { content: ' ' } } }]) {
     p.handlers.get('vidu-signal')({ payload });
     assert.equal(caption(p), '');
   }

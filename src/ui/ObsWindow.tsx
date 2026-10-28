@@ -1,8 +1,11 @@
+import { loadTtsConfig } from '../ttsConfig';
 import { useEffect, useRef, useState } from 'react';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import AliRtcEngine, { AliRtcSdkChannelProfile } from 'aliyun-rtc-sdk';
 import { monitorDownlinkAudio, type DownlinkMonitor, type VadActivity } from '../rtcVad';
+import { createSongAudioBridge } from '../songAudioBridge';
+import { MicrophoneInput } from '../microphoneInput';
 import { WhisperCapture, type RecognitionTarget, type WhisperResult } from '../whisperRecognition';
 import { ObsCaption } from './ObsCaption';
 import { loadCaptionSettings, normalizeCaptionSettings } from '../captionSettings';
@@ -67,9 +70,14 @@ export function ObsWindow() {
       songCleanup = Promise.all([songCleanup, stopping]).then(() => {});
       await songCleanup;
     };
+    let microphoneStream: MediaStream | undefined;
+    let microphoneMonitor: DownlinkMonitor | undefined;
+    let microphoneInput: MicrophoneInput | undefined;
+    let microphoneGeneration = 0;
+    const stopMicrophone = () => { microphoneGeneration++; microphoneInput?.stop(); microphoneInput = undefined; microphoneMonitor?.dispose(); microphoneMonitor = undefined; microphoneStream?.getTracks().forEach(track => track.stop()); microphoneStream = undefined; };
     let whisperUid: string | undefined;
     const whisper = new WhisperCapture(
-      request => invoke<WhisperResult>('whisper_transcribe', { request }),
+      request => invoke<WhisperResult>('speech_transcribe', { request, tts: loadTtsConfig() }),
       result => { if (!disposed && result.live_id === liveIdRef.current) void emit('whisper-recognition', result); },
     );
     const reportVad = (uid: string, state: VadActivity) => {
@@ -90,6 +98,7 @@ export function ObsWindow() {
       await emit('mic-state', { live_id: liveIdRef.current, enabled, error });
     }
     async function leave() {
+      stopMicrophone();
       await stopSong();
       whisper.start(); whisperUid = undefined;
       for (const monitor of downlinkMonitorsRef.current.values()) monitor.dispose();
@@ -118,37 +127,39 @@ export function ObsWindow() {
       if (micRef.current) await reportMic(false);
     }
     async function setMicrophone(enabled: boolean) {
-      const rtc = rtcRef.current;
+      stopMicrophone();
       const liveId = liveIdRef.current;
-      if (!rtc || !joinedRef.current) {
-        await reportMic(false, '播放窗口尚未加入实时会话');
-        return;
-      }
+      const generation = microphoneGeneration;
+      if (!enabled) { await reportMic(false); return; }
+      if (!liveId || !joinedRef.current) { await reportMic(false, '播放窗口尚未加入实时会话'); return; }
       try {
-        if (enabled) {
-          await rtc.startAudioCapture({ echoCancellation: true, noiseSuppression: true, autoGainControl: true });
-          if (disposed || rtcRef.current !== rtc || !joinedRef.current || liveIdRef.current !== liveId) {
-            rtc.stopAudioCapture();
-            return;
-          }
-        }
-        await rtc.publishLocalAudioStream(enabled);
-        if (!enabled) rtc.stopAudioCapture();
-        if (disposed || rtcRef.current !== rtc || !joinedRef.current || liveIdRef.current !== liveId) {
-          if (enabled) { await rtc.publishLocalAudioStream(false); rtc.stopAudioCapture(); }
-          return;
-        }
-        await reportMic(enabled);
+        await invoke('speech_prepare', { tts: loadTtsConfig() });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+        const current = () => !disposed && generation === microphoneGeneration && liveIdRef.current === liveId;
+        if (!current()) { stream.getTracks().forEach(track => track.stop()); return; }
+        microphoneStream = stream;
+        const input = new MicrophoneInput(liveId,
+          request => invoke<WhisperResult>('speech_transcribe', { request, tts: loadTtsConfig() }),
+          async () => { if (!current()) return; await emit('microphone-speech-start', { live_id: liveId }); await invoke('interrupt_session', { liveId }); },
+          (text, captureId) => { if (current()) { setMicrophoneCaption(text); setQueueCaption(''); void emit('microphone-input', { live_id: liveId, text, capture_id: captureId }); } },
+          error => { if (current()) { setStatus(error); void emit('microphone-error', { live_id: liveId, error }); } },
+        );
+        microphoneInput = input;
+        const monitor = await monitorDownlinkAudio(stream.getAudioTracks()[0], current,
+          state => { if (current() && !state.healthy) { input.stop(); } },
+          error => { if (current()) { setStatus(error); void emit('microphone-error', { live_id: liveId, error }); } },
+          (samples, rate, quietMs) => { if (current()) input.push(samples, rate, quietMs); },
+        );
+        if (!current()) { monitor.dispose(); stream.getTracks().forEach(track => track.stop()); return; }
+        microphoneMonitor = monitor;
+        await monitor.resume();
+        await reportMic(true);
       } catch (error) {
-        try { await rtc.publishLocalAudioStream(false); } catch { /* device or permission failure */ }
-        try { rtc.stopAudioCapture(); } catch { /* device or permission failure */ }
-        if (disposed || rtcRef.current !== rtc || liveIdRef.current !== liveId) return;
+        if (generation !== microphoneGeneration || liveIdRef.current !== liveId) return;
+        stopMicrophone();
         const detail = String(error);
-        const reason = /NotAllowed|PermissionDenied|permission denied/i.test(detail) ? '麦克风权限被拒绝，请在 Windows 隐私设置中允许桌面应用访问麦克风后重试'
-          : /NotFound|DevicesNotFound/i.test(detail) ? '未找到本地麦克风，请连接麦克风并检查 Windows 默认输入设备'
-          : /NotReadable|TrackStart|device.*(busy|use)/i.test(detail) ? '麦克风无法使用，请检查设备是否被占用'
-          : detail;
-        await reportMic(false, `麦克风推流失败：${reason}`);
+        const reason = /NotAllowed|PermissionDenied/i.test(detail) ? '麦克风权限被拒绝，请在 Windows 设置中允许麦克风访问' : detail;
+        await reportMic(false, '本地麦克风识别启动失败：' + reason);
       }
     }
     async function join(snapshot: Snapshot) {
@@ -287,11 +298,22 @@ export function ObsWindow() {
             whisper.start();
             const rtc = rtcRef.current!;
             const audio = new Audio(convertFileSrc(director.audio_path)); audio.preload = 'auto';
+            let bridge: Awaited<ReturnType<typeof createSongAudioBridge>> | undefined;
             const player = new SongDirectorPlayer(audio, director.cues, {
               mute: muted => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(muted); },
-              speak: (content, index) => invoke('speak_text', { liveId: control.live_id, taskId: `${control.playback_token}-${index}`, content }),
+              speak: (content, index) => invoke('component_transcription', { liveId: control.live_id, taskId: `${control.playback_token}-${index}`, content }),
               interrupt: () => invoke('interrupt_session', { liveId: control.live_id }),
-              prepare: () => invoke('interrupt_session', { liveId: control.live_id }),
+              prepare: async () => {
+                await invoke('interrupt_session', { liveId: control.live_id });
+                if (song !== currentSong || disposed || liveIdRef.current !== control.live_id) throw new Error('歌曲已取消');
+                await invoke('component_audio_begin', { liveId: control.live_id, token: control.playback_token });
+                bridge = await createSongAudioBridge(audio,
+                  (samples, sequence) => invoke('component_audio_push', { liveId: control.live_id, token: control.playback_token, sequence, samples }),
+                  error => { void player.stop('error', error); });
+                if (song !== currentSong || disposed) { bridge.dispose(); throw new Error('歌曲已取消'); }
+              },
+              activateAudio: () => bridge?.resume() || Promise.resolve(),
+              cleanup: () => bridge?.dispose(),
               observe: observation => {
                 void invoke('tts_log_song_observation', { liveId: control.live_id, msgId: `tts-${control.playback_token}-${observation.index}`, observation })
                   .catch(error => { if (!disposed) setStatus(`歌曲同步日志保存失败：${String(error)}`); });
@@ -343,6 +365,10 @@ export function ObsWindow() {
         }
         // type=9 is the server's recognition of our microphone audio.
         // type=10 is the avatar's reply and must not be labelled as "我".
+        if (signal.type === 10 && micRef.current) {
+          const text = signal.payload?.text_msg?.content;
+          if (text) setQueueCaption('回复：' + text);
+        }
         if (signal.type !== 9 || !micRef.current) return;
         const content = signal.payload?.text_msg?.content;
         if (typeof content === 'string' && content.trim()) setMicrophoneCaption(content.trim());

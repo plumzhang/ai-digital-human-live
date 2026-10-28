@@ -28,10 +28,14 @@ fn entry(live_id: &str, signal: &Value, error: Option<&str>) -> Option<Entry> {
         101 => ("text_action", &signal["payload"]["text_action"]),
         99 => ("text_msg", &signal["payload"]["text_msg"]),
         102 => ("text_dialog", &signal["payload"]["text_dialog"]),
+        9 => ("input_transcription", &signal["payload"]["text_msg"]),
+        10 => ("output_transcription", &signal["payload"]["text_msg"]),
+        97 => ("action_description", &signal["payload"]["session_update"]),
         7 => ("interrupt", &Value::Null),
         _ => return None,
     };
-    let content = if command == "interrupt" { "打断当前输出" } else { value["content"].as_str()? };
+    let content = if command == "interrupt" { "打断当前输出" } else if command == "action_description" { value["action_description"].as_str()? } else { value["content"].as_str()? };
+    let command = if command == "input_transcription" && value["msg_id"].as_str().is_some_and(|id| id.starts_with("avatar-action-") || id.starts_with("gift-action-") || id.starts_with("handoff-")) { "action_trigger" } else { command };
     Some(Entry {
         id:uuid::Uuid::new_v4().to_string(), at_ms:crate::unix_ms(), live_id:live_id.into(), command:command.into(), content:content.into(),
         msg_id:value["msg_id"].as_str().map(str::to_owned), seq_id:signal["seq_id"].as_u64(),
@@ -137,6 +141,13 @@ pub fn tts_log_load(app: tauri::AppHandle) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn component_action_driver_is_logged_as_an_action_and_keeps_its_slot_id() {
+        let log=entry("live",&json!({"type":9,"payload":{"text_msg":{"msg_id":"avatar-action-slot-1","content":"扎起马尾"}}}),None).unwrap();
+        assert_eq!(log.command,"action_trigger");assert_eq!(log.msg_id.as_deref(),Some("avatar-action-slot-1"));
+        let normal=entry("live",&json!({"type":9,"payload":{"text_msg":{"msg_id":"input-microphone-1","content":"你好"}}}),None).unwrap();
+        assert_eq!(normal.command,"input_transcription");
+    }
     #[test]
     fn dialogue_logs_retain_protocol_content_and_failures() {
         let (kind, payload) = crate::manual_question_signal("今天聊什么？", Some("text_dialog")).unwrap();

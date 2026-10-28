@@ -159,24 +159,27 @@ test('fixed persona defaults to 晚晚 and is saved with the selected model', as
   const p = mount(async () => [], { ...config, selectedModel: 'deepseek-chat' });
   let tree = p.render();
   const persona = nodes(tree).find(node => node.tag === 'textarea');
-  assert.ok(persona.props.value.includes('你叫晚晚'));
+  assert.ok(persona.props.value.includes('数字人主播'));
   persona.props.onChange({ target: { value: '你是晚晚，只输出要说的话。' } });
   tree = p.render();
   nodes(tree).find(node => node.tag === 'button' && node.props.children?.includes(' 保存配置')).props.onClick();
   assert.equal(JSON.parse(p.storage.get('openai-model-config')).persona, '你是晚晚，只输出要说的话。');
 });
 
-test('all unchanged answer personas migrate to question optimization while custom personas are preserved', () => {
+test('all unchanged answer personas migrate to direct speech while custom personas are preserved', () => {
   const initial = mount(async () => [], config);
   const current = nodes(initial.render()).find(node => node.tag === 'textarea').props.value;
-  assert.ok(current.includes('提问优化助手'));
-  assert.ok(current.includes('不代替数字人回答'));
-  assert.ok(current.includes('边说边做'));
+  assert.ok(current.includes('直接回答观众'));
+  assert.ok(current.includes('只输出最终口播台词'));
   const versions = {};
   const source = ts.transpileModule(fs.readFileSync('src/modelConfig.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  vm.runInNewContext(source + '\nexports.oldPersonas = [legacyModelPersona, previousModelPersona, previousIntentModelPersona, previousGazeModelPersona];', { exports: versions });
+  vm.runInNewContext(source + '\nexports.oldPersonas = [legacyModelPersona, previousModelPersona, previousIntentModelPersona, previousGazeModelPersona, previousQuestionPersona];', { exports: versions });
   for (const persona of [...versions.oldPersonas, current]) {
     const migrated = mount(async () => [], { ...config, persona });
+    assert.equal(nodes(migrated.render()).find(node => node.tag === 'textarea').props.value, current);
+  }
+  for (const persona of versions.oldPersonas) {
+    const migrated = mount(async () => [], { ...config, persona: '\r\n  ' + persona.replace(/\n/g, '\r\n') + '\r\n' });
     assert.equal(nodes(migrated.render()).find(node => node.tag === 'textarea').props.value, current);
   }
   const custom = '你是晚晚，请按我的自定义风格互动。';
@@ -184,13 +187,13 @@ test('all unchanged answer personas migrate to question optimization while custo
   assert.equal(nodes(retained.render()).find(node => node.tag === 'textarea').props.value, custom);
 });
 
-test('custom persona can be reset to question optimization and persisted explicitly', () => {
+test('custom persona can be reset to direct speech and persisted explicitly', () => {
   const p = mount(async () => [], { ...config, selectedModel: 'model', persona: '你是主播，只输出答案。' });
   let tree = p.render();
-  nodes(tree).find(node => node.tag === 'button' && node.props.children === '恢复默认提问规则').props.onClick();
+  nodes(tree).find(node => node.tag === 'button' && node.props.children === '恢复默认回复规则').props.onClick();
   tree = p.render();
-  assert.match(nodes(tree).find(node => node.tag === 'textarea').props.value, /提问优化助手/);
+  assert.match(nodes(tree).find(node => node.tag === 'textarea').props.value, /直接回答观众/);
   assert.equal(JSON.parse(p.storage.get('openai-model-config')).persona, '你是主播，只输出答案。');
   nodes(tree).find(node => node.tag === 'button' && node.props.children?.includes(' 保存配置')).props.onClick();
-  assert.match(JSON.parse(p.storage.get('openai-model-config')).persona, /不代替数字人回答/);
+  assert.match(JSON.parse(p.storage.get('openai-model-config')).persona, /只输出最终口播台词/);
 });

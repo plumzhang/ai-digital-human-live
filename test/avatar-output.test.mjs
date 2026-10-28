@@ -33,6 +33,13 @@ test('each slot labels the outgoing text as question and the actual output as an
   const task = { status: 'playing', result: { speech: '宝子希望你扎个高马尾，请自然回应并配合动作。' }, answer: { text: '已经扎好了，宝子喜欢吗？' } };
   const view = textOf(ui.TaskDialogue({ task }));
   assert.equal(view, '问：宝子希望你扎个高马尾，请自然回应并配合动作。答：已经扎好了，宝子喜欢吗？');
-  assert.match(textOf(ui.TaskDialogue({ task: { ...task, answer: undefined } })), /答：等待数字人返回回答/);
+  assert.match(textOf(ui.TaskDialogue({ task: { ...task, answer: undefined } })), /答：等待后台生成回答/);
   assert.match(textOf(ui.TaskDialogue({ task: { ...task, status: 'uncertain', answer: undefined } })), /答：尚未收到此槽位的回答文本/);
+});
+
+test('prefetched replies are visible before playback and do not claim to have been spoken', () => {
+ const task = { status: 'ready', result: { speech: '你叫什么名字', prepared_reply: '我叫晚晚。' }, prepared_audio: { state: 'preparing' } };
+ assert.match(textOf(ui.TaskDialogue({ task })), /答：我叫晚晚。/);
+ assert.match(textOf(ui.TaskDialogue({ task })), /正在预合成声音/);
+ assert.equal(task.answer, undefined);
 });

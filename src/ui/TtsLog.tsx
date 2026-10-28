@@ -7,7 +7,7 @@ export type TtsLogEntry = {
   id: string; at_ms: number; live_id: string; command: string; content: string;
   msg_id: string | null; seq_id: number | null; status: 'sent' | 'failed' | 'audio_detected' | 'unconfirmed' | 'overlap' | 'skipped'; error: string | null; detail?: string;
 };
-const labels: Record<string, string> = { text_tts: '台词 / 歌词', text_action: '动作指令', text_msg: '台词 / 歌词 / 对话', text_dialog: '文本对话', interrupt: '打断', song_sync: '歌曲同步检测' };
+const labels: Record<string, string> = { input_transcription: '用户输入文字', output_transcription: '合成台词 / 歌词', action_description: '组件动作提示词', action_trigger: '组件动作驱动', text_tts: '台词 / 歌词', text_action: '动作指令', text_msg: '文本消息', text_dialog: '文本对话', interrupt: '打断', song_sync: '歌曲同步检测' };
 const statuses = { sent: '已写入连接', failed: '发送失败', audio_detected: '检测到下行发声', unconfirmed: '尚未确认生成', overlap: '无法独立测量', skipped: '已过期跳过' };
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${(ms / 1000 % 60).toFixed(2).padStart(5, '0')}`;
 
@@ -46,7 +46,7 @@ export function TtsLog() {
   }, []);
   return <section className="tts-log-panel" aria-label="TTS 日志">
     <div className="section-title"><h2>TTS 日志</h2><span className="count">最近 {entries.length} 条</span></div>
-    <p className="hint">已写入连接不代表 Vidu 已生成。下行发声仅用于估计响应延迟，不等于已验证视频口型；可据此调整歌词提前量。</p>
+    <p className="hint">已写入连接不代表 Vidu 已生成。下行发声仅用于估计响应延迟，不等于已验证视频口型；歌曲发送原音频 PCM，歌词文字本身不会产生声音。</p>
     {progress && <p className="hint" role="status">原歌曲 {clock(progress.position_ms)} · 已发送 {progress.sent}/{progress.total} 段 · {progress.next_send_ms != null
       ? `下一句 ${clock(progress.next_send_ms)} 发送（${Math.max(0, (progress.next_send_ms - progress.position_ms) / 1000).toFixed(1)} 秒后）：${progress.next_text}` : '全部歌词已处理，等待原歌曲结束'}</p>}
     {error && <p className="tts-log-error" role="alert">{error}</p>}

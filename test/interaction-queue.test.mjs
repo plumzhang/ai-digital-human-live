@@ -28,6 +28,7 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/manualQuestions.ts', 
 }).outputText, { exports: manualExports, Date });
 const { ManualQuestions } = manualExports;
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
+const deferred = () => { let resolve, reject; const promise = new Promise((yes,no) => {resolve=yes;reject=no;});return {promise,resolve,reject}; };
 const reply = text => ({ speech: text, generation_mode: 'question', emotion: 'happy', segments: [] });
 
 function setup(initial = emptyQueue(), persistError = false, extras = {}) {
@@ -1416,20 +1417,20 @@ test('output fragments persist once and late old replies cannot contaminate the 
 });
 
 
-test('manual messages and dialogue preserve their protocol while sharing FIFO priority and interruption', async () => {
+test('manual text messages share FIFO priority and interruption', async () => {
   const p = setup(); const sent = [];
-  const m = operator(p, async (content, liveId, messageType) => sent.push({ content, liveId, messageType }));
+  const m = operator(p, async (content, liveId) => sent.push({ content, liveId }));
   await p.engine.importTestBatch([{ event: p.event('A'), result: reply('自动回复') }]);
   await p.engine.setContext(true, 'live', true);
   m.manual.enqueue('文本消息草稿', 'live');
-  m.manual.enqueue('只聊聊天', 'live', 'text_dialog');
-  assert.equal(m.questions()[0].message_type, 'text_msg'); assert.equal(m.questions()[1].message_type, 'text_dialog');
+  m.manual.enqueue('只聊聊天', 'live');
+  assert.equal(m.questions().length, 2);
   await m.idle();
-  assert.deepEqual(sent, [{ content: '文本消息草稿', liveId: 'live', messageType: 'text_msg' }]);
+  assert.deepEqual(sent, [{ content: '文本消息草稿', liveId: 'live' }]);
   m.voice(); await m.idle(2600); await m.manual.tick('live', true);
-  assert.equal(sent[1].content, '只聊聊天'); assert.equal(sent[1].messageType, 'text_dialog');
+  assert.equal(sent[1].content, '只聊聊天');
   assert.equal(p.spoken.length, 0);
-  m.manual.enqueue('下一条文本对话', 'live', 'text_dialog');
+  m.manual.enqueue('下一条文本消息', 'live');
   m.manual.cancel();
   await m.idle(); assert.equal(sent.length, 2); assert.equal(m.questions().length, 0);
   p.engine.dispose();
@@ -1472,4 +1473,160 @@ test('response style context uses actual avatar answers and excludes archived qu
   assert.deepEqual(Array.from(p.jobs.get('new').diversity.recentOpenings), ['观众，谢谢你的心意。']);
   assert.equal(p.jobs.get('new').history.length, 0);
   p.engine.dispose();
+});
+
+
+test('component replies survive sentence pauses and finish only after all PCM plus healthy downlink silence', async () => {
+  let sent;
+  const p = setup(emptyQueue(), false, { autoAnswer: false, speak: () => new Promise(resolve => { sent = resolve; }) });
+  await p.engine.importTestBatch([{ event: p.event('component'), result: { ...reply('原始问题'), generation_mode: 'component', request: '{}' } }]);
+  await p.engine.setContext(true, 'live', true);
+  await p.observe(); p.advance(1600); const playing = p.observe(); await flush();
+  let task = p.engine.snapshot().tasks[0]; assert.equal(task.status, 'playing');
+  await p.engine.observeOutput({ live_id: 'live', text: '第一句。', received_at: p.now(), request_id: task.id, final: false });
+  p.engine.observeVad({ speaking: true, healthy: true, ended: false, quiet_ms: 0 }, 'live');
+  p.advance(2500); p.engine.observeVideo('live');
+  p.engine.observeVad({ speaking: false, healthy: true, ended: true, quiet_ms: 2500 }, 'live');
+  await p.engine.tick(); assert.equal(p.engine.snapshot().history.length, 0);
+  await p.engine.observeOutput({ live_id: 'live', text: '第一句。第二句。', received_at: p.now(), request_id: task.id, final: true });
+  await p.engine.tick(); assert.equal(p.engine.snapshot().history.length, 0);
+  sent(); await playing; await flush();
+  assert.ok(p.engine.snapshot().tasks[0].audio_sent_at);
+  p.advance(1700); p.engine.observeVideo('live');
+  p.engine.observeVad({ speaking: false, healthy: false, ended: true, quiet_ms: 1700 }, 'live');
+  await p.engine.tick(); assert.equal(p.engine.snapshot().history.length, 0);
+  p.engine.observeVad({ speaking: true, healthy: true, ended: false, quiet_ms: 0 }, 'live');
+  p.advance(1300); p.engine.observeVideo('live');
+  p.engine.observeVad({ speaking: false, healthy: true, ended: true, quiet_ms: 1300 }, 'live');
+  await p.engine.tick(); assert.equal(p.engine.snapshot().history[0].outcome, 'played');
+  p.engine.dispose();
+});
+
+
+test('closing TTS preserves the current speech for confirmation and pauses later replies', async () => {
+  const p = setup();
+  await p.engine.importTestBatch([{ event:p.event('tts-current'), result:reply('第一条') }, { event:p.event('tts-next'), result:reply('第二条') }]);
+  await p.engine.setContext(true, 'live', true);
+  await p.observe(); p.advance(1600); await p.observe();
+  assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
+  await p.engine.speechUnavailable('服务已关闭');
+  assert.equal(p.engine.snapshot().tasks[0].status, 'uncertain');
+  assert.equal(p.engine.snapshot().tasks[0].error, '服务已关闭');
+  assert.equal(p.engine.snapshot().history.length, 0);
+  await p.engine.finish('skipped', '人工确认跳过');
+  await p.observe(); p.advance(1600); await p.observe();
+  assert.equal(p.spoken.length, 1); assert.equal(p.engine.snapshot().tasks[0].event.event_id, 'tts-next');
+  p.engine.dispose();
+});
+
+test('closing TTS leaves original song PCM playback running', async () => {
+  let stopped = 0;
+  const p = setup(emptyQueue(), false, { stopSong: async () => { stopped++; } });
+  await p.engine.setContext(false, 'live', true);
+  await p.engine.enqueueSong(songDirector); p.engine.observeVideo('live'); await p.engine.tick();
+  const before = p.engine.snapshot().tasks[0]; assert.equal(before.status, 'playing');
+  await p.engine.speechUnavailable('服务已关闭');
+  assert.equal(p.engine.snapshot().tasks[0].status, 'playing'); assert.equal(stopped, 0);
+  p.engine.dispose();
+});
+
+test('all six answers keep generating and PCM prepares while the first slot is still transmitting', async () => {
+  const audio = new Map(), retained = [], started = [], playback = deferred();
+  const p = setup(undefined, false, {
+    prepareAudio: task => { const job=deferred();audio.set(task.event.event_id,{...job,token:task.prepared_audio.token});return job.promise; },
+    retainAudio: async (live,tokens) => retained.push({live,tokens:[...tokens]}),
+    speak: async task => { started.push(task.event.event_id); assert.ok(task.result.prepared_reply);assert.equal(task.prepared_audio.state,'ready');await playback.promise; },
+  });
+  const ids=['A','B','C','D','E','F'];
+  const prepared=id=>({...reply(id),generation_mode:'component',prepared_reply:`回答${id}。`,prepared_for_live:'live'});
+  try {
+    await p.engine.importTestBatch(ids.map(id=>({event:p.event(id)})));
+    await p.engine.setContext(true,'live',true);
+    assert.equal(p.jobs.size,2);
+    p.jobs.get('A').resolve(prepared('A'));p.jobs.get('B').resolve(prepared('B'));await flush();
+    assert.equal(audio.size,1);assert.ok(audio.has('A'));assert.equal(started.length,0);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true,quiet_ms:2000},'live');
+    audio.get('A').resolve({state:'ready',duration_ms:3000});await flush();
+    assert.deepEqual(started,['A']);assert.ok(audio.has('B'));
+    // This must run despite the first native PCM send still awaiting completion.
+    p.jobs.get('C').resolve(prepared('C'));p.jobs.get('D').resolve(prepared('D'));await flush();
+    assert.ok(p.jobs.has('E')&&p.jobs.has('F'));
+    p.jobs.get('E').resolve(prepared('E'));p.jobs.get('F').resolve(prepared('F'));await flush();
+    const state=p.engine.snapshot();assert.equal(state.tasks[0].status,'playing');
+    for(const task of state.tasks){assert.ok(task.result.prepared_reply);assert.equal(task.answer,undefined);}
+    assert.deepEqual(started,['A']);assert.ok(retained.some(r=>r.tokens.includes(audio.get('B').token)));
+  } finally { p.engine.dispose();playback.resolve();for(const job of audio.values())job.resolve({state:'cancelled'});await flush(); }
+});
+
+test('busy TTS leaves prepared text visible, retries only when idle, and never regenerates on playback', async () => {
+  const tokens=[],spoken=[];
+  const p=setup(undefined,false,{
+    prepareAudio: async task=>{tokens.push(task.prepared_audio.token);return tokens.length===1?{state:'busy'}:{state:'ready',duration_ms:2000};},
+    retainAudio: async()=>{}, speak:async task=>spoken.push(task.result.prepared_reply),
+  });
+  try {
+    await p.engine.importTestBatch([{event:p.event('A')}]);await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');
+    p.jobs.get('A').resolve({...reply('原问题'),generation_mode:'component',prepared_reply:'预先生成的答案。',prepared_for_live:'live'});await flush();
+    assert.equal(tokens.length,1);assert.equal(p.engine.snapshot().tasks[0].result.prepared_reply,'预先生成的答案。');assert.equal(spoken.length,0);
+    p.advance(200);await p.engine.tick();assert.equal(tokens.length,1);
+    p.advance(100);await p.engine.tick();await flush();
+    assert.equal(tokens.length,2);assert.notEqual(tokens[0],tokens[1]);assert.equal(p.jobs.size,1);
+    assert.deepEqual(spoken,['预先生成的答案。']);
+  } finally {p.engine.dispose();}
+});
+
+test('skipping and regenerating drop cache handles and reject late prepared PCM', async () => {
+  const audio=new Map(),retained=[],spoken=[];
+  const p=setup(undefined,false,{
+    prepareAudio:task=>{const job=deferred();audio.set(task.event.event_id,{...job,token:task.prepared_audio.token});return job.promise;},
+    retainAudio:async(live,tokens)=>retained.push([...tokens]),speak:async task=>spoken.push(task.event.event_id),
+  });
+  try {
+    await p.engine.importTestBatch(['A','B'].map(id=>({event:p.event(id)})));await p.engine.setContext(true,'live',true);
+    for(const id of ['A','B'])p.jobs.get(id).resolve({...reply(id),generation_mode:'component',prepared_reply:`回答${id}。`,prepared_for_live:'live'});
+    await flush();const oldA=audio.get('A');
+    await p.engine.skip(p.engine.snapshot().tasks[0].id);await flush();
+    assert.ok(!retained.at(-1).includes(oldA.token));
+    oldA.resolve({state:'ready'});await flush();assert.ok(audio.has('B'));
+    const oldB=audio.get('B');await p.engine.retry(p.engine.snapshot().tasks[0].id);await flush();
+    assert.ok(!retained.at(-1).includes(oldB.token));oldB.resolve({state:'ready'});await flush();
+    assert.equal(p.engine.snapshot().tasks[0].prepared_audio,undefined);assert.equal(p.engine.snapshot().tasks[0].result,undefined);assert.deepEqual(spoken,[]);
+  } finally {p.engine.dispose();for(const job of audio.values())job.resolve({state:'cancelled'});await flush();}
+});
+
+test('an old live cannot overwrite new background answers and restored PCM handles are not reused', async () => {
+  const p=setup(undefined,false,{prepareAudio:async()=>({state:'busy'}),retainAudio:async()=>{}});
+  try {
+    await p.engine.importTestBatch(['A','B'].map(id=>({event:p.event(id)})));await p.engine.setContext(true,'live',true);
+    const oldA=p.jobs.get('A'),oldB=p.jobs.get('B');await p.engine.setContext(true,'new-live',true);
+    oldA.resolve({...reply('wrong'),generation_mode:'component',prepared_reply:'旧会话错误答案',prepared_for_live:'live'});
+    oldB.resolve({...reply('wrong'),generation_mode:'component',prepared_reply:'旧会话错误答案',prepared_for_live:'live'});await flush();
+    assert.notEqual(p.jobs.get('A'),oldA);assert.equal(p.engine.snapshot().tasks[0].result,undefined);
+    const snapshot=emptyQueue();snapshot.tasks=[{id:'restored',event:p.event('A'),status:'ready',result:{...reply('A'),generation_mode:'component',prepared_reply:'已生成台词',prepared_for_live:'live'},prepared_audio:{token:'obsolete-native-handle',state:'ready',live_id:'live'}}];
+    const restored=setup(snapshot,false,{prepareAudio:async()=>({state:'busy'}),retainAudio:async()=>{}});
+    assert.equal(restored.engine.snapshot().tasks[0].prepared_audio,undefined);restored.engine.dispose();
+  } finally {p.engine.dispose();}
+});
+
+test('changing voice discards late PCM and reuses the prepared answer without another model request', async () => {
+  const audio=[],retained=[];
+  const p=setup(undefined,false,{
+    prepareAudio:task=>{const job=deferred();audio.push({...job,token:task.prepared_audio.token,text:task.result.prepared_reply});return job.promise;},
+    retainAudio:async(live,tokens)=>retained.push([...tokens]),
+  });
+  try {
+    await p.engine.importTestBatch([{event:p.event('A')}]);await p.engine.setContext(true,'live',true);
+    p.jobs.get('A').resolve({...reply('原问题'),generation_mode:'component',prepared_reply:'同一句话换个音色。',prepared_for_live:'live'});await flush();
+    assert.equal(audio.length,1);const obsolete=audio[0];
+    await p.engine.invalidatePreparedAudio();await flush();
+    assert.ok(!retained.at(-1).includes(obsolete.token));
+    obsolete.resolve({state:'ready',duration_ms:1000});await flush();
+    assert.equal(audio.length,2);assert.notEqual(audio[1].token,obsolete.token);assert.equal(audio[1].text,obsolete.text);
+    assert.equal(p.jobs.size,1);assert.equal(p.engine.snapshot().tasks[0].prepared_audio.state,'preparing');
+    audio[1].resolve({state:'ready',duration_ms:2000});await flush();
+    assert.equal(p.engine.snapshot().tasks[0].prepared_audio.token,audio[1].token);
+    assert.equal(p.engine.snapshot().tasks[0].prepared_audio.duration_ms,2000);
+    assert.equal(p.spoken.length,0);
+  } finally {p.engine.dispose();for(const job of audio)job.resolve({state:'cancelled'});await flush();}
 });

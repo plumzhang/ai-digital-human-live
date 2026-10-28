@@ -91,7 +91,7 @@ pub fn director_get(app: tauri::AppHandle, id: String) -> Result<Value, String> 
     let path = folder(&app, &id)?; Ok(public(&path, &read(&path)?))
 }
 #[tauri::command]
-pub async fn director_create(app: tauri::AppHandle, request: CreateRequest) -> Result<Value, String> {
+pub async fn director_create(app: tauri::AppHandle, request: CreateRequest, tts: crate::component::TtsConfig) -> Result<Value, String> {
     if request.title.trim().is_empty() || request.title.chars().count() > 100 || request.lyrics.trim().is_empty() || request.lyrics.len() > 100000
         || !(1000..=1800000).contains(&request.duration_ms) { return Err("请填写歌名、完整歌词，并上传 1 秒～30 分钟的歌曲".into()); }
     let (prefix, data) = request.audio_data.split_once(",").ok_or("歌曲音频格式无效")?;
@@ -106,18 +106,18 @@ pub async fn director_create(app: tauri::AppHandle, request: CreateRequest) -> R
     fs::write(path.join(&song.audio_file), bytes).map_err(|e| e.to_string())?;
     fs::write(path.join("lyrics.txt"), &song.lyrics).map_err(|e| e.to_string())?;
     write(&path, &song)?;
-    transcribe(&app, &path, &mut song).await?;
+    transcribe(&tts, &path, &mut song).await?;
     Ok(public(&path, &song))
 }
-async fn transcribe(app: &tauri::AppHandle, path: &Path, song: &mut Director) -> Result<(), String> {
+async fn transcribe(tts: &crate::component::TtsConfig, path: &Path, song: &mut Director) -> Result<(), String> {
     song.status = "transcribing".into(); song.error = None; write(path, song)?;
-    let result = crate::whisper::transcribe_song(app.clone(), path.join(&song.audio_file)).await;
+    let result = crate::speech_stt::transcribe_file(tts, &path.join(&song.audio_file)).await;
     let outcome = result.and_then(|value| {
-        // Save the full untouched recognition response, including word timestamps.
-        crate::queue_store::atomic_write(path, "whisper.json", &serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)?;
+        // Save the untouched ASR API response and millisecond sentence timestamps.
+        crate::queue_store::atomic_write(path, "funasr.json", &serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)?;
         let segments = value["segments"].as_array().ok_or("语音识别未返回字幕")?;
         song.raw_segments = segments.iter().map(|c| Ok(Cue { start_ms:c["start_ms"].as_u64().ok_or("字幕时间无效")?, end_ms:c["end_ms"].as_u64().ok_or("字幕时间无效")?, text:c["text"].as_str().ok_or("字幕内容无效")?.into(), lead_ms:500 })).collect::<Result<_, String>>()?;
-        // raw.srt is only Whisper's result; correction never overwrites it.
+        // raw.srt is only FunASR's result; correction never overwrites it.
         crate::queue_store::atomic_write(path, "raw.srt", &srt(&song.raw_segments))?;
         if song.raw_segments.is_empty() { return Err("未识别出歌词，请检查音频后重试".into()); }
         Ok(())
@@ -126,11 +126,11 @@ async fn transcribe(app: &tauri::AppHandle, path: &Path, song: &mut Director) ->
     song.error = outcome.as_ref().err().cloned(); write(path, song)?; outcome
 }
 #[tauri::command]
-pub async fn director_transcribe(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+pub async fn director_transcribe(app: tauri::AppHandle, id: String, tts: crate::component::TtsConfig) -> Result<Value, String> {
     let _job = DirectorJob::acquire(&app, &id)?;
     crate::queue_store::ensure_song_not_queued(&app, &id)?;
     let path = folder(&app, &id)?; let mut song = read(&path)?;
-    transcribe(&app, &path, &mut song).await?; Ok(public(&path, &song))
+    transcribe(&tts, &path, &mut song).await?; Ok(public(&path, &song))
 }
 #[tauri::command]
 pub async fn director_correct(app: tauri::AppHandle, id: String, base_url: String, key: String, model: String) -> Result<Value, String> {

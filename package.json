@@ -11,7 +11,13 @@
     "tauri": "tauri",
     "prepare:dyhub": "powershell -ExecutionPolicy Bypass -File scripts/prepare-dyhub.ps1",
     "package:win": "powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1",
-    "setup:whisper": "powershell -ExecutionPolicy Bypass -File scripts/setup-whisper.ps1"
+    "setup:whisper": "powershell -ExecutionPolicy Bypass -File scripts/setup-speech.ps1",
+    "setup:tts": "powershell -ExecutionPolicy Bypass -File scripts/setup-speech.ps1",
+    "start:tts": "powershell -ExecutionPolicy Bypass -File scripts/start-speech.ps1",
+    "setup:speech": "powershell -ExecutionPolicy Bypass -File scripts/setup-speech.ps1",
+    "start:speech": "powershell -ExecutionPolicy Bypass -File scripts/start-speech.ps1",
+    "stop:speech": "powershell -ExecutionPolicy Bypass -File scripts/stop-speech.ps1",
+    "stop:tts": "powershell -ExecutionPolicy Bypass -File scripts/stop-speech.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

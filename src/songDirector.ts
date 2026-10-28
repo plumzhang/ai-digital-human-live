@@ -69,6 +69,8 @@ export class SongDirectorPlayer {
     speak: (text: string, index: number) => Promise<void>;
     interrupt: () => Promise<void>;
     prepare?: () => Promise<void>;
+    activateAudio?: () => Promise<void>;
+    cleanup?: () => void;
     caption: (text: string) => void;
     state: (state: SongPlaybackState['state'], error?: string) => void;
     observe?: (observation: SongSyncObservation) => void;
@@ -86,11 +88,13 @@ export class SongDirectorPlayer {
     } catch (error) { await this.stop('error', `原歌曲无法播放：${String(error)}`); }
   }
   private async play() {
+    const position = this.audio.currentTime;
     try {
-      await this.audio.play();
+      await Promise.all([this.audio.play(), this.adapter.activateAudio?.()]);
     } catch (error) {
       if (this.closed) return;
       if (error && typeof error === 'object' && 'name' in error && error.name === 'NotAllowedError') {
+        this.audio.pause(); this.audio.currentTime = position;
         this.blocked = true;
         this.adapter.state('blocked', '请在 OBS 窗口点击“恢复播放”以播放原歌曲');
         return;
@@ -176,6 +180,7 @@ export class SongDirectorPlayer {
     this.closed = true; clearInterval(this.timer);
     this.finishObservation('unconfirmed'); this.reportProgress(true);
     this.audio.pause(); this.audio.onended = null; this.audio.onerror = null;
+    this.adapter.cleanup?.();
     this.audio.removeAttribute('src'); this.audio.load();
     this.adapter.caption('');
     this.cleanupPromise = (async () => {
