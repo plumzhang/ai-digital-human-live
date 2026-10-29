@@ -210,10 +210,9 @@ fn validate_pcm(pcm: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch: u64, cancel: watch::Receiver<u64>, mut audio: mpsc::Receiver<(String, Vec<u8>)>, first_pcm:oneshot::Sender<tokio::time::Instant>) -> Result<String, String> {
+async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch: u64, cancel: watch::Receiver<u64>, mut audio: mpsc::Receiver<(String, Vec<u8>)>, mirror_local: bool) -> Result<String, String> {
     let mut answer = String::new();
     let mut duration = 0_u64;
-    let mut first_pcm=Some(first_pcm);
     while let Some((text, pcm)) = audio.recv().await {
         answer.push_str(&text);
         {
@@ -236,7 +235,7 @@ async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch:
                 session.sender.send(Outbound { message: Message::Binary(chunk.to_vec().into()), written: Some(written), epoch: Some((cancel.clone(), epoch)) }).map_err(|_| "PCM 发送通道已关闭")?;
             }
             tokio::time::timeout(Duration::from_secs(4), received).await.map_err(|_| "PCM 写入超时")?.map_err(|_| "PCM 写入未确认")??;
-            {
+            if mirror_local {
                 // Serialize local playback with interruption. A late write
                 // receipt must never restart audio from a cancelled epoch.
                 let state = app.state::<AppState>();
@@ -244,7 +243,6 @@ async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch:
                 guard.as_ref().filter(|s| s.live_id == live_id && *s.speech_cancel.borrow() == epoch && s.ready).ok_or("播报已取消")?;
                 app.emit_to("obs", "component-pcm", json!({"live_id":live_id,"task_id":task_id,"epoch":epoch,"state":"frame","pcm":chunk})).map_err(|e| format!("本地PCM播放投递失败：{e}"))?;
             }
-            if let Some(first)=first_pcm.take() {let _=first.send(tokio::time::Instant::now());}
             deadline += Duration::from_secs_f64(chunk.len() as f64 / 48_000.0);
             let now = tokio::time::Instant::now();
             if now.saturating_duration_since(deadline) > Duration::from_millis(100) { deadline = now; }
@@ -258,6 +256,26 @@ async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch:
     emit_answer(app, live_id, task_id, &answer, true);
     let _ = app.emit("component-speech", json!({"live_id":live_id,"task_id":task_id,"state":"sent","duration_ms":duration}));
     Ok(answer)
+}
+
+async fn play_slot_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch: u64,
+    prepared: std::sync::Arc<crate::prepared_speech::PreparedAudio>,
+    started_at: u64, play_delay_ms: u64, slot_started: tokio::time::Instant) -> Result<(), String> {
+    let mut bytes = 0_u64;
+    // Send the cached audio directly to OBS. Local playback may start before
+    // upstream transmission; both deadlines refer to the same slot transition.
+    for (_, pcm) in &prepared.parts {
+        let state = app.state::<AppState>();
+        let guard = state.session.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().filter(|s| s.live_id == live_id && *s.speech_cancel.borrow() == epoch && s.ready).ok_or("播报已取消")?;
+        app.emit_to("obs", "component-pcm", json!({"live_id":live_id,"task_id":task_id,"epoch":epoch,
+            "state":"buffer","play_at_ms":started_at+play_delay_ms+bytes/48,
+            "pcm_base64":base64::engine::general_purpose::STANDARD.encode(pcm)}))
+            .map_err(|e| format!("本地PCM播放投递失败：{e}"))?;
+        bytes += pcm.len() as u64;
+    }
+    tokio::time::sleep_until(slot_started + Duration::from_millis(play_delay_ms) + Duration::from_secs_f64(bytes as f64 / 48_000.0)).await;
+    Ok(())
 }
 
 fn emit_answer(app: &tauri::AppHandle, live_id: &str, task_id: &str, answer: &str, final_: bool) {
@@ -294,14 +312,32 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
     let (audio_tx, audio_rx) = mpsc::channel(1);
     let audio_cancel = cancel.clone();
     let question = content.clone();
+    let started_at = slot_actions.as_ref().map(|a| a.started_at).unwrap_or(unix_ms() as u64);
+    let now_ms = unix_ms() as u64;
+    let now = tokio::time::Instant::now();
+    let slot_started = if started_at > now_ms { now + Duration::from_millis(started_at - now_ms) } else { now - Duration::from_millis(now_ms - started_at) };
+    let send_delay_ms = slot_actions.as_ref().map(|a| a.send_delay_ms).unwrap_or(0);
+    let play_delay_ms = slot_actions.as_ref().map(|a| a.play_delay_ms).unwrap_or(0);
+    let local_prepared = if slot_actions.is_some() { prepared.clone() } else { None };
+    let mirror_local = local_prepared.is_none();
     let pipeline = async {
-        if let Some(actions)=&mut slot_actions {
-            if let Some(handoff)=actions.handoff.take() {
-                crate::component_action::submit(&app,&live_id,&task_id,epoch,&actions.playback_token,"handoff",handoff).await;
-            }
-        }
-        let (first_tx,first_rx)=oneshot::channel();
+        let token = slot_actions.as_ref().map(|a| a.playback_token.clone()).unwrap_or_default();
+        let handoff_payload = slot_actions.as_mut().and_then(|a| a.handoff.take());
+        let reply_payload = slot_actions.as_mut().and_then(|a| a.reply.take());
+        let reply_delay_ms = slot_actions.as_ref().map(|a| a.reply_delay_ms).unwrap_or(0);
+        let handoff_delay_ms = slot_actions.as_ref().map(|a| a.handoff_delay_ms).unwrap_or(0);
         let (finished_tx,finished_rx)=watch::channel(false);
+        let handoff_finished = finished_rx.clone();
+        let handoff = async {
+            if let Some(payload) = handoff_payload {
+                if crate::component_action::action_due(handoff_delay_ms,slot_started,handoff_finished).await {
+                    crate::component_action::submit(&app,&live_id,&task_id,epoch,&token,"handoff",payload).await;
+                } else {
+                    crate::component_action::report(&app,&live_id,&task_id,&token,"handoff","cancelled",Some("槽位音频已结束，取消尚未触发的承接动作"));
+                }
+            }
+            Ok::<(),String>(())
+        };
         let produce = async {
             if let Some(prepared) = prepared {
                 drop(sentence_tx); drop(sentence_rx);
@@ -312,23 +348,32 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
                 Ok(())
             }
         };
-        let transmit=async {
-            let result=send_audio(&app,&live_id,&task_id,epoch,audio_cancel,audio_rx,first_tx).await;
-            finished_tx.send_replace(true);result
+        let audio = async {
+            let transmit = async {
+                tokio::time::sleep_until(slot_started + Duration::from_millis(send_delay_ms)).await;
+                send_audio(&app,&live_id,&task_id,epoch,audio_cancel,audio_rx,mirror_local).await
+            };
+            let local = async {
+                if let Some(prepared) = local_prepared {
+                    play_slot_audio(&app,&live_id,&task_id,epoch,prepared,started_at,play_delay_ms,slot_started).await?;
+                }
+                Ok::<(),String>(())
+            };
+            let result = tokio::try_join!(produce, transmit, local).map(|(_, answer, _)| answer);
+            finished_tx.send_replace(true);
+            result
         };
         let reply=async {
-            if let Some(actions)=&mut slot_actions {
-                if let Some(payload)=actions.reply.take() {
-                    if crate::component_action::reply_due(actions.reply_delay_ms,first_rx,finished_rx).await {
-                        crate::component_action::submit(&app,&live_id,&task_id,epoch,&actions.playback_token,"reply",payload).await;
+                if let Some(payload)=reply_payload {
+                    if crate::component_action::action_due(reply_delay_ms,slot_started,finished_rx).await {
+                        crate::component_action::submit(&app,&live_id,&task_id,epoch,&token,"reply",payload).await;
                     } else {
-                        crate::component_action::report(&app,&live_id,&task_id,&actions.playback_token,"reply","cancelled",Some("PCM已停止发送，取消尚未触发的回复动作"));
+                        crate::component_action::report(&app,&live_id,&task_id,&token,"reply","cancelled",Some("槽位音频已结束，取消尚未触发的回复动作"));
                     }
                 }
-            }
             Ok::<(),String>(())
         };
-        let (_, answer, _) = tokio::try_join!(produce, transmit, reply)?;
+        let (_, answer, _) = tokio::try_join!(handoff, audio, reply)?;
         Ok::<String, String>(answer)
     };
     let result = tokio::select! {

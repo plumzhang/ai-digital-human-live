@@ -275,6 +275,9 @@
 .queue-handoff-controls{margin:16px 0;padding:14px 16px;border:1px solid #30425e;border-radius:10px;background:#142237}
 .queue-handoff-controls .auto-row{margin:0 0 14px;padding:0;border:0}
 .queue-handoff-controls label{max-width:340px}
+.queue-playback-settings-title{margin:0 0 16px;font-size:14px}
+.queue-audio-sync-settings{margin-top:16px;padding-top:16px;border-top:1px solid #30425e}
+.queue-audio-sync-settings>strong{display:block;margin-bottom:12px;font-size:14px}
 .voice-selector{padding:16px;border:1px solid #30425e;border-radius:12px}
 .voice-selector a{color:#9ec5ff;font-weight:600;text-decoration:underline;text-underline-offset:3px}
 .voice-selector a:hover,.voice-selector a:focus-visible{color:#d3e5ff}

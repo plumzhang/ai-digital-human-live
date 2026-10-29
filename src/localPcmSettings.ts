@@ -1,4 +1,5 @@
 export const LOCAL_PCM_DELAY_KEY = 'danmaku-local-pcm-delay-ms';
+export const PCM_SEND_DELAY_KEY = 'danmaku-pcm-send-delay-ms';
 export const MAX_LOCAL_PCM_DELAY_MS = 10000;
 
 export function validLocalPcmDelay(value: unknown): value is number {
@@ -13,4 +14,18 @@ export function loadLocalPcmDelayMs(): number {
 export function saveLocalPcmDelayMs(value: number) {
   if (!validLocalPcmDelay(value)) throw new Error(`播放延迟需为0–${MAX_LOCAL_PCM_DELAY_MS}毫秒的整数`);
   localStorage.setItem(LOCAL_PCM_DELAY_KEY, JSON.stringify(value));
+}
+
+export function loadPcmSendDelayMs(): number {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(PCM_SEND_DELAY_KEY) || '0');
+    return validLocalPcmDelay(value) ? value : 0;
+  } catch { return 0; }
+}
+export function savePcmSendDelayMs(value: number) {
+  if (!validLocalPcmDelay(value)) throw new Error(`发送延迟需为0–${MAX_LOCAL_PCM_DELAY_MS}毫秒的整数`);
+  localStorage.setItem(PCM_SEND_DELAY_KEY, JSON.stringify(value));
+}
+export function loadSlotPcmTiming() {
+  return { send_delay_ms: loadPcmSendDelayMs(), play_delay_ms: loadLocalPcmDelayMs() };
 }

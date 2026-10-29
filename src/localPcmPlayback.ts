@@ -1,11 +1,10 @@
-import { loadLocalPcmDelayMs, validLocalPcmDelay } from './localPcmSettings';
-
 export type LocalPcmEvent = {
-  live_id: string; epoch: number; state: 'frame' | 'stop'; pcm?: number[]; task_id?: string;
+  live_id: string; epoch: number; state: 'frame' | 'buffer' | 'stop'; pcm?: number[]; task_id?: string;
+  pcm_base64?: string; play_at_ms?: number;
 };
 
 // The component API uses our TTS audio to render the avatar. Play those same
-// acknowledged frames locally; its RTC stream is not our audio source.
+// cached audio locally on the slot clock; RTC is not our audio source.
 export class LocalPcmPlayback {
   private context = new AudioContext({ latencyHint: 'interactive' });
   private output = this.context.createGain();
@@ -15,10 +14,10 @@ export class LocalPcmPlayback {
   private epoch = -1;
   private stoppedThrough = -1;
   private nextAt = 0;
-  private delaySeconds = 0;
+  private bufferedBytes = 0;
   private disposed = false;
 
-  constructor(private readDelayMs = loadLocalPcmDelayMs) {
+  constructor(private now = Date.now) {
     this.output.connect(this.context.destination);
     this.output.connect(this.capture);
     // Keep the playback observer receiving real silence between replies so
@@ -41,13 +40,19 @@ export class LocalPcmPlayback {
     if (event.epoch <= this.stoppedThrough) return;
     if (event.epoch !== this.epoch) {
       this.clear(); this.epoch = event.epoch;
-      const delay = this.readDelayMs();
-      this.delaySeconds = validLocalPcmDelay(delay) && !event.task_id?.startsWith('manual-') && !event.task_id?.startsWith('microphone-') ? delay / 1000 : 0;
     }
     if (!this.running) throw new Error('请点击“恢复播放”启用本地 PCM 声音');
-    const pcm = event.pcm;
-    if (!pcm?.length || pcm.length % 2 || pcm.length > 960) throw new Error('本地 PCM 帧格式无效');
-    if (this.nextAt - this.context.currentTime > this.delaySeconds + 0.5) {
+    const prepared = event.state === 'buffer';
+    let pcm: number[] | Uint8Array | undefined = event.pcm;
+    if (prepared) {
+      if (!event.pcm_base64 || event.pcm_base64.length > 3_840_000 || !Number.isFinite(event.play_at_ms)) throw new Error('本地 PCM 缓存格式无效');
+      const bytes = atob(event.pcm_base64);
+      pcm = Uint8Array.from(bytes, byte => byte.charCodeAt(0));
+      if (this.bufferedBytes + pcm.length > 48_000 * 60) throw new Error('本地 PCM 缓存超过60秒');
+      this.bufferedBytes += pcm.length;
+    }
+    if (!pcm?.length || pcm.length % 2 || (!prepared && pcm.length > 960)) throw new Error('本地 PCM 帧格式无效');
+    if (!prepared && this.nextAt - this.context.currentTime > 0.5) {
       this.clear();
       throw new Error('本地音频播放积压，已停止当前回答');
     }
@@ -62,13 +67,14 @@ export class LocalPcmPlayback {
     source.connect(this.output);
     source.onended = () => { source.disconnect(); this.sources.delete(source); };
     this.sources.add(source);
-    const startAt = Math.max(this.context.currentTime + 0.03 + this.delaySeconds, this.nextAt);
+    const targetAt = prepared ? this.context.currentTime + (event.play_at_ms! - this.now()) / 1000 : this.context.currentTime;
+    const startAt = Math.max(this.context.currentTime + 0.03, targetAt + 0.03, this.nextAt);
     source.start(startAt);
     this.nextAt = startAt + buffer.duration;
   }
   private clear() {
     for (const source of this.sources) { source.onended = null; source.stop(); source.disconnect(); }
-    this.sources.clear(); this.nextAt = 0;
+    this.sources.clear(); this.nextAt = 0; this.bufferedBytes = 0;
   }
   dispose() {
     if (this.disposed) return;

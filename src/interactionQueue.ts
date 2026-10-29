@@ -17,11 +17,13 @@ export type InteractionTask = {
   action_state?: 'pending' | 'submitted' | 'failed' | 'cancelled'; action_error?: string;
   handoff_action?: { direction: HandoffDirection; angle_deg: number; status: 'waiting' | 'pending' | 'submitted' | 'failed' | 'cancelled'; error?: string };
   reply_action_delay_ms?: number;
+  handoff_action_delay_ms?: number;
   playback_token?: string;
   generation_token?: string;
   generation_note?: string;
   prepared_audio?: { token: string; live_id: string; state: 'preparing' | 'ready'; duration_ms?: number };
   audio_sent_at?: number;
+  pcm_timing?: { send_delay_ms: number; play_delay_ms: number };
   answer?: { text: string; received_at: number; message_ids: string[]; final?: boolean };
   song?: { id: string; title: string; duration_ms: number };
   song_playback?: 'starting' | 'blocked' | 'playing';
@@ -64,6 +66,7 @@ export type QueueSnapshot = {
   handoff?: { enabled: boolean; direction: HandoffDirection; wait_ms?: number; angle_deg?: number; trigger_percent?: number };
   handoff_action?: HandoffAction;
   reply_action_delay_ms?: number;
+  handoff_action_delay_ms?: number;
   recognition?: { enabled: boolean; match_percent?: number };
 };
 export type ReplyDiversity = { openingStyle: string; recentOpenings: string[] };
@@ -104,6 +107,7 @@ export function normalizeInteraction(raw: unknown, now = Date.now()): Interactio
 }
 
 type QueueAdapter = {
+  playbackTiming?: () => { send_delay_ms: number; play_delay_ms: number };
   persist: (snapshot: QueueSnapshot) => Promise<void>;
   generate: (task: InteractionTask, history: HistoryEntry[], diversity: ReplyDiversity, liveId: string) => Promise<GeneratedReply>;
   rewriteReply?: (task: InteractionTask, draft: GeneratedReply, history: HistoryEntry[], diversity: ReplyDiversity, liveId: string) => Promise<GeneratedReply>;
@@ -175,6 +179,7 @@ export class InteractionQueue {
     }
     this.state.handoff ||= { enabled: false, direction: 'left_down' };
     if (!Number.isInteger(this.state.reply_action_delay_ms) || this.state.reply_action_delay_ms! < 0 || this.state.reply_action_delay_ms! > 60000) this.state.reply_action_delay_ms = 0;
+    if (!Number.isInteger(this.state.handoff_action_delay_ms) || this.state.handoff_action_delay_ms! < 0 || this.state.handoff_action_delay_ms! > 60000) this.state.handoff_action_delay_ms = 0;
     if (!HANDOFF_DIRECTIONS.some(item => item.value === this.state.handoff?.direction)) this.state.handoff.direction = 'left_down';
     const waitMs = this.state.handoff.wait_ms;
     this.state.handoff.wait_ms = waitMs !== undefined && Number.isInteger(waitMs) && waitMs >= 0 && waitMs <= 3000 ? waitMs : 1699;
@@ -232,6 +237,7 @@ export class InteractionQueue {
       for (const task of next.tasks) {
         if (task.song || ['playing','uncertain'].includes(task.status) || (!this.adapter.prepareAudio && task.result?.generation_mode !== 'component')) continue;
         task.reply_action_delay_ms = next.reply_action_delay_ms ?? 0;
+        task.handoff_action_delay_ms = next.handoff_action_delay_ms ?? 0;
         if (next.handoff?.enabled) task.handoff_action = { direction: next.handoff.direction, angle_deg: next.handoff.angle_deg ?? 30, status: 'waiting' };
         else delete task.handoff_action;
       }
@@ -356,6 +362,10 @@ export class InteractionQueue {
   async configureReplyActionDelay(delayMs: number) {
     if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 60000) throw new Error('回复动作延迟需为0–60000毫秒的整数');
     await this.mutate(next => { next.reply_action_delay_ms = delayMs; return true; });
+  }
+  async configureHandoffActionDelay(delayMs: number) {
+    if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 60000) throw new Error('承接动作延迟需为0–60000毫秒的整数');
+    await this.mutate(next => { next.handoff_action_delay_ms = delayMs; return true; });
   }
   async observeRecognition(observation: RecognitionObservation) {
     if (!this.state.recognition?.enabled || !this.activeLive || observation.live_id !== this.activeLive) return;
@@ -560,6 +570,7 @@ export class InteractionQueue {
         const song=next.tasks[0],child=next.tasks[1];
         if(song?.id!==parent.id||song.song_pcm_active!==false||child?.id!==task.id||child.status!=='ready'||!this.enabled||!this.available)return false;
         child.status='playing';child.started_at=this.now();child.live_id=this.activeLive;child.playback_token=crypto.randomUUID();
+        child.pcm_timing=this.adapter.playbackTiming?.() || {send_delay_ms:0,play_delay_ms:0};
         child.song_parent={task_id:parent.id,playback_token:parent.playback_token!};
         delete child.audio_sent_at;delete child.recognition;delete child.answer;selected=structuredClone(child);return true;
       });
@@ -753,6 +764,7 @@ export class InteractionQueue {
       if (!task || task.status !== 'ready' || (this.adapter.prepareAudio && !task.song && task.prepared_audio?.state !== 'ready') || this.playbackHeld || this.importing || (!this.enabled && !task.song) || !this.available || this.activeLive !== liveId) return false;
       task.status = 'playing'; task.started_at = this.now(); task.live_id = liveId; task.playback_token = crypto.randomUUID();
       if (!task.song && task.result?.generation_mode === 'component') {
+        task.pcm_timing = this.adapter.playbackTiming?.() || { send_delay_ms: 0, play_delay_ms: 0 };
         if (task.handoff_action) task.handoff_action.status = 'pending';
         task.action_state = 'pending'; delete task.action_error;
       }
@@ -768,7 +780,8 @@ export class InteractionQueue {
     this.heardSpeech = false; this.lastSpeechAt = 0; this.vadEndTask = undefined;
     this.whisperQuietMs = 0; this.lastActualVoiceAt = 0;
     const selectedId = selected.id;
-    const timer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, selected.song ? selected.song.duration_ms + 60_000 : 60_000);
+    const timeoutMs = this.playbackTimeout(selected);
+    const timer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, Math.max(0, (selected.started_at || this.now()) + timeoutMs - this.now()));
     if(selected.song)this.songTimer=timer;else this.playbackTimer=timer;
     try {
       await this.adapter.speak(selected, liveId);
@@ -829,12 +842,15 @@ export class InteractionQueue {
     else if (state.ended && this.heardSpeech && this.current()?.status === 'playing') this.vadEndTask = this.current()!.id;
   }
   observeVideo(liveId: string) { if (liveId === this.activeLive) this.videoAt = this.now(); }
+  private playbackTimeout(task: InteractionTask) {
+    return 60_000 + (task.song ? task.song.duration_ms : task.result?.generation_mode === 'component' ? Math.max(task.pcm_timing?.send_delay_ms || 0, task.pcm_timing?.play_delay_ms || 0) : 0);
+  }
   private async observeCompletion() {
     const task = this.current();
     if (!task || task.status !== 'playing') return;
     if (task.song) return; // Only the original audio's ended event completes a song.
-    if (this.now() - task.started_at! >= 60_000) {
-      await this.markUncertain('60 秒内未确认播放结束，已保留任务并暂停后续播报');
+    if (this.now() - task.started_at! >= this.playbackTimeout(task)) {
+      await this.markUncertain('播报超时仍未确认播放结束，已保留任务并暂停后续播报');
       return;
     }
     if (task.result?.generation_mode === 'component') {

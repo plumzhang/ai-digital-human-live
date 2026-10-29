@@ -14,6 +14,7 @@ import { parseAvatarOutput } from '../avatarOutput';
 import { QuestionInputs } from './QuestionInputs';
 import { TaskDialogue } from './TaskDialogue';
 import { LocalPcmSettings } from './LocalPcmSettings';
+import { loadSlotPcmTiming } from '../localPcmSettings';
 import { TtsLog } from './TtsLog';
 import { FilterRules } from './FilterRules';
 import { loadCaptionSettings } from '../captionSettings';
@@ -201,6 +202,7 @@ export function ConsoleApp() {
       initial.recognition = { ...initial.recognition, enabled: true };
       const audioOwner = call<string>('component_audio_open');
       const queue = new InteractionQueue(initial, {
+        playbackTiming: loadSlotPcmTiming,
         persist: snapshot => call('queue_commit', { snapshot }),
         generate: async (task, history, diversity, liveId) => {
           const config = loadModelConfig();
@@ -221,7 +223,7 @@ export function ConsoleApp() {
           await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
           const gesture = avatarActionFor(task);
           await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig(),
-            slotActions: { playback_token: task.playback_token!, reply_delay_ms: task.reply_action_delay_ms ?? 0,
+            slotActions: { playback_token: task.playback_token!, started_at: task.started_at!, ...task.pcm_timing, reply_delay_ms: task.reply_action_delay_ms ?? 0, handoff_delay_ms: task.handoff_action_delay_ms ?? 0,
               handoff: task.handoff_action ? { direction: task.handoff_action.direction, angle_deg: task.handoff_action.angle_deg } : null,
               reply: !task.song_parent&&gesture ? { gesture: gesture.kind, instruction: gesture.instruction } : null } });
           log(`队列回答音频已发送 · ${task.event.nickname}，等待实际播放结束`);
@@ -299,6 +301,14 @@ export function ConsoleApp() {
     void manageQueue(() => interactionQueueRef.current?.configureRecognition(asrEnabled, matchPercent));
   };
   const replyActionDelay = interactionState.reply_action_delay_ms ?? 0;
+  const handoffActionDelay = interactionState.handoff_action_delay_ms ?? 0;
+  const [handoffActionDelayDraft, setHandoffActionDelayDraft] = useState('0');
+  useEffect(() => { setHandoffActionDelayDraft(String(handoffActionDelay)); }, [handoffActionDelay]);
+  const saveHandoffActionDelay = () => {
+    const delay = handoffActionDelayDraft.trim() ? Number(handoffActionDelayDraft) : NaN;
+    if (!Number.isInteger(delay) || delay < 0 || delay > 60000) { setHandoffActionDelayDraft(String(handoffActionDelay)); reportError('承接动作延迟需为0–60000毫秒的整数'); return; }
+    void manageQueue(() => interactionQueueRef.current?.configureHandoffActionDelay(delay));
+  };
   const [replyActionDelayDraft, setReplyActionDelayDraft] = useState('0');
   useEffect(() => { setReplyActionDelayDraft(String(replyActionDelay)); }, [replyActionDelay]);
   const saveReplyActionDelay = () => {
@@ -922,13 +932,20 @@ export function ConsoleApp() {
           <p className="hint">3个槽位固定保留，不因超时或新弹幕替换；完成或手动跳过后前移，再从最新候选补位。手动插歌或测试弹幕会替换槽位3。歌曲占槽位1时，自动回答开启后槽位2、3继续轮转：唱词期间只消费动作，空档允许语音回复。</p>
           {!!interactionState.deferred_tasks?.length && <p className="hint">旧版待补位任务 {interactionState.deferred_tasks.length} 条，已保留为候选。</p>}
           <p className="hint">候选弹幕 {interactionState.candidates.filter(event => event.type === 'chat').length} · 待感谢礼物 {interactionState.candidates.filter(event => event.type === 'gift').length + Object.keys(interactionState.combos).length} · 模型生成 {interactionState.tasks.filter(task => task.status === 'generating').length}/2 · 已播报 {interactionState.totals?.played ?? 0}</p>
-          <LocalPcmSettings/>
           <div className="queue-handoff-controls"><strong>FunASR 本地播报确认</strong><p className="hint">识别 OBS 窗口实际播放的 PCM 声音：长回答比较末尾10字，短回答比较全文，匹配度达标且最后3字一致后结束当前槽位；不再固定等待静音。</p><label>播报结束匹配度（%）<input type="number" min={50} max={100} step={1} disabled={!queueDirectory || queuePlaying} value={recognitionMatchDraft} onChange={event => setRecognitionMatchDraft(event.target.value)} onBlur={saveRecognitionMatch} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><div className="button-row"><button disabled={asrStatus === 'loading' || micEnabled} onClick={() => void checkAsr()}>{asrStatus === 'loading' ? '加载中…' : '检查 FunASR 服务'}</button><span className="hint" role="status">{asrMessage || '请先启动本机语音服务'}</span></div></div>
-          <div className="queue-handoff-controls">
+          <div className="queue-handoff-controls" role="group" aria-label="槽位播放设置">
+            <h3 className="queue-playback-settings-title">槽位播放设置</h3>
             <div className="auto-row"><div><strong>承接动作</strong></div><button className={handoff.enabled ? 'switch on' : 'switch'} disabled={!queueDirectory} aria-label="切换承接动作" aria-pressed={handoff.enabled} onClick={() => void manageQueue(() => interactionQueueRef.current?.configureHandoff(!handoff.enabled, handoff.direction))}><span/></button></div>
-            <div className="fields-row"><label>承接动作方向<select disabled={!handoff.enabled || !queueDirectory} value={handoff.direction} onChange={event => void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, event.target.value as HandoffDirection))}>{HANDOFF_DIRECTIONS.map(direction => <option key={direction.value} value={direction.value}>{direction.label}</option>)}</select></label><label>查看角度（度）<input type="number" min={0} max={90} step={1} disabled={!handoff.enabled || !queueDirectory || handoff.direction === 'front'} value={handoffAngleDraft} onChange={event => setHandoffAngleDraft(event.target.value)} onBlur={saveHandoffAngle} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>回复动作延迟（毫秒）<input type="number" min={0} max={60000} step={100} disabled={!queueDirectory} value={replyActionDelayDraft} onChange={event => setReplyActionDelayDraft(event.target.value)} onBlur={saveReplyActionDelay} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
+            <div className="fields-row"><label>承接动作方向<select disabled={!handoff.enabled || !queueDirectory} value={handoff.direction} onChange={event => void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, event.target.value as HandoffDirection))}>{HANDOFF_DIRECTIONS.map(direction => <option key={direction.value} value={direction.value}>{direction.label}</option>)}</select></label><label>查看角度（度）<input type="number" min={0} max={90} step={1} disabled={!handoff.enabled || !queueDirectory || handoff.direction === 'front'} value={handoffAngleDraft} onChange={event => setHandoffAngleDraft(event.target.value)} onBlur={saveHandoffAngle} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>承接动作延迟（毫秒）<input type="number" min={0} max={60000} step={100} disabled={!handoff.enabled || !queueDirectory} value={handoffActionDelayDraft} onChange={event => setHandoffActionDelayDraft(event.target.value)} onBlur={saveHandoffActionDelay} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
             {handoff.direction === 'front' && <p className="hint">平视前方不使用查看角度，其他方向继续使用已保存的角度。</p>}
-            <p className="hint">每个槽位先提交承接动作，再发送缓存PCM；回复动作从首帧PCM成功发送起计时，0毫秒为同时提交，500毫秒为延后500毫秒。</p>
+            <p className="hint">所有延迟均从上一个槽位切换到当前槽位开始计时，各自独立，不累加。承接动作在其设定延迟后提交。</p>
+            <LocalPcmSettings kind="send"/>
+            <LocalPcmSettings/>
+            <div className="queue-audio-sync-settings">
+              <strong>回复动作</strong>
+              <div className="fields-row"><label>回复动作延迟（毫秒）<input type="number" min={0} max={60000} step={100} disabled={!queueDirectory} value={replyActionDelayDraft} onChange={event => setReplyActionDelayDraft(event.target.value)} onBlur={saveReplyActionDelay} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
+              <p className="hint">从切换到当前槽位开始计时，到设定时间后提交回复动作，与承接动作延迟独立。</p>
+            </div>
           </div>
           <div className="interaction-slots">{Array.from({ length: INTERACTION_SLOT_COUNT }, (_, index) => { const task = interactionState.tasks[index]; const gesture = task?.result && (!task.action_only || task.event.type === 'gift' || task.result.intent === 'action_request') ? avatarActionFor(task) : null; return <div className={task ? 'interaction-slot occupied' : 'interaction-slot'} key={index}>
             <strong>槽位 {index + 1}{task && ' · ' + task.event.nickname}</strong>
@@ -936,8 +953,8 @@ export function ConsoleApp() {
               {task.song && task.status === 'playing' && <p className="hint">{task.song_pcm_active !== false ? '唱词PCM发送中：自动回答开启时，槽位2、3仅消费动作，无动作直接释放。' : '歌词空档：自动回答开启时，允许槽位2、3生成语音；下一段唱词优先打断。'}</p>}{task.song && task.status === 'ready' && <p className="hint">{!session || !ready ? '等待数字人连接就绪' : !rtcJoined ? '等待 OBS 播放窗口连接' : micEnabled || micPending ? '请先关闭麦克风识别' : index > 0 ? '等待前面的槽位播放完成；自动回答关闭时，需先处理前面的弹幕任务' : busy && !queuePlaying ? '等待当前提问结束' : !videoPlaying ? '等待 OBS 实时画面恢复' : '等待 OBS 启动原歌曲，无需开启自动回答'}</p>}
               {task.song && task.status === 'playing' && task.song_playback === 'blocked' && <p className="hint">请在 OBS 窗口点击“恢复播放”，歌曲将从头开始。</p>}
               {!task.song && asrEnabled && ['playing', 'uncertain'].includes(task.status) && <p className="hint">语音识别：{task.recognition?.error ? errorText(task.recognition.error) : task.status === 'uncertain' ? '等待人工确认' : (task.recognition?.progress || 0) * 100 + 1e-9 >= (task.result?.generation_mode === 'component' ? recognitionMatchPercent : handoff.enabled ? handoff.trigger_percent ?? 50 : recognitionMatchPercent) && task.recognition?.ending_matched !== false ? '匹配通过' : !(task.result?.prepared_reply || task.answer?.text) ? '等待回答生成' : '匹配实际回答结尾中'} · 匹配度 {Math.floor((task.recognition?.progress || 0) * 100 + 1e-9)}%{task.result?.generation_mode === 'component' && <span> · 末尾3字{task.recognition?.ending_matched ? '已确认' : '待确认'}</span>}{task.recognition?.text && <span> · {task.recognition.text}</span>}</p>}
-              {!task.song && task.handoff_action && <p className="interaction-action">[承接动作] {handoffActionLabel(task.handoff_action.direction, task.handoff_action.angle_deg)} · {{ waiting: '槽位开始时提交', pending: '正在提交', submitted: '已发送', failed: '发送失败', cancelled: '已取消' }[task.handoff_action.status]}{task.handoff_action.error && <span>：{task.handoff_action.error}</span>}</p>}
-              {gesture && <p className="interaction-action">[回复动作] {gesture.label} · {task.action_state === 'submitted' ? '已发送' : task.action_state === 'failed' ? '发送失败' : task.action_state === 'cancelled' ? '已取消' : task.action_only ? '唱词期间立即提交动作' : `PCM开始后${task.reply_action_delay_ms ?? replyActionDelay}毫秒提交`}{task.action_error && <span>：{task.action_error}</span>}</p>}
+              {!task.song && task.handoff_action && <p className="interaction-action">[承接动作] {handoffActionLabel(task.handoff_action.direction, task.handoff_action.angle_deg)} · {{ waiting: '等待槽位开始', pending: '等待或正在提交', submitted: '已发送', failed: '发送失败', cancelled: '已取消' }[task.handoff_action.status]} · 槽位切换后{task.handoff_action_delay_ms ?? handoffActionDelay}毫秒提交{task.handoff_action.error && <span>：{task.handoff_action.error}</span>}</p>}
+              {gesture && <p className="interaction-action">[回复动作] {gesture.label} · {task.action_state === 'submitted' ? '已发送' : task.action_state === 'failed' ? '发送失败' : task.action_state === 'cancelled' ? '已取消' : task.action_only ? '唱词期间立即提交动作' : `槽位切换后${task.reply_action_delay_ms ?? replyActionDelay}毫秒提交`}{task.action_error && <span>：{task.action_error}</span>}</p>}
               <div className="button-row">{task.status === 'uncertain' && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.finish('played', '操作员确认完成',false,task.id))}>确认完成</button>}{!task.song && ['failed', 'ready'].includes(task.status) && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.retry(task.id))}>重新生成</button>}{['playing', 'uncertain'].includes(task.status) ? <button onClick={() => void skipCurrentQueue(task.id)}>打断并跳过</button> : <button onClick={() => void manageQueue(() => interactionQueueRef.current?.skip(task.id))}>跳过</button>}</div></> : <p className="hint">等待最新候选事件补位</p>}
           </div>; })}</div>{queueDirectory && <p className="hint queue-directory">文件目录：{queueDirectory}</p>}
         </section>

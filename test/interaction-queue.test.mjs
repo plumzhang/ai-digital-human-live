@@ -1986,6 +1986,20 @@ async function startRecognizedComponent(text, extras={}) {
   return {...p,task,sending,output,heard,media};
 }
 
+test('slot timeout includes the configured PCM delay instead of expiring during the scheduled playback window', async () => {
+  const pending = deferred();
+  const p = await startRecognizedComponent('这是一段等待播放的回答。', {
+    playbackTiming: () => ({ send_delay_ms: 5000, play_delay_ms: 10000 }),
+    speak: () => pending.promise,
+  });
+  try {
+    p.advance(61000); p.media(false); await p.engine.tick();
+    assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
+    p.advance(9001); p.media(false); await p.engine.tick();
+    assert.equal(p.engine.snapshot().tasks[0].status, 'uncertain');
+  } finally { pending.resolve(); await p.sending; p.engine.dispose(); }
+});
+
 test('FunASR confirms a component ending without waiting for 1.5 seconds or the silence window', async () => {
   const text='欢迎大家来到直播间，今天一起轻松聊聊天。';
   const p=await startRecognizedComponent(text);
@@ -2041,7 +2055,9 @@ test('FunASR failure keeps the component slot for confirmation instead of fallin
 
 test('each component slot owns its handoff and reply delay, with no end-of-previous-slot wait', async () => {
   const starts=[],legacyHandoffs=[];
+  let timing={send_delay_ms:500,play_delay_ms:800};
   const p=setup(undefined,false,{
+    playbackTiming:()=>({...timing}),
     autoAnswer:false,prepareAudio:async()=>({state:'ready',duration_ms:2000}),retainAudio:async()=>{},
     speak:async(task,live)=>{
       starts.push(structuredClone(task));
@@ -2052,20 +2068,30 @@ test('each component slot owns its handoff and reply delay, with no end-of-previ
   const media=(speaking=false)=>{p.engine.observeVideo('live');p.engine.observeVad({speaking,ended:false,healthy:true,quiet_ms:0},'live');};
   try {
     await p.engine.configureRecognition(true,70);await p.engine.configureHandoff(true,'right_down',3000,35);
+    await p.engine.configureHandoffActionDelay(300);
     await p.engine.configureReplyActionDelay(500);
     const prepared=id=>({...reply('原问题'+id),generation_mode:'component',prepared_for_live:'live',prepared_reply:'这是给观众'+id+'的回答，最后祝你每天都开开心心。'});
     await p.engine.importTestBatch(['A','B'].map(id=>({event:p.event(id),result:prepared(id)})));
     await p.engine.setContext(true,'live',true);await flush();media();await p.engine.tick();await flush();
     assert.equal(starts.length,1);const first=starts[0];
     assert.equal(first.handoff_action.direction,'right_down');assert.equal(first.handoff_action.angle_deg,35);assert.equal(first.reply_action_delay_ms,500);
+    assert.equal(first.handoff_action_delay_ms,300);
+    assert.equal(first.pcm_timing.send_delay_ms,500);assert.equal(first.pcm_timing.play_delay_ms,800);
     const second=p.engine.snapshot().tasks[1];assert.equal(second.handoff_action.status,'waiting');assert.equal(second.prepared_audio.state,'ready');
     // Settings affect future slots, never the active slot's frozen action schedule.
     await p.engine.configureReplyActionDelay(0);
+    await p.engine.configureHandoffActionDelay(900);
+    assert.equal(p.engine.snapshot().tasks[0].handoff_action_delay_ms,300);
+    assert.equal(p.engine.snapshot().tasks[1].handoff_action_delay_ms,900);
+    timing={send_delay_ms:1000,play_delay_ms:1500};
+    assert.equal(p.engine.snapshot().tasks[0].pcm_timing.play_delay_ms,800);
     assert.equal(p.engine.snapshot().tasks[0].reply_action_delay_ms,500);assert.equal(p.engine.snapshot().tasks[1].reply_action_delay_ms,0);
     media(true);
     const heard={live_id:'live',task_id:first.id,capture_id:first.playback_token,enabled:true,text:first.result.prepared_reply,captured_at:p.now(),inference_ms:20};
     await p.engine.observeRecognition(heard);await flush();
     assert.equal(starts.length,2);assert.equal(starts[1].event.event_id,'B');assert.equal(starts[1].reply_action_delay_ms,0);
+    assert.equal(starts[1].handoff_action_delay_ms,900);
+    assert.equal(starts[1].pcm_timing.send_delay_ms,1000);assert.equal(starts[1].pcm_timing.play_delay_ms,1500);
     assert.equal(starts[1].started_at,first.audio_sent_at ?? first.started_at); // No 3000ms legacy cooldown.
     assert.equal(starts[1].handoff_action.status,'pending');assert.deepEqual(legacyHandoffs,[]);
     assert.equal(p.engine.snapshot().history.length,1);assert.equal(p.engine.snapshot().handoff_action,undefined);
@@ -2078,8 +2104,12 @@ test('per-slot action observations reject late callbacks and persist delay acros
   try {
     await p.sending;
     await p.engine.configureReplyActionDelay(500);
-    const reopened=setup(p.engine.snapshot());assert.equal(reopened.engine.snapshot().reply_action_delay_ms,500);reopened.engine.dispose();
-    for(const delay of [-1,60001,0.5,NaN]) await assert.rejects(p.engine.configureReplyActionDelay(delay),/0–60000/);
+    await p.engine.configureHandoffActionDelay(300);
+    const reopened=setup(p.engine.snapshot());assert.equal(reopened.engine.snapshot().reply_action_delay_ms,500);assert.equal(reopened.engine.snapshot().handoff_action_delay_ms,300);reopened.engine.dispose();
+    for(const delay of [-1,60001,0.5,NaN]) {
+      await assert.rejects(p.engine.configureReplyActionDelay(delay),/0–60000/);
+      await assert.rejects(p.engine.configureHandoffActionDelay(delay),/0–60000/);
+    }
     const update={live_id:'live',task_id:p.task.id,playback_token:p.task.playback_token,kind:'reply',state:'submitted'};
     for(const extra of [{live_id:'old'},{task_id:'old'},{playback_token:'old'}]) await p.engine.observeSlotAction({...update,...extra});
     assert.equal(p.engine.snapshot().tasks[0].action_state,'pending');

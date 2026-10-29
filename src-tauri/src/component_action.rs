@@ -10,7 +10,15 @@ type WriteReceipt = oneshot::Receiver<Result<(), String>>;
 pub struct SlotActions {
     playback_token: String,
     #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    send_delay_ms: u64,
+    #[serde(default)]
+    play_delay_ms: u64,
+    #[serde(default)]
     reply_delay_ms: u64,
+    #[serde(default)]
+    handoff_delay_ms: u64,
     handoff: Option<SlotHandoff>,
     reply: Option<SlotReply>,
 }
@@ -26,7 +34,11 @@ struct SlotReply {
 }
 pub(crate) struct PreparedSlotActions {
     pub playback_token: String,
+    pub started_at: u64,
+    pub send_delay_ms: u64,
+    pub play_delay_ms: u64,
     pub reply_delay_ms: u64,
+    pub handoff_delay_ms: u64,
     pub handoff: Option<Value>,
     pub reply: Option<Value>,
 }
@@ -35,9 +47,24 @@ impl SlotActions {
         if uuid::Uuid::parse_str(&self.playback_token).is_err() || self.reply_delay_ms > 60_000 {
             return Err("槽位播放标识或回复动作延迟无效（需0–60000毫秒）".into());
         }
+        if self.handoff_delay_ms > 60_000 {
+            return Err("承接动作延迟无效（需0–60000毫秒）".into());
+        }
+        if self.send_delay_ms > 10_000 || self.play_delay_ms > 10_000 {
+            return Err("PCM发送和本地播放延迟需为0–10000毫秒".into());
+        }
+        let now = crate::unix_ms() as u64;
+        let started_at = self.started_at.unwrap_or(now);
+        if started_at > now + 1000 || now.saturating_sub(started_at) > 120_000 {
+            return Err("槽位开始时间已失效".into());
+        }
         Ok(PreparedSlotActions {
             playback_token: self.playback_token,
+            started_at,
+            send_delay_ms: self.send_delay_ms,
+            play_delay_ms: self.play_delay_ms,
             reply_delay_ms: self.reply_delay_ms,
+            handoff_delay_ms: self.handoff_delay_ms,
             handoff: self
                 .handoff
                 .map(|h| crate::handoff_action_payload(task_id, &h.direction, h.angle_deg))
@@ -117,23 +144,17 @@ pub(crate) async fn submit(
     );
 }
 
-pub(crate) async fn reply_due(
+pub(crate) async fn action_due(
     delay_ms: u64,
-    first_pcm: oneshot::Receiver<tokio::time::Instant>,
+    slot_started: tokio::time::Instant,
     mut finished: watch::Receiver<bool>,
 ) -> bool {
-    let Ok(first) = first_pcm.await else {
-        return false;
-    };
     if *finished.borrow() {
         return false;
     }
-    if delay_ms == 0 {
-        return true;
-    }
     tokio::select! {biased;
         _=finished.changed()=>false,
-        _=tokio::time::sleep_until(first+std::time::Duration::from_millis(delay_ms))=>!*finished.borrow(),
+        _=tokio::time::sleep_until(slot_started+std::time::Duration::from_millis(delay_ms))=>!*finished.borrow(),
     }
 }
 
@@ -306,19 +327,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_and_500ms_delays_start_only_after_the_first_pcm_write_receipt() {
+    async fn zero_and_500ms_delays_use_the_slot_start_without_waiting_for_pcm() {
         for delay in [0, 500] {
-            let (first, received) = oneshot::channel();
             let (_finished, watch) = watch::channel(false);
-            let scheduled = reply_due(delay, received, watch);
-            tokio::pin!(scheduled);
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(20), &mut scheduled)
-                    .await
-                    .is_err()
-            );
             let start = tokio::time::Instant::now();
-            first.send(start).unwrap();
+            let scheduled = action_due(delay, start, watch);
+            tokio::pin!(scheduled);
             if delay > 0 {
                 assert!(tokio::time::timeout(
                     std::time::Duration::from_millis(450),
@@ -337,11 +351,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_reply_is_cancelled_when_audio_ends_or_first_pcm_never_writes() {
-        let (first, received) = oneshot::channel();
+    async fn pending_reply_is_cancelled_when_slot_audio_ends() {
         let (finished, watch) = watch::channel(false);
-        first.send(tokio::time::Instant::now()).unwrap();
-        let scheduled = reply_due(500, received, watch);
+        let scheduled = action_due(500, tokio::time::Instant::now(), watch);
         tokio::pin!(scheduled);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), &mut scheduled)
@@ -350,21 +362,49 @@ mod tests {
         );
         finished.send_replace(true);
         assert!(!scheduled.await);
-        let (first, received) = oneshot::channel();
-        drop(first);
+        let (_finished, watch) = watch::channel(true);
+        assert!(!action_due(0, tokio::time::Instant::now(), watch).await);
+    }
+
+    #[tokio::test]
+    async fn command_setup_time_does_not_restart_the_reply_delay() {
         let (_finished, watch) = watch::channel(false);
-        assert!(!reply_due(0, received, watch).await);
+        let slot_started = tokio::time::Instant::now() - std::time::Duration::from_millis(400);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(300), action_due(500, slot_started, watch)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn handoff_and_reply_use_independent_delays_and_share_cancellation() {
+        let origin = tokio::time::Instant::now();
+        let (finished, watch) = watch::channel(false);
+        let handoff = action_due(100, origin, watch.clone());
+        let reply = action_due(250, origin, watch.clone());
+        let (handoff_due, reply_due) = tokio::time::timeout(std::time::Duration::from_millis(340), async {
+            tokio::join!(handoff, reply)
+        }).await.unwrap();
+        assert!(handoff_due && reply_due);
+        let pending = async { tokio::join!(action_due(500, origin, watch.clone()), action_due(600, origin, watch)) };
+        tokio::pin!(pending);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending).await.is_err());
+        finished.send_replace(true);
+        assert_eq!(pending.await, (false, false));
     }
 
     #[test]
     fn slot_plan_binds_both_actions_to_the_new_slot_and_validates_delay_before_playback() {
-        let input = json!({"playback_token":uuid::Uuid::new_v4().to_string(),"reply_delay_ms":500,
+        let started_at = crate::unix_ms() as u64 - 100;
+        let input = json!({"playback_token":uuid::Uuid::new_v4().to_string(),"started_at":started_at,
+            "send_delay_ms":500,"play_delay_ms":800,"reply_delay_ms":500,"handoff_delay_ms":300,
             "handoff":{"direction":"right_down","angle_deg":35},"reply":{"instruction":"涂一下口红"}});
         let plan = serde_json::from_value::<SlotActions>(input.clone())
             .unwrap()
             .prepare("next-slot")
             .unwrap();
         assert_eq!(plan.reply_delay_ms, 500);
+        assert_eq!(plan.handoff_delay_ms, 300);
+        assert_eq!(plan.started_at, started_at);
+        assert_eq!(plan.send_delay_ms, 500);
+        assert_eq!(plan.play_delay_ms, 800);
         assert_eq!(
             plan.handoff.unwrap()["text_action"]["msg_id"],
             "handoff-next-slot"
@@ -373,6 +413,12 @@ mod tests {
             plan.reply.unwrap()["text_action"]["msg_id"],
             "avatar-action-next-slot"
         );
+        for field in ["send_delay_ms", "play_delay_ms"] {
+            let mut invalid = input.clone(); invalid[field] = json!(10001);
+            assert!(serde_json::from_value::<SlotActions>(invalid).unwrap().prepare("next-slot").is_err());
+        }
+        let mut invalid_handoff = input.clone(); invalid_handoff["handoff_delay_ms"] = json!(60001);
+        assert!(serde_json::from_value::<SlotActions>(invalid_handoff).unwrap().prepare("next-slot").is_err());
         let mut invalid = input;
         invalid["reply_delay_ms"] = json!(60001);
         assert!(serde_json::from_value::<SlotActions>(invalid)
