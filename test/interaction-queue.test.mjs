@@ -6,6 +6,8 @@ import ts from 'typescript';
 import * as pinyinPro from 'pinyin-pro';
 
 const exports = {};
+const diversityExports = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/replyDiversity.ts','utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports: diversityExports });
 const actionsExports = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/giftActions.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
   { exports: actionsExports });
@@ -17,6 +19,7 @@ vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/interactionQueue.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
   { exports, structuredClone, crypto, Date, setTimeout, clearTimeout, require: name => {
     if (name === './whisperRecognition') return recognitionExports;
+    if (name === './replyDiversity') return diversityExports;
     if (name === './avatarOutput') return outputExports;
     assert.equal(name, './giftActions');
     return actionsExports;
@@ -54,6 +57,63 @@ function setup(initial = emptyQueue(), persistError = false, extras = {}) {
   return { engine, jobs, spoken, saved, errors, event, observe, advance: ms => { now += ms; }, now: () => now };
 }
 
+test('collected chat occupies a visible persisted slot before any avatar or automatic reply is enabled', async () => {
+  const changes = [], prepared = [];
+  const p = setup(emptyQueue(), false, { changed: snapshot => changes.push(snapshot), prepareAudio: async task => { prepared.push(task.id); return { state: 'ready' }; } });
+  const event = normalizeInteraction({ id: '18446744073709551614', roomId: 'room', type: 'chat', ts: 1_000_000_000_000, user: { id: '9223372036854775806', nickname: '小宇' }, data: { content: '姐姐你好' } }, p.now());
+  await p.engine.ingest(event); await flush();
+  const task = p.engine.snapshot().tasks[0];
+  assert.equal(task.event.content, '姐姐你好'); assert.equal(task.event.nickname, '小宇'); assert.equal(task.status, 'pending');
+  assert.equal(task.event.event_id, '18446744073709551614'); assert.equal(task.event.user_id, '9223372036854775806');
+  assert.equal(p.saved.at(-1).tasks[0].id, task.id); assert.equal(changes.at(-1).tasks[0].id, task.id);
+  assert.equal(p.jobs.size, 0); assert.equal(prepared.length, 0); assert.equal(p.spoken.length, 0);
+  await p.engine.setContext(false, 'live', true); assert.equal(p.jobs.size, 0);
+  await p.engine.setContext(true, 'live', false); assert.equal(p.jobs.size, 0);
+  await p.engine.setContext(true, 'live', true); assert.ok(p.jobs.has(event.event_id));
+  assert.equal(p.engine.snapshot().tasks[0].id, task.id);
+  p.engine.dispose();
+});
+
+test('a vacant slot immediately takes the newest overflow chat while no avatar is running', async () => {
+  const p = setup();
+  for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
+  await p.engine.ingest(p.event('older')); p.advance(1000); await p.engine.ingest(p.event('newest'));
+  assert.equal(p.engine.snapshot().tasks.length, 3);
+  await p.engine.skip(p.engine.snapshot().tasks[2].id);
+  const state = p.engine.snapshot();
+  assert.equal(state.tasks.length, 3); assert.equal(state.tasks.at(-1).event.event_id, 'newest');
+  assert.equal(state.candidates[0].event_id, 'older'); assert.equal(p.jobs.size, 0); assert.equal(p.spoken.length, 0);
+  p.engine.dispose();
+});
+
+test('chats with equal collector timestamps refill by latest receipt, while a full queue keeps occupied slots', async () => {
+  const p = setup();
+  for (const id of ['A', 'B', 'C', 'older', 'latest']) await p.engine.ingest(p.event(id));
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.event_id), ['A', 'B', 'C']);
+  await p.engine.skip(p.engine.snapshot().tasks[0].id);
+  assert.equal(p.engine.snapshot().tasks.at(-1).event.event_id, 'latest');
+  await p.engine.skip(p.engine.snapshot().tasks[0].id);
+  assert.equal(p.engine.snapshot().tasks.at(-1).event.event_id, 'older');
+  assert.equal(p.engine.snapshot().tasks.length, 3); p.engine.dispose();
+});
+
+test('visible slots stay fixed beyond 30 seconds and gifts wait for a vacancy before fresh chats', async () => {
+  const p = setup();
+  for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
+  const original = p.engine.snapshot().tasks.map(t => t.id);
+  p.advance(29_000); await p.engine.ingest(p.event('fresh'));
+  p.advance(2000); await p.engine.tick();
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.id), original);
+  await p.engine.ingest(p.event('gift', 'gift', { gift: { name: '玫瑰', count: 5, gift_id: 'rose', combo_id: 'group', is_final: true } }));
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.id), original);
+  await p.engine.skip(original[0]);
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.event_id), ['B', 'C', 'gift']);
+  assert.equal(p.engine.snapshot().tasks[2].event.gift.count, 5);
+  await p.engine.skip(original[1]);
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.event_id), ['C', 'gift', 'fresh']);
+  assert.equal(p.jobs.size, 0); assert.equal(p.spoken.length, 0); p.engine.dispose();
+});
+
 function operator(p, send) {
   const sent = [];
   let questions = [];
@@ -83,10 +143,64 @@ function operator(p, send) {
   return { manual, sent, idle, voice, questions: () => questions };
 }
 
-test('operator question reserves the next turn during playback and restores all six interaction slots afterward', async () => {
+test('ABC remains fixed during collection and only advances to BCF when A is skipped', async () => {
+  const p = setup();
+  for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
+  const original = p.engine.snapshot().tasks.map(t => t.id);
+  p.advance(120_000); await p.engine.tick();
+  for (const id of ['D', 'E', 'F']) { p.advance(1); await p.engine.ingest(p.event(id)); }
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.id), original);
+  assert.equal(p.engine.snapshot().history.length, 0);
+  await p.engine.skip(original[0]);
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.event_id), ['B', 'C', 'F']);
+  assert.deepEqual(p.engine.snapshot().tasks.slice(0, 2).map(t => t.id), original.slice(1));
+  assert.equal(p.engine.snapshot().history.length, 1); assert.equal(p.jobs.size, 0); assert.equal(p.spoken.length, 0);
+  p.engine.dispose();
+});
+
+test('waiting candidates expire without removing or regenerating already prepared visible slots', async () => {
+  const initial = emptyQueue();
+  initial.tasks = ['A', 'B', 'C'].map(id => ({ id, status: 'ready', event: { event_id: id, type: 'chat', room_id: 'room', created_at: 100_000, content: id }, result: reply('answer '+id) }));
+  const p = setup(initial);
+  await p.engine.ingest(p.event('expired-overflow')); p.advance(31_000); await p.engine.tick();
+  assert.equal(p.engine.snapshot().candidates.length, 0);
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.result.speech), ['answer A', 'answer B', 'answer C']);
+  assert.ok(p.engine.snapshot().tasks.every(t => t.status === 'ready')); assert.equal(p.jobs.size, 0);
+  await p.engine.ingest(p.event('latest'));
+  await p.engine.skip('A');
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.event_id), ['B', 'C', 'latest']);
+  p.engine.dispose();
+});
+
+test('six-slot migration preserves unfinished playback, deferred gifts and songs across reopening', async () => {
+  const initial = emptyQueue();
+  initial.tasks = ['A', 'B', 'C', 'gift', 'song', 'old-chat'].map((id, i) => ({ id, status: i === 0 ? 'playing' : 'pending', event: { event_id: id, type: i === 3 ? 'gift' : i === 4 ? 'song' : 'chat', room_id: 'room', created_at: 100_000, content: id, ...(i === 3 ? { gift: { name: '花', count: 5, is_final: true } } : {}) }, ...(i === 4 ? { status: 'ready', song: { id: 'saved-song', title: '歌', duration_ms: 1000 } } : {}) }));
+  const p = setup(initial); await p.engine.restore();
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.id), ['A', 'B', 'C']);
+  assert.equal(p.engine.snapshot().tasks[0].status, 'uncertain');
+  assert.deepEqual(p.engine.snapshot().deferred_tasks.map(t => t.id), ['gift', 'song', 'old-chat']);
+  assert.equal(p.saved[0].tasks.length, 3);
+  const q = setup(p.engine.snapshot()); p.engine.dispose(); q.advance(120_000); await q.engine.tick();
+  assert.deepEqual(q.engine.snapshot().deferred_tasks.map(t => t.id), ['gift', 'song']);
+  await q.engine.skip('B'); assert.deepEqual(q.engine.snapshot().tasks.map(t => t.id), ['A', 'C', 'gift']);
+  await q.engine.skip('C'); assert.deepEqual(q.engine.snapshot().tasks.map(t => t.id), ['A', 'gift', 'song']);
+  assert.equal(q.engine.snapshot().tasks[2].song.id, 'saved-song'); assert.equal(q.jobs.size, 0);
+  q.engine.dispose();
+});
+
+test('a legacy unfinished playback outside the first three slots stays visible for confirmation', () => {
+  const initial = emptyQueue();
+  initial.tasks = Array.from({ length: 6 }, (_, i) => ({ id: String(i), status: i === 5 ? 'playing' : 'pending', event: { event_id: String(i), type: 'chat', created_at: 100_000, content: String(i) } }));
+  const p = setup(initial), state = p.engine.snapshot();
+  assert.equal(state.tasks.length, 3); assert.equal(state.tasks[0].id, '5'); assert.equal(state.tasks[0].status, 'uncertain');
+  assert.equal(state.deferred_tasks.length, 3); assert.equal(new Set([...state.tasks, ...state.deferred_tasks].map(t => t.id)).size, 6);
+  p.engine.dispose();
+});
+
+test('operator question reserves the next turn during playback and restores all three interaction slots afterward', async () => {
   const p = setup();
   const m = operator(p);
-  const ids = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const ids = ['A', 'B', 'C'];
   await p.engine.importTestBatch(ids.map(id => ({ event: p.event(id), result: reply(id) })));
   await p.engine.setContext(true, 'live', true);
   await m.idle();
@@ -94,7 +208,7 @@ test('operator question reserves the next turn during playback and restores all 
   m.manual.enqueue('  请挥挥手  ', 'live');
   await m.manual.tick('live', true);
   assert.equal(m.sent.length, 0);
-  assert.equal(p.engine.snapshot().tasks.length, 6);
+  assert.equal(p.engine.snapshot().tasks.length, 3);
   await p.engine.finish('played', 'operator confirmation');
   await m.idle();
   assert.deepEqual(m.sent, [{ content: '请挥挥手', liveId: 'live' }]);
@@ -255,11 +369,11 @@ test('test batch is persisted in input order, retains supplied answers and does 
 test('test import never overwrites existing tasks or pending gifts and rejects invalid sizes', async () => {
   const p = setup();
   const batch = ['A', 'B', 'C'].map(id => ({ event: p.event(id) }));
-  await assert.rejects(p.engine.importTestBatch([]), /1～6/);
-  await assert.rejects(p.engine.importTestBatch(Array.from({ length: 7 }, (_, i) => ({ event: p.event(`overflow-${i}`) }))), /1～6/);
+  await assert.rejects(p.engine.importTestBatch([]), /1～3/);
+  await assert.rejects(p.engine.importTestBatch(Array.from({ length: 4 }, (_, i) => ({ event: p.event(`overflow-${i}`) }))), /1～3/);
   await p.engine.ingest(p.event('existing'));
   await assert.rejects(p.engine.importTestBatch(batch), /待处理任务/);
-  assert.equal(p.engine.snapshot().candidates[0].event_id, 'existing');
+  assert.equal(p.engine.snapshot().tasks[0].event.event_id, 'existing');
   assert.equal(p.errors.length, 0);
   await p.engine.setContext(true, 'live', true);
   assert.ok(p.jobs.has('existing'));
@@ -271,8 +385,8 @@ test('test import never overwrites existing tasks or pending gifts and rejects i
   g.engine.dispose();
 });
 
-test('one through six imported tasks keep input order, fit the slots and remain durable while waiting', async () => {
-  for (let size = 1; size <= 6; size++) {
+test('one through three imported tasks keep input order, fit the slots and remain durable while waiting', async () => {
+  for (let size = 1; size <= 3; size++) {
     const p = setup();
     const ids = Array.from({ length: size }, (_, i) => `task-${i + 1}`);
     await p.engine.importTestBatch(ids.map(id => ({ event: p.event(id), result: reply(id) })));
@@ -288,14 +402,14 @@ test('one through six imported tasks keep input order, fit the slots and remain 
   }
 });
 
-test('six slots include current speech, a seventh waits, only two generations run, and out-of-order results never reorder playback', async () => {
+test('three slots include current speech, a fourth waits, only two generations run, and out-of-order results never reorder playback', async () => {
   const p = setup();
   await p.engine.setContext(true, 'live', true);
-  for (const id of ['A', 'B', 'C', 'D', 'E', 'F']) await p.engine.ingest(p.event(id));
-  assert.equal(p.engine.snapshot().tasks.length, 6);
+  for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
+  assert.equal(p.engine.snapshot().tasks.length, 3);
   assert.equal(p.jobs.size, 2);
   p.jobs.get('B').resolve(reply('B answer')); await flush();
-  for (const id of ['C', 'D', 'E', 'F']) {
+  for (const id of ['C']) {
     assert.ok(p.jobs.has(id));
     assert.equal(p.engine.snapshot().tasks.filter(task => task.status === 'generating').length, 2);
     p.jobs.get(id).resolve(reply(`${id} answer`)); await flush();
@@ -305,12 +419,12 @@ test('six slots include current speech, a seventh waits, only two generations ru
   p.jobs.get('A').resolve(reply('A answer')); await flush();
   assert.deepEqual(p.spoken, ['A']);
   await p.engine.ingest(p.event('G'));
-  assert.equal(p.engine.snapshot().tasks.length, 6);
+  assert.equal(p.engine.snapshot().tasks.length, 3);
   assert.equal(p.engine.snapshot().candidates.length, 1);
   assert.equal(p.engine.snapshot().candidates[0].event_id, 'G');
   assert.ok(!p.jobs.has('G'));
   await p.engine.finish('played', 'test confirmation');
-  assert.equal(p.engine.snapshot().tasks.length, 6);
+  assert.equal(p.engine.snapshot().tasks.length, 3);
   assert.equal(p.engine.snapshot().candidates.length, 0);
   assert.ok(p.jobs.has('G'));
   p.advance(3500); await p.observe();
@@ -677,24 +791,23 @@ test('interrupting during handoff submission preserves the operator skip and can
   p.engine.dispose();
 });
 
-test('gift combo cumulative reports merge once and displace only unplayed chat', async () => {
+test('gift combo merges once and has refill priority without displacing visible chats', async () => {
   const p = setup(); await p.engine.setContext(true, 'live', true);
-  for (const id of ['A', 'B', 'C', 'D', 'E', 'F']) await p.engine.ingest(p.event(id));
+  for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
   p.jobs.get('A').resolve(reply('A')); p.jobs.get('B').resolve(reply('B')); await flush();
   await p.observe(); p.advance(3500); await p.observe();
-  assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
+  const original = p.engine.snapshot().tasks.map(t => t.id);
   const gift = count => ({ name: '玫瑰', count, gift_id: 'rose', combo_id: 'combo1', is_final: count === 10 });
-  for (const count of [1, 5, 10]) await p.engine.ingest(p.event(`gift-${count}`, 'gift', { user_id: 'giver', gift: gift(count), content: `玫瑰×${count}` }));
-  let snapshot = p.engine.snapshot();
-  assert.equal(snapshot.tasks.length, 6);
-  assert.equal(snapshot.tasks[0].event.event_id, 'A');
-  assert.equal(snapshot.tasks[1].event.type, 'gift');
-  assert.equal(snapshot.tasks[1].event.gift.count, 10);
-  assert.ok(snapshot.history.some(entry => entry.reason === '为礼物优先任务让位'));
-  assert.ok(snapshot.history.some(entry => entry.task.event.event_id === 'F'));
+  for (const count of [1, 5, 10]) await p.engine.ingest(p.event('gift-'+count, 'gift', { user_id: 'giver', gift: gift(count), content: '玫瑰×'+count }));
+  await p.engine.ingest(p.event('newest-chat'));
   await p.engine.ingest(p.event('repeat-final', 'gift', { user_id: 'giver', gift: gift(10) }));
-  snapshot = p.engine.snapshot();
-  assert.equal(snapshot.tasks.filter(task => task.event.type === 'gift').length, 1);
+  let snapshot = p.engine.snapshot();
+  assert.deepEqual(snapshot.tasks.map(t => t.id), original); assert.equal(snapshot.history.length, 0);
+  assert.equal(snapshot.candidates.filter(e => e.type === 'gift').length, 1);
+  assert.equal(snapshot.candidates.find(e => e.type === 'gift').gift.count, 10);
+  await p.engine.finish('played', 'confirmed'); snapshot = p.engine.snapshot();
+  assert.deepEqual(snapshot.tasks.map(t => t.event.event_id), ['B', 'C', 'gift-1']);
+  assert.equal(snapshot.tasks[2].event.gift.count, 10); assert.equal(snapshot.candidates[0].event_id, 'newest-chat');
   p.engine.dispose();
 });
 
@@ -708,14 +821,14 @@ test('generation results for preempted tasks are ignored and cannot exceed concu
   p.engine.dispose();
 });
 
-test('chat expires after 30 seconds but pending gifts remain durable', async () => {
-  const p = setup();
-  await p.engine.ingest(p.event('chat'));
+test('occupied chats and gifts both remain durable beyond 30 seconds during collection only', async () => {
+  const p = setup(); await p.engine.ingest(p.event('chat'));
   await p.engine.ingest(p.event('gift', 'gift', { gift: { name: '礼物', count: 1, gift_id: 'g', combo_id: 'c', is_final: true } }));
-  p.advance(31_000); await p.engine.tick();
-  assert.equal(p.engine.snapshot().candidates.length, 1);
-  assert.equal(p.engine.snapshot().candidates[0].type, 'gift');
-  p.engine.dispose();
+  const ids = p.engine.snapshot().tasks.map(t => t.id);
+  p.advance(120_000); await p.engine.tick();
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.id), ids);
+  assert.deepEqual(p.engine.snapshot().tasks.map(t => t.event.type), ['chat', 'gift']);
+  assert.equal(p.engine.snapshot().history.length, 0); assert.equal(p.jobs.size, 0); p.engine.dispose();
 });
 
 test('without playback evidence a spoken task is retained as uncertain instead of consumed by a timeout', async () => {
@@ -918,8 +1031,9 @@ test('gift reports without a group ID use the two-second merge window', async ()
   await p.engine.ingest(p.event('g2', 'gift', { user_id: 'sender', gift: gift(10) }));
   assert.equal(p.engine.snapshot().candidates.length, 0);
   p.advance(2100); await p.engine.tick();
-  assert.equal(p.engine.snapshot().candidates.length, 1);
-  assert.equal(p.engine.snapshot().candidates[0].gift.count, 10);
+  assert.equal(p.engine.snapshot().tasks.length, 1);
+  assert.equal(p.engine.snapshot().tasks[0].event.gift.count, 10);
+  assert.equal(p.engine.snapshot().candidates.length, 0);
   const normalized = normalizeInteraction({ type: 'gift', data: { groupId: '0', giftName: '心心' } });
   assert.equal(normalized.gift.combo_id, '');
   p.engine.dispose();
@@ -930,8 +1044,9 @@ test('cumulative updates may reuse the same event ID before the combo finishes',
   for (const count of [1, 5, 10]) {
     await p.engine.ingest(p.event('same-gift-message', 'gift', { gift: { name: '礼物', count, gift_id: 'g', combo_id: 'same-group', is_final: count === 10 } }));
   }
-  assert.equal(p.engine.snapshot().candidates.length, 1);
-  assert.equal(p.engine.snapshot().candidates[0].gift.count, 10);
+  assert.equal(p.engine.snapshot().tasks.length, 1);
+  assert.equal(p.engine.snapshot().tasks[0].event.gift.count, 10);
+  assert.equal(p.engine.snapshot().candidates.length, 0);
   p.engine.dispose();
 });
 
@@ -1238,7 +1353,7 @@ test('normal recognition uses the configured percentage and still waits for 350m
   }
 });
 
-const songDirector = { id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
+const songDirector = { pcm_ready: true, pcm_segments: [{index:0,start_ms:2000,end_ms:3000,sample_count:24000,pcm_path:'test.pcm'}], id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
 test('manually queued songs start with auto replies off and no remote audio, and never generate pending chat', async () => {
   const p = setup();
   await p.engine.configureRecognition(true);
@@ -1311,14 +1426,19 @@ test('songs remain durable beyond 60 seconds and finish only on their own origin
   assert.equal(p.engine.snapshot().tasks.length, 0); assert.equal(stops.length, 1); assert.equal(actions.length, 0);
   assert.equal(p.engine.snapshot().history[0].outcome, 'played'); p.engine.dispose();
 });
-test('full song queue rejects additions without faulting and gifts cannot displace songs', async () => {
+test('a full song queue replaces only slot three and gifts cannot displace songs', async () => {
   const p = setup();
-  for (let i=0;i<6;i++) await p.engine.enqueueSong({ ...songDirector, id: 'song-'+i });
-  await assert.rejects(p.engine.enqueueSong(songDirector), /槽位已满/);
+  for (let i=0;i<3;i++) await p.engine.enqueueSong({ ...songDirector, id: 'song-'+i });
+  const previous=p.engine.snapshot().tasks.map(t=>t.id);
+  await p.engine.enqueueSong(songDirector);
+  let state=p.engine.snapshot();
+  assert.equal(state.tasks.length,3); assert.deepEqual(state.tasks.slice(0,2).map(t=>t.id),previous.slice(0,2));
+  assert.equal(state.tasks[2].song.id,songDirector.id); assert.equal(state.history.at(-1).task.id,previous[2]);
+  assert.equal(state.history.at(-1).outcome,'skipped');
   await p.engine.ingest(p.event('gift', 'gift', { gift: { name:'花', count:1, gift_id:'flower', combo_id:'combo', is_final:true } }));
   await p.engine.setContext(true, 'live', true);
-  assert.equal(p.engine.snapshot().tasks.length, 6); assert.ok(p.engine.snapshot().tasks.every(t => t.song));
-  assert.equal(p.errors.length, 0); p.engine.dispose();
+  state=p.engine.snapshot();assert.equal(state.tasks.length,3);assert.ok(state.tasks.every(t=>t.song));
+  assert.equal(state.candidates.length,1);assert.equal(p.errors.length,0);p.engine.dispose();
 });
 test('song playback error retains the slot as uncertain and operator skip stops the original audio', async () => {
   const stopped = [];
@@ -1330,6 +1450,48 @@ test('song playback error retains the slot as uncertain and operator skip stops 
   assert.equal(p.engine.snapshot().tasks[0].status,'uncertain'); assert.equal(stopped.length,1);
   await p.engine.finish('skipped','操作员跳过'); assert.equal(stopped.length,2); assert.equal(p.engine.snapshot().history[0].outcome,'skipped');
   p.engine.dispose();
+});
+
+test('inserting a song into prepared slot three releases only the displaced PCM and preserves slots one and two', async () => {
+  const retained=[],prepared=[];
+  const p=setup(undefined,false,{
+    prepareAudio:async task=>{prepared.push(task.id);return {state:'ready',duration_ms:2000};},
+    retainAudio:async(live,tokens)=>retained.push([...tokens]),
+  });
+  await p.engine.importTestBatch(['A','B','C'].map(id=>({event:p.event(id),result:{...reply(id),generation_mode:'component',prepared_reply:'回答'+id,prepared_for_live:'live'}})));
+  await p.engine.setContext(true,'live',true);await flush();
+  const before=p.engine.snapshot().tasks;
+  assert.ok(before.every(t=>t.prepared_audio?.state==='ready'));
+  await p.engine.enqueueSong(songDirector);await flush();
+  const state=p.engine.snapshot();
+  assert.deepEqual(state.tasks.slice(0,2),before.slice(0,2));
+  assert.equal(state.tasks[2].song.id,songDirector.id);assert.equal(state.history.at(-1).task.id,before[2].id);
+  assert.ok(!retained.at(-1).includes(before[2].prepared_audio.token));
+  assert.ok(before.slice(0,2).every(t=>retained.at(-1).includes(t.prepared_audio.token)));
+  assert.equal(prepared.length,3);assert.equal(p.jobs.size,0);assert.equal(p.spoken.length,0);
+  assert.ok(!state.candidates.some(e=>e.event_id==='C'));
+  p.engine.dispose();
+});
+
+test('a replaced generating slot cannot accept its late reply or displace the inserted song', async () => {
+  const p=setup();await p.engine.setContext(true,'live',true);
+  for(const id of ['A','B','C'])await p.engine.ingest(p.event(id));
+  p.jobs.get('B').resolve(reply('B answer'));await flush();assert.ok(p.jobs.has('C'));
+  const before=p.engine.snapshot().tasks;
+  await p.engine.enqueueSong(songDirector);
+  p.jobs.get('C').resolve(reply('discarded late answer'));await flush();
+  const state=p.engine.snapshot();
+  assert.deepEqual(state.tasks.slice(0,2).map(t=>t.id),before.slice(0,2).map(t=>t.id));
+  assert.equal(state.tasks[2].song.id,songDirector.id);
+  assert.ok(!state.tasks.some(t=>t.result?.speech==='discarded late answer'));
+  assert.equal(state.history.at(-1).task.id,before[2].id);assert.equal(p.spoken.length,0);p.engine.dispose();
+});
+
+test('invalid songs never discard the original third slot', async () => {
+  const p=setup();for(const id of ['A','B','C'])await p.engine.ingest(p.event(id));
+  const before=p.engine.snapshot();
+  await assert.rejects(p.engine.enqueueSong({...songDirector,pcm_ready:false}),/截取歌词PCM/);
+  assert.deepEqual(p.engine.snapshot(),before);p.engine.dispose();
 });
 
 
@@ -1456,8 +1618,8 @@ test('restoring old prepared answers regenerates only unsent interactions', () =
     assert.equal(task.answer, undefined); assert.equal(task.action_state, undefined); assert.equal(task.error, undefined);
   }
   assert.equal(state.tasks[2].status, 'uncertain'); assert.equal(state.tasks[2].answer.text, '已收到礼物');
-  assert.equal(state.tasks[3].status, 'ready'); assert.equal(state.tasks[3].result.generation_mode, 'question');
-  assert.equal(state.tasks[4].status, 'ready'); assert.equal(state.history[0].task.result.speech, old.speech);
+  assert.equal(state.deferred_tasks[0].status, 'ready'); assert.equal(state.deferred_tasks[0].result.generation_mode, 'question');
+  assert.equal(state.deferred_tasks[1].status, 'ready'); assert.equal(state.history[0].task.result.speech, old.speech);
   p.engine.dispose();
 });
 
@@ -1530,14 +1692,14 @@ test('closing TTS leaves original song PCM playback running', async () => {
   p.engine.dispose();
 });
 
-test('all six answers keep generating and PCM prepares while the first slot is still transmitting', async () => {
+test('all three answers keep generating and PCM prepares while the first slot is still transmitting', async () => {
   const audio = new Map(), retained = [], started = [], playback = deferred();
   const p = setup(undefined, false, {
     prepareAudio: task => { const job=deferred();audio.set(task.event.event_id,{...job,token:task.prepared_audio.token});return job.promise; },
     retainAudio: async (live,tokens) => retained.push({live,tokens:[...tokens]}),
     speak: async task => { started.push(task.event.event_id); assert.ok(task.result.prepared_reply);assert.equal(task.prepared_audio.state,'ready');await playback.promise; },
   });
-  const ids=['A','B','C','D','E','F'];
+  const ids=['A','B','C'];
   const prepared=id=>({...reply(id),generation_mode:'component',prepared_reply:`回答${id}。`,prepared_for_live:'live'});
   try {
     await p.engine.importTestBatch(ids.map(id=>({event:p.event(id)})));
@@ -1549,11 +1711,15 @@ test('all six answers keep generating and PCM prepares while the first slot is s
     audio.get('A').resolve({state:'ready',duration_ms:3000});await flush();
     assert.deepEqual(started,['A']);assert.ok(audio.has('B'));
     // This must run despite the first native PCM send still awaiting completion.
-    p.jobs.get('C').resolve(prepared('C'));p.jobs.get('D').resolve(prepared('D'));await flush();
-    assert.ok(p.jobs.has('E')&&p.jobs.has('F'));
-    p.jobs.get('E').resolve(prepared('E'));p.jobs.get('F').resolve(prepared('F'));await flush();
+    p.jobs.get('C').resolve(prepared('C'));await flush();
     const state=p.engine.snapshot();assert.equal(state.tasks[0].status,'playing');
     for(const task of state.tasks){assert.ok(task.result.prepared_reply);assert.equal(task.answer,undefined);}
+    for(const id of ['D','E','F']) await p.engine.ingest(p.event(id));
+    const after=p.engine.snapshot();
+    assert.deepEqual(after.tasks.map(t=>t.id),state.tasks.map(t=>t.id));
+    assert.deepEqual(after.tasks.map(t=>t.prepared_audio?.token),state.tasks.map(t=>t.prepared_audio?.token));
+    assert.deepEqual(after.tasks.map(t=>t.result.prepared_reply),state.tasks.map(t=>t.result.prepared_reply));
+    assert.equal(p.jobs.size,3);
     assert.deepEqual(started,['A']);assert.ok(retained.some(r=>r.tokens.includes(audio.get('B').token)));
   } finally { p.engine.dispose();playback.resolve();for(const job of audio.values())job.resolve({state:'cancelled'});await flush(); }
 });
@@ -1629,4 +1795,169 @@ test('changing voice discards late PCM and reuses the prepared answer without an
     assert.equal(p.engine.snapshot().tasks[0].prepared_audio.duration_ms,2000);
     assert.equal(p.spoken.length,0);
   } finally {p.engine.dispose();for(const job of audio)job.resolve({state:'cancelled'});await flush();}
+});
+
+async function startRecognizedComponent(text, extras={}) {
+  const p=setup(undefined,false,{autoAnswer:false,...extras});
+  await p.engine.configureRecognition(true,70);
+  await p.engine.importTestBatch([{event:p.event('component'),result:{...reply('原问题'),generation_mode:'component',prepared_reply:text,prepared_for_live:'live'}}]);
+  await p.engine.setContext(true,'live',true);
+  p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true,quiet_ms:0},'live');
+  const sending=p.engine.tick();await flush();
+  const task=p.engine.snapshot().tasks[0];
+  const output=(speech,final=true)=>p.engine.observeOutput({live_id:'live',request_id:task.id,text:speech,received_at:p.now(),final});
+  const heard=(speech,extra={})=>p.engine.observeRecognition({live_id:'live',task_id:task.id,capture_id:task.playback_token,enabled:true,text:speech,captured_at:p.now(),inference_ms:20,...extra});
+  const media=(speaking=true,healthy=true)=>{p.engine.observeVideo('live');p.engine.observeVad({speaking,ended:false,healthy,quiet_ms:0},'live');};
+  return {...p,task,sending,output,heard,media};
+}
+
+test('FunASR confirms a component ending without waiting for 1.5 seconds or the silence window', async () => {
+  const text='欢迎大家来到直播间，今天一起轻松聊聊天。';
+  const p=await startRecognizedComponent(text);
+  try {
+    await p.sending;await p.output(text);p.media();
+    await p.heard(text);
+    const state=p.engine.snapshot();assert.equal(state.tasks.length,0);assert.equal(state.history[0].outcome,'played');
+    assert.match(state.history[0].reason,/FunASR/);assert.equal(state.history[0].task.recognition.ending_matched,true);
+    assert.equal(p.now()-state.history[0].task.audio_sent_at,0);
+  } finally {p.engine.dispose();}
+});
+
+test('a component cannot complete from a first-sentence match, omitted final words or VAD silence alone', async () => {
+  const text='先跟你打个招呼。接下来甲乙丙丁戊己庚辛壬癸。';
+  const p=await startRecognizedComponent(text);
+  try {
+    await p.sending;p.media();await p.output('先跟你打个招呼。',false);await p.heard('先跟你打个招呼。');
+    assert.equal(p.engine.snapshot().tasks[0].status,'playing');assert.equal(p.engine.snapshot().tasks[0].recognition.matched,false);
+    await p.output(text);await p.heard('甲乙丙丁戊己庚');
+    assert.equal(p.engine.snapshot().tasks[0].recognition.progress,0.7);assert.equal(p.engine.snapshot().tasks[0].recognition.ending_matched,false);
+    p.advance(2000);p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:2000},'live');await p.engine.tick();
+    assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+    await p.heard('甲乙丙丁戊己庚辛壬癸');assert.equal(p.engine.snapshot().history[0].outcome,'played');
+  } finally {p.engine.dispose();}
+});
+
+test('component ending evidence must follow all PCM writes and belong to the current healthy capture', async () => {
+  const sent=deferred(),text='这是完整回答，最后祝你每天都开开心心。';
+  const p=await startRecognizedComponent(text,{speak:()=>sent.promise});
+  try {
+    p.media();await p.output(text);await p.heard(text);assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+    p.advance(1);sent.resolve();await p.sending;await flush();
+    assert.equal(p.engine.snapshot().tasks[0].status,'playing'); // The earlier capture cannot finish after a late send acknowledgement.
+    p.media();
+    for(const extra of [{live_id:'other'},{task_id:'other'},{capture_id:'other'},{captured_at:p.task.started_at-1}]) await p.heard(text,extra);
+    assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+    p.media(true,false);await p.heard(text);assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+    p.media();p.advance(2100);await p.heard(text);assert.equal(p.engine.snapshot().tasks[0].status,'playing'); // Media is stale.
+    p.media();await p.heard(text);assert.equal(p.engine.snapshot().history[0].outcome,'played');
+  } finally {p.engine.dispose();sent.resolve();await p.sending;}
+});
+
+test('FunASR failure keeps the component slot for confirmation instead of falling back to silence', async () => {
+  const p=await startRecognizedComponent('欢迎来到直播间，祝大家晚上开心。');
+  try {
+    await p.sending;p.media();await p.output(p.task.result.prepared_reply);
+    await p.heard('',{error:'FunASR unavailable'});
+    assert.equal(p.engine.snapshot().tasks[0].status,'uncertain');assert.equal(p.engine.snapshot().history.length,0);
+    p.advance(3000);p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:3000},'live');await p.engine.tick();
+    assert.equal(p.engine.snapshot().tasks[0].status,'uncertain');
+  } finally {p.engine.dispose();}
+});
+
+test('each component slot owns its handoff and reply delay, with no end-of-previous-slot wait', async () => {
+  const starts=[],legacyHandoffs=[];
+  const p=setup(undefined,false,{
+    autoAnswer:false,prepareAudio:async()=>({state:'ready',duration_ms:2000}),retainAudio:async()=>{},
+    speak:async(task,live)=>{
+      starts.push(structuredClone(task));
+      await p.engine.observeOutput({live_id:live,request_id:task.id,text:task.result.prepared_reply,received_at:p.now(),final:true});
+    },
+    handoff:async task=>legacyHandoffs.push(task.id),
+  });
+  const media=(speaking=false)=>{p.engine.observeVideo('live');p.engine.observeVad({speaking,ended:false,healthy:true,quiet_ms:0},'live');};
+  try {
+    await p.engine.configureRecognition(true,70);await p.engine.configureHandoff(true,'right_down',3000,35);
+    await p.engine.configureReplyActionDelay(500);
+    const prepared=id=>({...reply('原问题'+id),generation_mode:'component',prepared_for_live:'live',prepared_reply:'这是给观众'+id+'的回答，最后祝你每天都开开心心。'});
+    await p.engine.importTestBatch(['A','B'].map(id=>({event:p.event(id),result:prepared(id)})));
+    await p.engine.setContext(true,'live',true);await flush();media();await p.engine.tick();await flush();
+    assert.equal(starts.length,1);const first=starts[0];
+    assert.equal(first.handoff_action.direction,'right_down');assert.equal(first.handoff_action.angle_deg,35);assert.equal(first.reply_action_delay_ms,500);
+    const second=p.engine.snapshot().tasks[1];assert.equal(second.handoff_action.status,'waiting');assert.equal(second.prepared_audio.state,'ready');
+    // Settings affect future slots, never the active slot's frozen action schedule.
+    await p.engine.configureReplyActionDelay(0);
+    assert.equal(p.engine.snapshot().tasks[0].reply_action_delay_ms,500);assert.equal(p.engine.snapshot().tasks[1].reply_action_delay_ms,0);
+    media(true);
+    const heard={live_id:'live',task_id:first.id,capture_id:first.playback_token,enabled:true,text:first.result.prepared_reply,captured_at:p.now(),inference_ms:20};
+    await p.engine.observeRecognition(heard);await flush();
+    assert.equal(starts.length,2);assert.equal(starts[1].event.event_id,'B');assert.equal(starts[1].reply_action_delay_ms,0);
+    assert.equal(starts[1].started_at,first.audio_sent_at ?? first.started_at); // No 3000ms legacy cooldown.
+    assert.equal(starts[1].handoff_action.status,'pending');assert.deepEqual(legacyHandoffs,[]);
+    assert.equal(p.engine.snapshot().history.length,1);assert.equal(p.engine.snapshot().handoff_action,undefined);
+    await p.engine.observeRecognition(heard);assert.equal(starts.length,2);
+  } finally {p.engine.dispose();}
+});
+
+test('per-slot action observations reject late callbacks and persist delay across reopening', async () => {
+  const p=await startRecognizedComponent('这是完整回答，祝你天天开开心心。');
+  try {
+    await p.sending;
+    await p.engine.configureReplyActionDelay(500);
+    const reopened=setup(p.engine.snapshot());assert.equal(reopened.engine.snapshot().reply_action_delay_ms,500);reopened.engine.dispose();
+    for(const delay of [-1,60001,0.5,NaN]) await assert.rejects(p.engine.configureReplyActionDelay(delay),/0–60000/);
+    const update={live_id:'live',task_id:p.task.id,playback_token:p.task.playback_token,kind:'reply',state:'submitted'};
+    for(const extra of [{live_id:'old'},{task_id:'old'},{playback_token:'old'}]) await p.engine.observeSlotAction({...update,...extra});
+    assert.equal(p.engine.snapshot().tasks[0].action_state,'pending');
+    await p.engine.observeSlotAction(update);assert.equal(p.engine.snapshot().tasks[0].action_state,'submitted');
+    await p.engine.finish('skipped','操作员跳过');
+    await p.engine.observeSlotAction({...update,state:'failed',error:'late'});
+    assert.equal(p.engine.snapshot().history[0].task.action_state,'submitted');
+  } finally {p.engine.dispose();}
+});
+
+
+test('concurrent component replies are checked at commit time and duplicates never reach TTS before rewriting', async () => {
+  const rewrites=[],tts=[];
+  const p=setup(undefined,false,{
+    autoAnswer:false,prepareAudio:async task=>{tts.push(task.result.prepared_reply);return {state:'ready'};},retainAudio:async()=>{},
+    rewriteReply:(task,draft,history,diversity)=>{const job=deferred();rewrites.push({...job,task,draft,history,diversity});return job.promise;},
+  });
+  const prepared=(id,text)=>({...reply(id),generation_mode:'component',prepared_reply:text,prepared_for_live:'live',gesture:'heart'});
+  try {
+    await p.engine.importTestBatch(['A','B'].map(id=>({event:p.event(id)})));await p.engine.setContext(true,'live',true);
+    assert.deepEqual(Array.from(p.jobs.get('A').diversity.recentOpenings),[]);assert.deepEqual(Array.from(p.jobs.get('B').diversity.recentOpenings),[]);
+    p.jobs.get('A').resolve(prepared('A','哎呀，这五朵玫瑰一送过来，直播间都香起来啦。'));
+    p.jobs.get('B').resolve(prepared('B','哎呀，怎么啦，这是来打听姐姐的感情八卦呀？'));await flush();
+    assert.equal(rewrites.length,1);assert.equal(p.engine.snapshot().tasks[1].status,'generating');assert.match(p.engine.snapshot().tasks[1].generation_note,/开头重复/);
+    assert.equal(tts.length,1);assert.equal(rewrites[0].history.length,0);assert.match(rewrites[0].diversity.recentOpenings[0],/^哎呀/);
+    rewrites[0].resolve({...rewrites[0].draft,prepared_reply:'专门来打听姐姐的感情八卦啦？'});await flush();
+    assert.equal(p.engine.snapshot().tasks[1].status,'ready');assert.equal(p.engine.snapshot().tasks[1].generation_note,undefined);
+    assert.equal(tts.length,2);assert.match(tts[1],/^专门/);assert.equal(p.engine.snapshot().tasks[1].result.gesture,'heart');
+  } finally {p.engine.dispose();for(const job of rewrites)job.resolve({...job.draft,prepared_reply:'迟到结果'});await flush();}
+});
+
+test('restored duplicate ready replies are rewritten before synthesis and repeated rewrite failures stay visible', async () => {
+  const initial=emptyQueue();initial.tasks=['A','B'].map((id,i)=>({id,event:{event_id:id,type:'chat',nickname:id,user_id:id,content:id,created_at:100000,source:'test'},status:i?'ready':'uncertain',live_id:'live',
+    result:{...reply(id),generation_mode:'component',prepared_reply:'哎呀，这个问题很有意思。',prepared_for_live:'live'},prepared_audio:{token:'obsolete',live_id:'live',state:'ready'}}));
+  const tts=[],rewrites=[];
+  const p=setup(initial,false,{prepareAudio:async task=>{tts.push(task.id);return {state:'ready'};},retainAudio:async()=>{},rewriteReply:async(task,draft)=>{rewrites.push(task.id);return {...draft,prepared_reply:'哎哟，这个问题很有意思。'};}});
+  try {
+    await p.engine.setContext(true,'live',true);await flush();
+    assert.equal(rewrites.length,3);assert.deepEqual(tts,[]);const task=p.engine.snapshot().tasks[1];
+    assert.equal(task.status,'failed');assert.match(task.error,/开头连续重复/);assert.equal(task.prepared_audio,undefined);
+    assert.equal(p.engine.snapshot().tasks[0].status,'uncertain');
+  } finally {p.engine.dispose();}
+});
+
+test('a skipped slot cannot accept a late rewritten reply or synthesize its discarded PCM', async () => {
+  const initial=emptyQueue();initial.history=[{outcome:'played',task:{id:'previous',event:{nickname:'之前的观众'},answer:{text:'哎呀，礼物收到了。'}}}];
+  const rewrite=deferred(),tts=[];
+  const p=setup(initial,false,{prepareAudio:async task=>{tts.push(task.id);return {state:'ready'};},retainAudio:async()=>{},rewriteReply:()=>rewrite.promise});
+  try {
+    await p.engine.importTestBatch([{event:p.event('A')}]);await p.engine.setContext(true,'live',true);
+    p.jobs.get('A').resolve({...reply('A'),generation_mode:'component',prepared_reply:'哎呀，这个问题真有意思。',prepared_for_live:'live'});await flush();
+    const id=p.engine.snapshot().tasks[0].id;assert.equal(p.engine.snapshot().tasks[0].status,'generating');await p.engine.skip(id);
+    rewrite.resolve({...reply('A'),generation_mode:'component',prepared_reply:'专门来关心姐姐呀。',prepared_for_live:'live'});await flush();
+    assert.equal(p.engine.snapshot().tasks.length,0);assert.deepEqual(tts,[]);
+  } finally {p.engine.dispose();rewrite.resolve({...reply('A'),prepared_reply:'迟到'});await flush();}
 });

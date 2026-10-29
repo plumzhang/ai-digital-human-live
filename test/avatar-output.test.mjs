@@ -43,3 +43,10 @@ test('prefetched replies are visible before playback and do not claim to have be
  assert.match(textOf(ui.TaskDialogue({ task })), /正在预合成声音/);
  assert.equal(task.answer, undefined);
 });
+
+test('collected slots show the question and the actual readiness reason before any reply exists', () => {
+  const task = { status: 'pending', event: { content: '姐姐你好' } };
+  assert.equal(textOf(ui.TaskDialogue({ task, waitingReason: '等待数字人就绪后生成回答…' })), '问：姐姐你好答：等待数字人就绪后生成回答…');
+  assert.match(textOf(ui.TaskDialogue({ task, waitingReason: '等待开启自动回答后生成回答…' })), /等待开启自动回答后生成回答/);
+  assert.match(textOf(ui.TaskDialogue({ task: { ...task, result: { prepared_reply: '你好呀。' } }, waitingReason: '等待数字人就绪后生成回答…' })), /答：你好呀。/);
+});

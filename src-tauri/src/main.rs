@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod douyin_live;
 mod model_api;
 mod obs_window;
 mod queue_store;
@@ -7,6 +8,7 @@ mod signal_trace;
 mod tts_log;
 mod songs;
 mod song_director;
+mod song_pcm;
 mod whisper;
 mod speech_runtime;
 mod speech_stt;
@@ -18,7 +20,7 @@ mod prepared_speech;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::PathBuf, process::{Child, Command, Stdio}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::{mpsc::{unbounded_channel, UnboundedSender}, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, http::HeaderValue, Message}};
@@ -63,7 +65,6 @@ mod single_instance {
 
 #[derive(Default)]
 struct AppState {
-    dyhub: Mutex<Option<Child>>,
     session: Mutex<Option<Session>>,
     creating_session: AtomicBool,
 }
@@ -118,7 +119,7 @@ where W: futures_util::Sink<Message> + Unpin, W::Error: std::fmt::Display {
 }
 
 #[derive(Serialize, Clone)]
-struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String }
+struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String, ready: bool }
 
 #[derive(Deserialize)]
 struct AvatarSettings {
@@ -195,7 +196,7 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Token {}", key)).map_err(|e| e.to_string())?);
     let (sender, mut receiver) = unbounded_channel::<Outbound>();
-    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: "qwen3_tts".into() };
+    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: "qwen3_tts".into(), ready: false };
     let task_conn_id = conn_id.clone();
     *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id: conn_id.clone(), key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: "qwen3_tts".into(), ready: false, speaking: false, external_audio: None, conversation: Vec::new(), speech_cancel: tokio::sync::watch::channel(0).0, tts: avatar.tts, llm: avatar.llm, persona: avatar.persona });
     // Retain the live ID before connecting so a failed handshake can still be
@@ -502,7 +503,7 @@ fn playback_frame(state: State<'_, AppState>, live_id: String) -> Result<(), Str
 
 #[tauri::command]
 fn session_snapshot(state: State<'_, AppState>) -> Result<Option<SessionSnapshot>, String> {
-    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone(), voice_provider: s.voice_provider.clone() }))
+    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone(), voice_provider: s.voice_provider.clone(), ready: s.ready }))
 }
 
 #[tauri::command]
@@ -532,71 +533,6 @@ async fn open_obs_window(app: tauri::AppHandle) -> Result<(), String> {
     window.center().map_err(|e| e.to_string())?;
     window.show().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn dyhub_paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), String> {
-    let resource = app.path().resource_dir().map_err(|e| e.to_string())?;
-    let packaged = resource.join("dyhub");
-    let node = resource.join("node.exe");
-    if packaged.join("dist/index.js").exists() && node.exists() { return Ok((packaged, node)); }
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vendor/dyhub");
-    if source.join("dist/index.js").exists() { return Ok((source, PathBuf::from("node"))); }
-    Err("未找到 dyhub 构建产物。请先运行 npm run prepare:dyhub".into())
-}
-
-#[tauri::command]
-async fn start_dyhub(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    {
-        let mut guard = state.dyhub.lock().map_err(|e| e.to_string())?;
-        if let Some(child) = guard.as_mut() {
-            if child.try_wait().map_err(|e| e.to_string())?.is_none() { return Ok("running".into()); }
-            *guard = None;
-        }
-    }
-    if reqwest::get("http://127.0.0.1:8757/api/stats").await.is_ok() { return Ok("external".into()); }
-    let (dir, node) = dyhub_paths(&app)?;
-    let mut command = Command::new(node);
-    command.arg(dir.join("dist/index.js")).current_dir(&dir)
-        .env("DYHUB_HOST", "127.0.0.1").env("DYHUB_PORT", "8757")
-        .env("DYHUB_COLLECTOR", "browser").stdout(Stdio::null()).stderr(Stdio::null());
-    #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
-    let child = command.spawn().map_err(|e| format!("启动 dyhub 失败: {e}"))?;
-    *state.dyhub.lock().map_err(|e| e.to_string())? = Some(child);
-    for _ in 0..30 {
-        if reqwest::get("http://127.0.0.1:8757/api/stats").await.is_ok() { return Ok("running".into()); }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    Err("dyhub 启动超时，请检查本机 Chrome 和端口 8757".into())
-}
-
-#[tauri::command]
-fn stop_dyhub(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(mut child) = state.dyhub.lock().map_err(|e| e.to_string())?.take() {
-        #[cfg(windows)] {
-            use std::os::windows::process::CommandExt;
-            let _ = Command::new("taskkill").args(["/PID", &child.id().to_string(), "/T", "/F"])
-                .creation_flags(0x08000000).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn dyhub_connect(room_id: String) -> Result<Value, String> {
-    let room_id = room_id.trim();
-    if room_id.is_empty() { return Err("请输入直播间号".into()); }
-    let response = reqwest::Client::new().post("http://127.0.0.1:8757/api/rooms/connect")
-        .json(&json!({"roomId":room_id})).send().await.map_err(|e| e.to_string())?;
-    response_json(response).await
-}
-
-#[tauri::command]
-async fn dyhub_disconnect(room_id: String) -> Result<Value, String> {
-    let response = reqwest::Client::new().post(format!("http://127.0.0.1:8757/api/rooms/{}/disconnect", room_id))
-        .send().await.map_err(|e| e.to_string())?;
-    response_json(response).await
 }
 
 #[tauri::command]
@@ -739,7 +675,7 @@ fn open_voice_document(provider: String) -> Result<(), String> {
     }
     #[cfg(not(windows))] {
         let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        Command::new(opener).arg(url).spawn().map(|_| ()).map_err(|error| format!("无法打开系统默认浏览器：{error}"))
+        std::process::Command::new(opener).arg(url).spawn().map(|_| ()).map_err(|error| format!("无法打开系统默认浏览器：{error}"))
     }
 }
 
@@ -748,6 +684,7 @@ fn main() {
     let Some(_instance_guard) = single_instance::Guard::acquire() else { return; };
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(douyin_live::DouyinRuntime::default())
         .manage(prepared_speech::PreparedSpeech::default())
         .manage(queue_store::QueueStorage::default())
         .manage(songs::SongManager::default())
@@ -755,6 +692,9 @@ fn main() {
         .manage(speech_runtime::LocalTtsRuntime::default())
         .manage(song_director::DirectorRuntime::default())
         .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
+                window.app_handle().state::<douyin_live::DouyinRuntime>().shutdown();
+            }
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     let app = window.app_handle().clone();
@@ -782,7 +722,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![prepared_speech::component_audio_open, prepared_speech::component_audio_retain, prepared_speech::component_prepare_audio, prepared_speech::component_play_prepared, component::component_prepare_reply, speech_runtime::component_local_status, speech_runtime::component_stop_local, component::component_tts_preview, speech_runtime::component_start_local, component::component_audio_begin, component::component_audio_push, component::component_transcription, component::component_local_voice, component::component_preflight, component::component_respond, component::component_configure, create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, start_dyhub, stop_dyhub, dyhub_connect, dyhub_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, speech_stt::speech_prepare, speech_stt::speech_transcribe, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
+        .invoke_handler(tauri::generate_handler![prepared_speech::component_audio_open, prepared_speech::component_audio_retain, prepared_speech::component_prepare_audio, prepared_speech::component_play_prepared, component::component_prepare_reply, speech_runtime::component_local_status, speech_runtime::component_stop_local, component::component_tts_preview, speech_runtime::component_start_local, component::component_audio_begin, component::component_audio_push, component::component_transcription, component::component_local_voice, component::component_preflight, component::component_respond, component::component_configure, create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, douyin_live::douyin_connect, douyin_live::douyin_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, speech_stt::speech_prepare, speech_stt::speech_transcribe, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_prepare_pcm, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }

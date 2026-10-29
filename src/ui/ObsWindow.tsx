@@ -61,6 +61,8 @@ export function ObsWindow() {
     if (videoRef.current) resizeObserver?.observe(videoRef.current);
     let detachRtcListeners: (() => void) | null = null;
     const downlinks = new Map<string, { token: object; bytes?: number; progressAt: number; activity: VadActivity }>();
+    let videoSubscribed = false;
+    let audioSubscribed = false;
     let song: { identity: SongPlaybackIdentity; player?: SongDirectorPlayer } | undefined;
     let songCleanup = Promise.resolve();
     const stopSong = async () => {
@@ -109,6 +111,7 @@ export function ObsWindow() {
       liveIdRef.current = null;
       lastFrameRef.current = { time: -1, reportedAt: 0 };
       joinedRef.current = false;
+      videoSubscribed = false; audioSubscribed = false;
       await emit('rtc-status', { joined: false });
       await emit('rtc-media-status', { kind: 'video', subscribed: false });
       await emit('rtc-media-status', { kind: 'audio', subscribed: false });
@@ -179,7 +182,9 @@ export function ObsWindow() {
       rtc.setDefaultSubscribeAllRemoteVideoStreams(true);
       rtc.setDefaultSubscribeAllRemoteAudioStreams(true);
       const onVideoSubscribe = (uid: string, _old: number, next: number) => {
-        void emit('rtc-media-status', { kind: 'video' satisfies MediaKind, subscribed: next === 3 });
+        if (disposed || rtcRef.current !== rtc || liveIdRef.current !== snapshot.live_id) return;
+        videoSubscribed = next === 3;
+        void emit('rtc-media-status', { live_id: snapshot.live_id, kind: 'video' satisfies MediaKind, subscribed: videoSubscribed });
         if (next === 3 && videoRef.current) {
           rtc.setRemoteViewConfig(videoRef.current, uid, 1);
           setStatus('视频已订阅，等待首帧');
@@ -194,8 +199,10 @@ export function ObsWindow() {
         void emit('rtc-status', { live_id: snapshot.live_id, joined: joinedRef.current, error: reason || '视频播放失败' });
       };
       const onAudioSubscribe = (_uid: string, _old: number, next: number) => {
+        if (disposed || rtcRef.current !== rtc || liveIdRef.current !== snapshot.live_id) return;
+        audioSubscribed = next === 3;
         if (song) rtc.muteAllRemoteAudioPlaying(true);
-        void emit('rtc-media-status', { kind: 'audio' satisfies MediaKind, subscribed: next === 3 });
+        void emit('rtc-media-status', { live_id: snapshot.live_id, kind: 'audio' satisfies MediaKind, subscribed: audioSubscribed });
         if (!_uid || _uid === snapshot.rtc.user_id) return;
         downlinkMonitorsRef.current.get(_uid)?.dispose();
         downlinkMonitorsRef.current.delete(_uid);
@@ -256,7 +263,7 @@ export function ObsWindow() {
         await rtc.joinChannel(snapshot.rtc.token, snapshot.rtc.user_id);
         if (disposed || rtcRef.current !== rtc) { await rtc.leaveChannel(); return; }
         joinedRef.current = true;
-        await emit('rtc-status', { joined: true });
+        await emit('rtc-status', { live_id: snapshot.live_id, joined: true });
         if (!videoRef.current?.videoWidth) setStatus('已入会，等待数字人画面');
         await reportMic(false);
         await emit('queue-caption-request', { live_id: snapshot.live_id });
@@ -294,10 +301,15 @@ export function ObsWindow() {
           try {
             const director = await invoke<SongDirector>('director_get', { id: control.song_id });
             if (song !== currentSong || disposed || control.live_id !== liveIdRef.current) return;
-            if (director.status !== 'ready' || !director.available || !director.cues.length) throw new Error('歌曲导播或原歌曲文件不可用');
+            if (director.status !== 'ready' || !director.available || !director.cues.length || !director.pcm_ready || !director.pcm_segments?.length) throw new Error('请先在唱歌模块按歌词时间轴截取PCM');
             whisper.start();
             const rtc = rtcRef.current!;
-            const audio = new Audio(convertFileSrc(director.audio_path)); audio.preload = 'auto';
+            const audio = new Audio();
+            // The asset endpoint is a different origin. This must be set before
+            // src, otherwise Web Audio's optional lead path produces silence.
+            audio.crossOrigin = 'anonymous'; audio.preload = 'auto';
+            audio.muted = false; audio.volume = 1;
+            audio.src = convertFileSrc(director.audio_path);
             let bridge: Awaited<ReturnType<typeof createSongAudioBridge>> | undefined;
             const player = new SongDirectorPlayer(audio, director.cues, {
               mute: muted => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(muted); },
@@ -307,13 +319,16 @@ export function ObsWindow() {
                 await invoke('interrupt_session', { liveId: control.live_id });
                 if (song !== currentSong || disposed || liveIdRef.current !== control.live_id) throw new Error('歌曲已取消');
                 await invoke('component_audio_begin', { liveId: control.live_id, token: control.playback_token });
-                bridge = await createSongAudioBridge(audio,
+                bridge = await createSongAudioBridge(audio, director.pcm_segments!, async path => {
+                  const response = await fetch(convertFileSrc(path)); if (!response.ok) throw new Error('无法读取歌词PCM片段'); return response.arrayBuffer();
+                }, director.pcm_lead_ms ?? 0,
                   (samples, sequence) => invoke('component_audio_push', { liveId: control.live_id, token: control.playback_token, sequence, samples }),
                   error => { void player.stop('error', error); });
                 if (song !== currentSong || disposed) { bridge.dispose(); throw new Error('歌曲已取消'); }
               },
               activateAudio: () => bridge?.resume() || Promise.resolve(),
               cleanup: () => bridge?.dispose(),
+              drain: () => bridge?.drain() || Promise.resolve(),
               observe: observation => {
                 void invoke('tts_log_song_observation', { liveId: control.live_id, msgId: `tts-${control.playback_token}-${observation.index}`, observation })
                   .catch(error => { if (!disposed) setStatus(`歌曲同步日志保存失败：${String(error)}`); });
@@ -339,6 +354,14 @@ export function ObsWindow() {
         }).catch(error => { void emit('song-playback-state', { ...control, state: 'error', error: String(error) }); });
       }));
       unlisteners.push(await listen<Snapshot>('session-changed', e => enqueue(() => join(e.payload))));
+      unlisteners.push(await listen<{ live_id: string; include_mic?: boolean }>('rtc-status-request', async event => {
+        if (disposed || event.payload.live_id !== liveIdRef.current) return;
+        const live_id = event.payload.live_id;
+        await emit('rtc-status', { live_id, joined: joinedRef.current });
+        await emit('rtc-media-status', { live_id, kind: 'video', subscribed: videoSubscribed });
+        await emit('rtc-media-status', { live_id, kind: 'audio', subscribed: audioSubscribed });
+        if (event.payload.include_mic) await emit('mic-state', { live_id, enabled: micRef.current });
+      }));
       unlisteners.push(await listen<{ live_id?: string }>('session-ended', event => {
         const endedId = event.payload?.live_id;
         enqueue(async () => {

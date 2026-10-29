@@ -2,10 +2,7 @@ import { INTERACTION_SLOT_COUNT, type GeneratedReply, type InteractionEvent } fr
 
 export const defaultTestDanmaku = `[弹幕][小杰] 姐姐今天好漂亮啊//等待生成
 [礼物][阿豪][玫瑰×5]//等待生成
-[弹幕][小宇] 姐姐你有男朋友吗？//等待生成
-[弹幕][宝子] 札一下马尾//等待生成
-[弹幕][空白] 涂一下口红//等待生成
-[弹幕][大哥] 你叫什么名字//等待生成`;
+[弹幕][小宇] 姐姐你有男朋友吗？//等待生成`;
 
 export type TestDanmaku = { type: 'chat' | 'gift'; nickname: string; content: string; gift?: InteractionEvent['gift']; result?: GeneratedReply };
 

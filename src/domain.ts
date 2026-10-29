@@ -24,7 +24,7 @@ export function selectQuestion(pool: Danmaku[], random = Math.random): Danmaku |
   return latest.length ? latest[Math.min(latest.length - 1, Math.floor(random() * latest.length))] : null;
 }
 
-export function parseDyhubEvent(raw: string): Danmaku | null {
+export function parseDanmakuEvent(raw: string): Danmaku | null {
   try {
     const event = JSON.parse(raw);
     if (event.type !== 'chat' || typeof event.data?.content !== 'string') return null;
@@ -33,3 +33,6 @@ export function parseDyhubEvent(raw: string): Danmaku | null {
     return { id: String(event.id || crypto.randomUUID()), ts: Number(event.ts || Date.now()), nickname: String(event.user?.nickname || '观众'), content, blocked: null };
   } catch { return null; }
 }
+
+// Compatibility for existing saved-event consumers.
+export const parseDyhubEvent = parseDanmakuEvent;

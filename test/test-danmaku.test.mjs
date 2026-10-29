@@ -7,12 +7,12 @@ import ts from 'typescript';
 const exports = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/testDanmaku.ts', 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-}).outputText, { exports, require: name => { assert.equal(name, './interactionQueue'); return { INTERACTION_SLOT_COUNT: 6 }; } });
+}).outputText, { exports, require: name => { assert.equal(name, './interactionQueue'); return { INTERACTION_SLOT_COUNT: 3 }; } });
 const { countTestDanmaku, parseTestDanmaku, defaultTestDanmaku } = exports;
 
-test('default batch has exactly six viewers and requests model generation', () => {
+test('default batch has exactly three viewers and requests model generation', () => {
   const batch = parseTestDanmaku(defaultTestDanmaku.replaceAll('\n', '\r\n'));
-  assert.equal(batch.length, 6);
+  assert.equal(batch.length, 3);
   assert.equal(batch[0].nickname, '小杰');
   assert.equal(batch[1].type, 'gift');
   assert.equal(batch[1].gift.name, '玫瑰');
@@ -35,8 +35,8 @@ test('queue snapshot format preserves supplied speech and treats placeholders as
 });
 
 test('invalid batch sizes and malformed entries fail before anything is imported', () => {
-  assert.throws(() => parseTestDanmaku(''), /1～6/);
-  assert.throws(() => parseTestDanmaku(Array.from({ length: 7 }, (_, i) => `[弹幕][观众${i}] 多了//等待生成`).join('\n')), /1～6/);
+  assert.throws(() => parseTestDanmaku(''), /1～3/);
+  assert.throws(() => parseTestDanmaku(Array.from({ length: 4 }, (_, i) => `[弹幕][观众${i}] 多了//等待生成`).join('\n')), /1～3/);
   assert.throws(() => parseTestDanmaku(defaultTestDanmaku.replace('[阿豪]', '[]')), /第 2 行/);
   assert.throws(() => parseTestDanmaku(defaultTestDanmaku.replace('玫瑰×5', '玫瑰×0')), /第 2 行/);
   assert.throws(() => parseTestDanmaku(defaultTestDanmaku.replace('玫瑰×5', '玫瑰×-1')), /第 2 行/);
@@ -45,8 +45,8 @@ test('invalid batch sizes and malformed entries fail before anything is imported
   assert.throws(() => parseTestDanmaku(defaultTestDanmaku.replace('//等待生成', '')), /第 1 行/);
 });
 
-test('test import accepts one through six lines in order and ignores blank lines in the displayed count', () => {
-  for (let size = 1; size <= 6; size++) {
+test('test import accepts one through three lines in order and ignores blank lines in the displayed count', () => {
+  for (let size = 1; size <= 3; size++) {
     const input = Array.from({ length: size }, (_, i) => `[弹幕][观众${i + 1}] 问题${i + 1}//回答${i + 1}`).join('\n\n');
     const text = `\n${input}\n\n`;
     const parsed = parseTestDanmaku(text);

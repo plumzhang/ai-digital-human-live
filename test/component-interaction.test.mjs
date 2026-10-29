@@ -40,3 +40,14 @@ test('a missing action instruction fails visibly instead of silently submitting 
   await assert.rejects(exports.planComponentInteraction(task('札一下马尾'), [], diversity, config,
     async () => ({ speech: '提问', intent: 'action_request', action_instruction: ' ', emotion: 'happy', segments: [] }), 'live'), /没有返回动作描述/);
 });
+
+test('rewriting changes spoken text while preserving gift/actions and supplies concrete recent openings', async () => {
+  const gift={...task('玫瑰×5'),event:{...task('').event,type:'gift',nickname:'阿豪',content:'玫瑰×5',gift:{name:'玫瑰',count:5}}};
+  const draft={speech:'玫瑰×5',generation_mode:'component',prepared_reply:'哎呀，阿豪这玫瑰真香。',intent:'gift',gesture:'heart',emotion:'happy',segments:[]};
+  const calls=[];
+  const result=await exports.rewriteComponentReply(gift,draft,[],{...diversity,recentOpenings:['哎呀，怎么来打听姐姐的感情生活了？']},config,async(name,args)=>{calls.push({name,args});return '阿豪的五朵玫瑰收到啦，谢谢你惦记姐姐。';},'live');
+  assert.equal(calls.length,1);assert.equal(calls[0].name,'component_prepare_reply');
+  const request=JSON.parse(calls[0].args.content);assert.equal(request.current_event.gift.count,5);assert.equal(request.rewrite.draft,draft.prepared_reply);
+  assert.equal(request.recent_answer_openings.length,1);assert.match(request.speech_requirements,/不要|不沿用/);
+  assert.equal(result.gesture,'heart');assert.equal(result.intent,'gift');assert.equal(result.speech,'玫瑰×5');assert.match(result.prepared_reply,/五朵玫瑰/);
+});

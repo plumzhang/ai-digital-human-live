@@ -51,7 +51,7 @@ async function player(options = {}) {
     '@tauri-apps/api/core': { convertFileSrc: path => `asset://${path}`, invoke: async (name, args) => {
       calls.push([name, args]);
       if (name === 'speech_transcribe' && options.transcribe) return options.transcribe(args.request);
-      if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
+      if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, pcm_ready:true, pcm_segments:[{index:0,start_ms:0,end_ms:1000,sample_count:24000,pcm_path:'clip.pcm'}], audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
       return name === 'session_snapshot' ? snapshot : undefined;
     } },
     '@tauri-apps/api/event': {
@@ -65,7 +65,7 @@ async function player(options = {}) {
     '../microphoneInput': microphoneExports,
     '../ttsConfig': { loadTtsConfig: () => ({ base_url: 'http://127.0.0.1:8766', model: 'k2-fsa/OmniVoice' }) },
     '../songDirector': songDirectorExports,
-    '../songAudioBridge': { createSongAudioBridge: async (audio, send) => ({ dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {} }) },
+    '../songAudioBridge': { createSongAudioBridge: async (audio, send) => ({ dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {}, drain: async () => {} }) },
     '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
       const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
@@ -84,6 +84,8 @@ async function player(options = {}) {
     return { getTracks: () => [track], getAudioTracks: () => [track] };
   } } }, Audio: class {
     constructor(src) { this.src = src; this.paused = true; this.currentTime = 0; songs.push(this); }
+    set src(value) { this._src=value; if(value)calls.push(['songAudioSource',{src:value,crossOrigin:this.crossOrigin,muted:this.muted,volume:this.volume}]); }
+    get src() { return this._src; }
     async play() {
       if (options.blockSongAutoplay && !this.tried) { this.tried=true; const error=new Error('user gesture required'); error.name='NotAllowedError'; throw error; }
       this.paused = false;
@@ -99,12 +101,30 @@ async function player(options = {}) {
   return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors, songs };
 }
 
+test('OBS can report its existing join/subscriptions after console listeners reload without rejoining RTC', async () => {
+  const p=await player();
+  p.rtcHandlers.get('videoSubscribeStateChanged')('bot',0,3);
+  p.rtcHandlers.get('audioSubscribeStateChanged')('bot',0,3);
+  await new Promise(resolve=>setImmediate(resolve));
+  const joins=p.calls.filter(([name])=>name==='joinChannel').length;
+  const start=p.calls.length;
+  await p.handlers.get('rtc-status-request')({payload:{live_id:'123',include_mic:true}});
+  const replay=p.calls.slice(start);
+  assert.ok(replay.some(([name,state])=>name==='rtc-status'&&state.live_id==='123'&&state.joined===true));
+  for(const kind of ['video','audio']) assert.ok(replay.some(([name,state])=>name==='rtc-media-status'&&state.kind===kind&&state.subscribed===true));
+  assert.ok(replay.some(([name,state])=>name==='mic-state'&&state.live_id==='123'&&state.enabled===false));
+  assert.equal(p.calls.filter(([name])=>name==='joinChannel').length,joins);
+  const before=p.calls.length;await p.handlers.get('rtc-status-request')({payload:{live_id:'old'}});assert.equal(p.calls.length,before);
+});
+
 test('OBS song control plays original audio, mutes RTC, submits exact lyrics and restores sound at ended', async () => {
   const p = await player();
   const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
   p.handlers.get('song-control')({ payload:control });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(p.songs.length,1); assert.equal(p.songs[0].src,'asset://song.mp3'); assert.equal(p.songs[0].paused,false);
+  const loaded=p.calls.find(([name])=>name==='songAudioSource')[1];
+  assert.equal(loaded.crossOrigin,'anonymous');assert.equal(loaded.muted,false);assert.equal(loaded.volume,1);
   assert.ok(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === true));
   const tts = p.calls.find(([name]) => name === 'component_transcription')[1];
   assert.equal(tts.content, '原歌词'); assert.equal(tts.taskId,'attempt-0');

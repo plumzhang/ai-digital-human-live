@@ -9,7 +9,7 @@ const exports = {};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/whisperRecognition.ts', 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText, { exports, require: name => { assert.equal(name, 'pinyin-pro'); return pinyinPro; } });
-const { normalizeSpeech, matchReplyEnding, Pcm16Encoder, WhisperCapture, mergeWhisperTimeline } = exports;
+const { normalizeSpeech, matchReplyEnding, matchPlaybackEnding, Pcm16Encoder, WhisperCapture, mergeWhisperTimeline } = exports;
 const flush = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
 const target = { live_id: 'live', task_id: 'task', capture_id: 'attempt-1', enabled: true };
 
@@ -78,6 +78,35 @@ test('PCM resampling is continuous across frames at 44.1kHz and preserves signed
   assert.equal(count, 16000);
   assert.deepEqual(Array.from(new Pcm16Encoder(16000).encode(Float32Array.from([-1, 1, 0]))), [-32768, 32767, 0]);
   assert.throws(() => new Pcm16Encoder(0));
+});
+
+test('component ending confirmation requires the last three syllables, beyond a passing tail similarity', () => {
+  const answer='这是前面的回答内容，甲乙丙丁戊己庚辛壬癸。';
+  const incomplete=matchPlaybackEnding(answer,'甲乙丙丁戊己庚');
+  assert.equal(incomplete.progress,0.7);assert.equal(incomplete.ending_matched,false);assert.equal(incomplete.matched,false);
+  assert.equal(matchPlaybackEnding(answer,'甲乙丙丁花草木辛壬癸').matched,true);
+  assert.equal(matchPlaybackEnding('大家晚上好，欢迎来到直播间，我叫晚晚。','大家晚上好欢迎来到直播间我叫碗碗').ending_matched,true);
+  assert.equal(matchPlaybackEnding('好的。','好').matched,false);
+  assert.equal(matchPlaybackEnding('好的。','好的').matched,true);
+  assert.equal(matchPlaybackEnding('','').ending_matched,false);
+});
+
+test('PCM transmission completion refreshes a final ASR batch without clearing captured audio or repeating forever', async () => {
+  let now=1000;const requests=[];
+  const capture=new WhisperCapture(async request=>{
+    requests.push(request);return {...request,segments:[{text:'末尾已经说完',start_ms:0,end_ms:500}],inference_ms:20};
+  },()=>{},()=>now);
+  capture.start(target);
+  for(let i=0;i<16;i++)capture.push(new Float32Array(1600).fill(0.1),16000,0);
+  await flush();capture.push(new Float32Array(1600),16000,350);await flush();
+  const before=requests.length,oldLength=requests.at(-1).samples.length;
+  now=2000;capture.start({...target,audio_sent_at:now});
+  capture.push(new Float32Array(1600),16000,450);await flush();
+  assert.equal(requests.length,before+1);assert.ok(requests.at(-1).samples.length>oldLength);assert.equal(requests.at(-1).captured_at,now);
+  // A delayed task refresh must not remove the transmission timestamp or restart capture.
+  capture.start(target);capture.start({...target,audio_sent_at:now});
+  for(let i=0;i<20;i++)capture.push(new Float32Array(1600),16000,550+i*100);
+  await flush();assert.equal(requests.length,before+1);capture.start();
 });
 
 test('rolling recognition retains words before a window boundary even when it cuts through a segment', () => {

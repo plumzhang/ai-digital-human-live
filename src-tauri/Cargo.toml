@@ -1,7 +1,7 @@
 [package]
 name = "ai-digital-human-live"
 version = "0.1.0"
-description = "Windows control console for Vidu S2 Avatar and DyHub"
+description = "Windows control console for Vidu S2 Avatar and douyinLive"
 authors = ["InnoTechx"]
 edition = "2021"
 

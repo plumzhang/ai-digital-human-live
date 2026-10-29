@@ -1,7 +1,7 @@
 import { pinyin } from 'pinyin-pro';
 
 export type ReplyMatch = { matched: boolean; progress: number; method: 'text' | 'phonetic'; scope: 'full' | 'tail'; compared_chars: number };
-export type RecognitionTarget = { live_id: string; task_id: string; capture_id: string; enabled: boolean };
+export type RecognitionTarget = { live_id: string; task_id: string; capture_id: string; enabled: boolean; audio_sent_at?: number };
 export type WhisperSegment = { text: string; start_ms: number; end_ms: number; words?: { text: string; start_ms: number; end_ms: number; probability: number }[] };
 export type WhisperAudioRequest = RecognitionTarget & { samples: number[]; offset_ms: number; captured_at: number };
 export type WhisperResult = RecognitionTarget & { segments: WhisperSegment[]; offset_ms: number; captured_at: number; inference_ms: number };
@@ -73,6 +73,16 @@ export function matchReplyEnding(expectedText: string, observedText: string): Re
   return { ...matchTokens(sounds(expected), sounds(observed)), method: 'phonetic', ...context };
 }
 
+// Component replies are known in full before playback. Never accept a matching
+// prefix that omits the final words, even when it passes the similarity threshold.
+export function matchPlaybackEnding(expectedText: string, observedText: string): ReplyMatch & { ending_matched: boolean } {
+  const result = matchReplyEnding(expectedText, observedText);
+  const expected = Array.from(normalizeSpeech(expectedText)).slice(-3).join('');
+  const observed = Array.from(normalizeSpeech(observedText)).slice(-3).join('');
+  const endingMatched = !!expected && matchReplyEnding(expected, observed).progress === 1;
+  return { ...result, ending_matched: endingMatched, matched: result.matched && endingMatched };
+}
+
 // Stateful box resampling preserves fractional sample boundaries at 44.1kHz.
 export class Pcm16Encoder {
   private sum = 0;
@@ -119,7 +129,13 @@ export class WhisperCapture {
     private now: () => number = Date.now,
   ) {}
   start(target?: RecognitionTarget) {
-    if (target?.enabled && this.target?.capture_id === target.capture_id && this.target.live_id === target.live_id && this.target.task_id === target.task_id) return;
+    if (target?.enabled && this.target?.capture_id === target.capture_id && this.target.live_id === target.live_id && this.target.task_id === target.task_id) {
+      const sentAt = Math.max(this.target.audio_sent_at || 0, target.audio_sent_at || 0);
+      // The final PCM write may finish after the previous silent ASR batch.
+      // Keep its audio/timeline and request one fresh final batch after the write.
+      if (sentAt > (this.target.audio_sent_at || 0)) this.submittedFinal = false;
+      this.target = { ...target, audio_sent_at: sentAt || undefined }; return;
+    }
     this.generation++; this.target = target?.enabled ? { ...target } : undefined;
     this.frames = []; this.size = 0; this.total = 0; this.encoder = undefined; this.rate = 0;
     this.lastVoice = 0; this.submittedVoice = 0; this.submittedAt = 0; this.submittedFinal = false; this.timeline = [];

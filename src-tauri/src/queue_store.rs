@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::{fs::{self, OpenOptions}, io::Write, path::{Path, PathBuf}, sync::Mutex};
 use tauri::{Manager, State};
 
-const INTERACTION_SLOT_COUNT: usize = 6;
+pub(crate) const INTERACTION_SLOT_COUNT: usize = 3;
 
 #[derive(Default)]
 pub struct QueueStorage(Mutex<Option<Store>>);
@@ -109,7 +109,7 @@ pub(crate) fn ensure_song_not_queued(app: &tauri::AppHandle, id: &str) -> Result
         let snapshot = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get::<_, String>(0)).optional().map_err(|e| e.to_string())?;
         if let Some(text) = snapshot {
             let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            if value["tasks"].as_array().is_some_and(|tasks| tasks.iter().any(|task| task.pointer("/song/id").and_then(Value::as_str) == Some(id))) {
+            if ["tasks", "deferred_tasks"].iter().any(|field| value[*field].as_array().is_some_and(|tasks| tasks.iter().any(|task| task.pointer("/song/id").and_then(Value::as_str) == Some(id)))) {
                 return Err("歌曲已在互动队列中，请先完成或跳过，再编辑或删除".into());
             }
         }
@@ -168,7 +168,7 @@ pub async fn queue_ack_event(app: tauri::AppHandle, storage: State<'_, QueueStor
 pub async fn queue_save_config(app: tauri::AppHandle, storage: State<'_, QueueStorage>, persona: String, model: String, base_url: String) -> Result<(), String> {
     with_store(&app, &storage, |store| {
         atomic_write(&store.directory, "persona.txt", &persona)?;
-        atomic_write(&store.directory, "config.json", &json!({"window_size":INTERACTION_SLOT_COUNT,"generation_concurrency":2,"playback_concurrency":1,"chat_expiry_seconds":30,"gift_merge_ms":2000,"gift_priority":true,"model":model,"base_url":base_url}).to_string())
+        atomic_write(&store.directory, "config.json", &json!({"window_size":INTERACTION_SLOT_COUNT,"generation_concurrency":2,"playback_concurrency":1,"chat_expiry_seconds":30,"slot_expiry_seconds":null,"slot_replacement":"on_vacancy","gift_merge_ms":2000,"gift_priority":true,"model":model,"base_url":base_url}).to_string())
     })
 }
 
@@ -195,12 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_commit_exports_six_readable_lines_and_replaces_existing_snapshots() {
+    fn sqlite_commit_exports_three_readable_lines_and_replaces_existing_snapshots() {
         let mut store = temporary_store();
         let first = snapshot();
         commit_snapshot(&mut store, &first).unwrap();
         let text = fs::read_to_string(store.directory.join("queue.txt")).unwrap();
-        assert_eq!(text.lines().count(), 6);
+        assert_eq!(text.lines().count(), 3);
         assert!(text.contains("[弹幕][小杰] 你好//小杰你好！"));
         assert!(text.contains("[礼物][阿豪][玫瑰×5]//生成中"));
         let mut second = first.clone();
@@ -214,20 +214,16 @@ mod tests {
     }
 
     #[test]
-    fn six_tasks_are_persisted_and_exported_and_a_seventh_is_rejected() {
+    fn three_tasks_are_persisted_and_exported_and_a_fourth_is_rejected() {
         let mut store = temporary_store();
         let mut valid = snapshot();
-        for id in ["d", "e", "f"] {
-            valid["tasks"].as_array_mut().unwrap().push(json!({
-                "id":id,"status":"pending","event":{"type":"chat","nickname":id,"content":id}
-            }));
-        }
+        valid["deferred_tasks"] = json!([{"id":"old-song","status":"ready","song":{"id":"saved-song"}}]);
         commit_snapshot(&mut store, &valid).unwrap();
         let text = fs::read_to_string(store.directory.join("queue.txt")).unwrap();
-        assert_eq!(text.lines().count(), 6);
-        assert!(text.contains("[弹幕][f] f//等待生成"));
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.contains("[弹幕][小宇] 在吗//等待生成"));
         let mut invalid = valid.clone();
-        invalid["tasks"].as_array_mut().unwrap().push(json!({"id":"g","status":"pending"}));
+        invalid["tasks"].as_array_mut().unwrap().push(json!({"id":"d","status":"pending"}));
         assert!(commit_snapshot(&mut store, &invalid).is_err());
         let saved: String = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), valid);

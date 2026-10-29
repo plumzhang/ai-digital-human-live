@@ -159,3 +159,11 @@ test('cancelling during initial AI interruption never starts original audio late
   const starting = p.player.start(); await p.player.stop(); finishPrepare(); await starting;
   assert.equal(played,false); assert.equal(p.speaks().length,0);
 });
+
+test('song end waits for the configured audible tail and interruption prevents a late ended event',async()=>{
+  let release;const p=setup({drain:()=>new Promise(resolve=>{release=resolve;})});
+  await p.player.start();p.audio.onended();
+  assert.equal(p.calls.some(c=>c[0]==='state'&&c[1]==='ended'),false);
+  await p.player.stop('stopped');release();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(p.calls.some(c=>c[0]==='state'&&c[1]==='ended'),false);
+});

@@ -29,6 +29,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
   const [editing, setEditing] = useState<string | null>(null);
   const [cues, setCues] = useState<SongCue[]>([]);
   const [leadDraft, setLeadDraft] = useState('500');
+  const [pcmLeadDraft, setPcmLeadDraft] = useState('0');
   const [ignoredGapWarnings, setIgnoredGapWarnings] = useState<string[]>(loadIgnoredGapWarnings);
   const lock = useRef(false);
   const container = useRef<HTMLDivElement>(null);
@@ -54,7 +55,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
     setCues(structuredClone(next));
     setLeadDraft(next.length && next.every(cue => cue.lead_ms === next[0].lead_ms) ? String(next[0].lead_ms) : next.length ? '' : '500');
   }
-  function edit(song: SongDirector) { setEditing(song.id); loadEditorCues(song.cues.length ? song.cues : song.raw_segments); }
+  function edit(song: SongDirector) { setEditing(song.id); setPcmLeadDraft(String(song.pcm_lead_ms ?? 0)); loadEditorCues(song.cues.length ? song.cues : song.raw_segments); }
   function ignoreGapWarning(songId: string) {
     const next = [...new Set([...loadIgnoredGapWarnings(), ...ignoredGapWarnings, songId])];
     try {
@@ -72,7 +73,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
     {notice && <div className="voice-notice success" role="status">{notice}</div>}
     {busy && <div className="voice-notice" role="status">{busy}</div>}
     <section id="songs-library" role="tabpanel" aria-labelledby="songs-library-tab" hidden={tab !== 'library'}>
-      <div className="song-library-heading"><div><h2>已有歌曲导播</h2><p className="hint">播放原歌曲，按时间轴发送歌词驱动数字人。文字 TTS 使用朗读节奏，提前量只能校准起点，无法保证逐字匹配原唱拖音；严格同步需使用原唱音频驱动口型。歌曲结束后自动释放队列槽位。</p></div><div className="button-row">
+      <div className="song-library-heading"><div><h2>已有歌曲导播</h2><p className="hint">先按每段歌词的起止时间截取原唱PCM，播放时发送已截取的片段，歌词空档发送静音；本地播放完整原歌曲。点击歌曲“编辑”可设置PCM提前量，默认0毫秒。加入时替换槽位3的原待播任务，保留槽位1、2；不足三条时排在队尾。歌曲结束后自动释放队列槽位。</p></div><div className="button-row">
         <button disabled={!!busy || !desktop} onClick={() => void work('读取歌曲导播…', refresh)}><RefreshCw size={15}/> 刷新</button>
         <button disabled={!desktop} onClick={() => void invoke('director_open_folder', { id: null }).catch(e => setError(String(e)))}><FolderOpen size={15}/> 打开保存目录</button>
       </div></div>
@@ -82,23 +83,26 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
         const queued = queuedSongIds.includes(song.id);
         const gaps = songTimelineGaps(editing === song.id ? cues : song.cues);
         return <article key={song.id} className={`card song-card${editing === song.id ? ' song-card-editing' : ''}`}>
-          <div className="song-card-heading"><h3>{song.title}</h3><span className="tag">{statusText(song.status)}</span></div>
-          <p className="hint">{clock(song.duration_ms)} · {song.cues.length} 段歌词{queued && ' · 已在队列中'}</p>
+          <div className="song-card-heading"><h3>{song.title}</h3><span className="tag">{song.status === 'ready' && !song.pcm_ready ? '歌词已就绪，待截取PCM' : statusText(song.status)}</span></div>
+          <p className="hint">{clock(song.duration_ms)} · {song.cues.length} 段歌词 · {song.pcm_ready ? `${song.pcm_segments?.length ?? 0}段PCM已截取 · PCM提前${song.pcm_lead_ms ?? 0}毫秒` : 'PCM待截取'}{queued && ' · 已在队列中'}</p>
           {!!gaps.length && !ignoredGapWarnings.includes(song.id) && <p className="song-error song-gap-warning">时间轴有 {gaps.length} 处超过10秒的空档：{gaps.slice(0,3).map(gap => `${clock(gap.start_ms)}～${clock(gap.end_ms)}`).join('、')}。请试听确认是间奏还是漏词；漏词需重新识别，仅校正文字无法补齐时间。<button type="button" aria-label={`忽略《${song.title}》的时间轴空档提醒`} onClick={() => ignoreGapWarning(song.id)}>忽略提醒</button></p>}
           <div className="button-row">
-            <button className="primary" disabled={!!busy || !queueAvailable || song.status !== 'ready' || !song.available} onClick={() => void work('加入互动任务队列…', async () => { await onEnqueue(song); setNotice(`“${song.title}”已加入队列，数字人与 OBS 就绪后按槽位顺序自动播放。`); })}>加入播放歌曲槽位</button>
+            <button className="primary" disabled={!!busy || !queueAvailable || song.status !== 'ready' || !song.available || !song.pcm_ready} onClick={() => void work('加入互动任务队列…', async () => { await onEnqueue(song); setNotice(`“${song.title}”已加入待播队列；队列满时已替换槽位3，数字人与 OBS 就绪后按顺序自动播放。`); })}>加入播放歌曲槽位</button>
+            <button disabled={!!busy || queued || !song.available || !song.cues.length} onClick={() => void work('正在按歌词起止时间截取PCM…', async () => { await invoke('director_prepare_pcm', { id: song.id }); setNotice(`“${song.title}”歌词PCM已截取完成。`); })}>截取歌词PCM</button>
             <button disabled={!!busy} aria-expanded={editing === song.id} aria-controls={`song-details-${song.id}`} onClick={() => editing === song.id ? setEditing(null) : edit(song)}>{editing === song.id ? '收起详情' : '编辑'}</button>
             <button className="danger" disabled={!!busy || queued} onClick={() => { if (window.confirm(`删除“${song.title}”的导播、原歌曲和字幕文件？`)) void work('删除歌曲导播…', async () => { await invoke('director_delete', { id: song.id }); if (editing === song.id) setEditing(null); }); }}><Trash2 size={14}/> 删除</button>
           </div>
           {editing === song.id && <div id={`song-details-${song.id}`} className="song-timeline-editor">
             {song.available ? <audio controls preload="none" src={convertFileSrc(song.audio_path)} aria-label={`${song.title}原歌曲试听`}/> : <p className="song-error">原歌曲文件缺失，请重新上传。</p>}
             {song.error && <p className="song-error">{song.error}</p>}
+            {!song.pcm_ready && song.pcm_error && <p className="hint">{song.pcm_error}</p>}
             {queued && <p className="hint">已在队列中，请先完成或跳过，再编辑或删除。</p>}
             <div className="button-row">
               {!!song.raw_segments.length && <button disabled={!!busy || queued} onClick={() => void work('大语言模型正在校正歌词…', () => correct(song))}>校正歌词</button>}
               <button disabled={!!busy || queued || !song.available} onClick={() => void work('正在重新识别整首歌曲…', async () => { const result = await invoke<SongDirector>('director_transcribe', { id: song.id, tts: loadTtsConfig() }); loadEditorCues(result.raw_segments); await correct(result); })}>重新识别并校正</button>
               <button onClick={() => void invoke('director_open_folder', { id: song.id }).catch(e => setError(String(e)))}><FolderOpen size={14}/> 字幕与文件</button>
-              <label className="song-bulk-lead">提前量（毫秒）<input type="number" min={0} max={5000} step={50} value={leadDraft} placeholder="各段不同" disabled={!!busy || queued || !cues.length} title="修改后覆盖全部歌词段，保存时间轴后生效" onChange={event => {
+              <label className="song-bulk-lead">PCM提前量（毫秒）<input type="number" min={0} max={5000} step={50} value={pcmLeadDraft} disabled={!!busy || queued} onChange={event => setPcmLeadDraft(event.target.value)} onBlur={() => { const value = Number(pcmLeadDraft); if (!pcmLeadDraft.trim() || !Number.isInteger(value) || value < 0 || value > 5000) { setPcmLeadDraft(String(song.pcm_lead_ms ?? 0)); setError('PCM提前量需为0–5000毫秒的整数'); } }}/></label>
+              <label className="song-bulk-lead">歌词文字提前量（毫秒）<input type="number" min={0} max={5000} step={50} value={leadDraft} placeholder="各段不同" disabled={!!busy || queued || !cues.length} title="修改后覆盖全部歌词段，保存时间轴后生效" onChange={event => {
                 const value = event.target.value; setLeadDraft(value);
                 const lead = value.trim() ? Number(value) : NaN;
                 if (Number.isInteger(lead) && lead >= 0 && lead <= 5000) {
@@ -113,7 +117,8 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
               }}/></label>
             </div>
             {!!cues.length && <>
-            <p className="hint">修改上方提前量将覆盖全部歌词段，也可在下方逐段调整或删除。删除后点击“保存时间轴”生效，至少保留一段歌词。</p>
+            <p className="hint">修改上方歌词文字提前量会覆盖全部歌词段，也可逐段调整或删除。删除后点击“保存时间轴”重新截取PCM，至少保留一段歌词。</p>
+            <p className="hint">PCM按每段原始起止时间截取；提前量0按原时间发送。设置500毫秒时，PCM相对本地听到的原歌曲提前500毫秒，开头和结尾音频均完整保留。保存后生效，歌词文字提前量独立设置。</p>
             <p className="hint">识别原文：raw.srt；校正字幕：corrected.srt；歌词发送时间轴：timeline.json。“时间”列以秒显示歌词开始位置，精确到0.1秒；开始、结束和提前量输入单位为毫秒。</p>
             <div className="song-timeline-scroll"><table className="song-timeline"><thead><tr><th>时间</th><th>开始</th><th>结束</th><th>歌词</th><th>提前量</th><th>发送时刻</th><th>操作</th></tr></thead><tbody>{cues.map((cue, index) => <tr key={index}>
               <td className="song-timeline-time">{(cue.start_ms / 1000).toFixed(1)}s</td>
@@ -122,7 +127,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
               <td><input type="number" aria-label={`第${index+1}段提前量`} min={0} max={5000} step={50} value={cue.lead_ms} disabled={!!busy || queued} onChange={e => setCues(old => old.map((c,i) => i === index ? { ...c, lead_ms:Number(e.target.value) } : c))}/></td><td>{clock(songCueSendAt(cue))}</td>
               <td><button type="button" className="danger song-cue-delete" aria-label={`删除第${index+1}段歌词`} disabled={!!busy || queued || cues.length <= 1} title={cues.length <= 1 ? '至少保留一段歌词' : '删除此行，保存时间轴后生效'} onClick={() => setCues(old => old.filter((_, i) => i !== index))}><Trash2 size={14}/>删除</button></td>
             </tr>)}</tbody></table></div>
-            <div className="button-row"><button className="primary" disabled={!!busy || queued} onClick={() => void work('保存歌词时间轴…', async () => { await invoke('director_save', { id: song.id, cues }); setNotice('时间轴已保存。'); })}>保存时间轴</button></div>
+            <div className="button-row"><button className="primary" disabled={!!busy || queued} onClick={() => void work('保存时间轴并截取歌词PCM…', async () => { const lead = Number(pcmLeadDraft); if (!pcmLeadDraft.trim() || !Number.isInteger(lead) || lead < 0 || lead > 5000) throw new Error('PCM提前量需为0–5000毫秒的整数'); await invoke('director_save', { id: song.id, cues, pcmLeadMs: lead }); setNotice('时间轴与PCM提前量已保存，歌词PCM已截取完成。'); })}>保存时间轴</button></div>
             </>}
           </div>}
         </article>;
@@ -139,7 +144,7 @@ export function SingingModule({ active, onConfigureModel, onEnqueue, queuedSongI
         <label className="song-upload-picker"><Upload size={24}/><span>{audio ? `${audio.name} · ${clock(audio.duration_ms)}` : '上传原歌曲（包含人声和伴奏）'}</span><input type="file" accept=".mp3,.wav,.aac,.m4a" disabled={!!busy || !desktop} onChange={e => { const file = e.target.files?.[0]; e.target.value = ''; if (file) void work('读取歌曲…', async () => { setAudio(null); const result = await readDirectorAudio(file); setAudio(result); if (!title.trim()) setTitle(file.name.replace(/\.[^.]+$/, '').slice(0,100)); }); }}/></label>
         <p className="hint">MP3、WAV、AAC、M4A · 小于100 MB · 最长30分钟</p>
         <label>完整歌词（必填）<textarea rows={12} value={lyrics} required disabled={!!busy} maxLength={30000} placeholder="粘贴与歌曲版本一致的完整歌词，保留重复演唱部分" onChange={e => setLyrics(e.target.value)}/></label>
-        <p className="hint">先生成 FunASR 原始 SRT，再使用大语言模型参照输入的歌词纠错并保留时间。播放时每段默认提前500毫秒发送给数字人，屏蔽数字人声音，只播放原歌曲。</p>
+        <p className="hint">先生成FunASR原始SRT，再校正歌词，按每段起止时间预截取24kHz单声道PCM。播放时发送已截取的歌词片段，歌词间空档发送静音，只听原歌曲。PCM提前量默认0，可在歌曲编辑区设置。</p>
         <div className="button-row"><button className="primary" type="submit" disabled={!!busy || !desktop || !audio || !title.trim() || !lyrics.trim()}>生成字幕并校正歌词</button><button type="button" onClick={onConfigureModel}>配置大语言模型</button></div>
       </form>
     </section>

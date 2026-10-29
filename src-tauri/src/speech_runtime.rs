@@ -84,6 +84,19 @@ fn windows_to_wsl(path: &Path) -> Result<String, String> {
     }
     Err("WSL2 语音服务目录必须位于本机盘符路径".into())
 }
+pub(crate) fn decode_song_audio(app:&tauri::AppHandle,source:&Path,target:&Path)->Result<(),String> {
+    let config=read_config(&directory(app)?)?;
+    decode_song_audio_in(&config.distro,source,target)
+}
+pub(crate) fn decode_song_audio_in(distro:&str,source:&Path,target:&Path)->Result<(),String> {
+    let mut command=Command::new("wsl.exe");
+    command.args(["-d",distro,"-u","root","--exec","/usr/bin/ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y","-i"])
+        .arg(windows_to_wsl(source)?).args(["-vn","-ac","1","-ar","24000","-t","1801","-f","s16le"]).arg(windows_to_wsl(target)?);
+    quiet(&mut command);
+    let output=command.output().map_err(|_|"无法启动歌曲解码，请检查 WSL2 语音环境")?;
+    if !output.status.success(){return Err(format!("原歌曲解码失败：{}",String::from_utf8_lossy(&output.stderr).chars().take(500).collect::<String>()));}
+    Ok(())
+}
 async fn stop(app: &tauri::AppHandle, runtime: &LocalTtsRuntime) -> Result<(), String> {
     runtime.generation.fetch_add(1, Ordering::AcqRel);
     let legacy_running = service_health(&TtsConfig { base_url:LOCAL_URL.into(),key:String::new(),model:MODEL.into(),ref_audio:String::new(),ref_text:String::new() }).await.ok()

@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { Activity, Cpu, CircleStop, Clapperboard, Mic2, MicOff, Music2, Play, Plus, Radio, Send, Settings2, Shield, Square, Trash2, Video } from 'lucide-react';
-import { blockReason, parseDyhubEvent, type Danmaku, type Rule } from '../domain';
+import { blockReason, parseDanmakuEvent, type Danmaku, type Rule } from '../domain';
+import { DouyinConnection } from '../douyinConnection';
 import { defaultAvatarConfig, initialAdvanced, type AvatarConfig, type AvatarProfile } from '../avatarProfiles';
 import { useAvatarLibrary } from '../useAvatarLibrary';
 import { AvatarSettings } from './AvatarSettings';
@@ -23,10 +24,11 @@ import { HANDOFF_DIRECTIONS, handoffActionLabel, INTERACTION_SLOT_COUNT, Interac
 import { countTestDanmaku, defaultTestDanmaku, parseTestDanmaku } from '../testDanmaku';
 import { formatQueueCaption } from '../queueCaption';
 import { avatarActionFor } from '../giftActions';
-import { planComponentInteraction } from '../componentInteraction';
+import { planComponentInteraction, rewriteComponentReply } from '../componentInteraction';
 import { builtinVoices } from '../voiceCatalog';
 import { normalizeStoredVoice } from '../voiceSelection';
 import { SessionRecovery } from '../sessionRecovery';
+import { SessionSnapshotSync, queueWaitingReason } from '../sessionReadiness';
 import type { RecognitionObservation } from '../whisperRecognition';
 import type { SongPlaybackState, SongPlaybackIdentity } from '../songDirector';
 
@@ -52,7 +54,7 @@ type CreditItem = { type?: string; credit_remain?: number; concurrency_limit?: n
 type CreditPackage = { id?: string; name?: string; type?: string; credit_remain?: number; valid_to?: string };
 type Credits = { remains?: CreditItem[]; remaining_credits?: CreditItem[]; packages?: CreditPackage[]; queue_count?: number };
 type ErrorEntry = { id: string; message: string; at: number };
-type Session = { live_id: string; rtc: unknown; voice_provider?: string };
+type Session = { live_id: string; rtc: unknown; voice_provider?: string; ready?: boolean };
 type SessionCreation = { key: string; region: string; avatar: Record<string, unknown> };
 type LiveState = { live_id: string; status: string; trace_id?: string; billed_seconds?: string | number; credits_cost?: string | number; refreshed_at?: number };
 type LiveResponse = { live?: { id?: string; status?: string; trace_id?: string; billed_seconds?: string | number; credits_cost?: string | number } };
@@ -111,6 +113,7 @@ export function ConsoleApp() {
   const [modelTab, setModelTab] = useState<ModelSettingsTab>('reply');
   const openViduSettings = () => { setModelTab('vidu'); setTab('models'); };
   const [roomConnected, setRoomConnected] = useState(false);
+  const [danmakuStatus, setDanmakuStatus] = useState('尚未连接');
   const [session, setSession] = useState<Session | null>(null);
   const [liveState, setLiveState] = useState<LiveState | null>(null);
   const [liveStatusError, setLiveStatusError] = useState('');
@@ -137,6 +140,10 @@ export function ConsoleApp() {
   const [auto, setAuto] = useState(false);
   const [question, setQuestion] = useState('');
   const [messages, setMessages] = useState<Danmaku[]>([]);
+  const streamListRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (streamListRef.current) streamListRef.current.scrollTop = 0;
+  }, [messages, tab]);
   const [showTestDanmaku, setShowTestDanmaku] = useState(false);
   const [testDanmakuInput, setTestDanmakuInput] = useState(defaultTestDanmaku);
   const testDanmakuCount = countTestDanmaku(testDanmakuInput);
@@ -163,13 +170,16 @@ export function ConsoleApp() {
   const modelRequestRef = useRef(0);
   const generatingReplyRef = useRef(false);
   const readyRef = useRef(false);
+  const sessionSyncRef = useRef<SessionSnapshotSync<Session> | null>(null);
   const expectedDisconnectRef = useRef(false);
   const activeLiveIdRef = useRef<string | null>(null);
   const endedLiveIdsRef = useRef(new Set<string>());
   const disconnectedLiveIdsRef = useRef(new Set<string>());
   const autoRef = useRef(false);
   const micRef = useRef(false);
-  const wsRef = useRef<WebSocket | null>(null);
+  const danmakuRef = useRef<DouyinConnection | null>(null);
+  const danmakuRulesRef = useRef(settings.rules);
+  danmakuRulesRef.current = settings.rules;
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()}  ${message}`, ...old].slice(0, 80));
   const reportError = (message: string) => {
     const safeMessage = message.replace(/vda_[A-Za-z0-9_-]+/g, 'vda_***');
@@ -185,7 +195,7 @@ export function ConsoleApp() {
     void call<{ snapshot: QueueSnapshot | null; directory: string; pending_events: { event_id: string; raw: unknown }[] }>('queue_load').then(async saved => {
       if (disposed) return;
       const initial = saved.snapshot || emptyQueue();
-      initial.recognition = { ...initial.recognition, enabled: false };
+      initial.recognition = { ...initial.recognition, enabled: true };
       const audioOwner = call<string>('component_audio_open');
       const queue = new InteractionQueue(initial, {
         persist: snapshot => call('queue_commit', { snapshot }),
@@ -194,6 +204,7 @@ export function ConsoleApp() {
           if (!config.apiKey.trim() || !config.selectedModel || !config.persona.trim()) throw new Error('请先在“模型配置 → 大语言模型”保存有效的模型配置和固定人设');
           return planComponentInteraction(task, history, diversity, config, call, liveId);
         },
+        rewriteReply: (task, draft, history, diversity, liveId) => rewriteComponentReply(task, draft, history, diversity, loadModelConfig(), call, liveId),
         retainAudio: async (liveId, tokens) => call('component_audio_retain', { owner: await audioOwner, liveId, tokens }),
         prepareAudio: (task, liveId) => call('component_prepare_audio', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig() }),
         speak: async (task, liveId) => {
@@ -204,13 +215,10 @@ export function ConsoleApp() {
           const config = loadModelConfig();
           await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
           const gesture = avatarActionFor(task);
-          if (gesture) {
-            let actionError: string | undefined;
-            try { await call('send_avatar_action', { liveId, taskId: task.id, gesture: gesture.kind, instruction: gesture.instruction }); }
-            catch (error) { actionError = errorText(error); log('互动动作提交失败：' + actionError); }
-            await queue.observeAction(task.id, task.playback_token!, liveId, actionError);
-          }
-          await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig() });
+          await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig(),
+            slotActions: { playback_token: task.playback_token!, reply_delay_ms: task.reply_action_delay_ms ?? 0,
+              handoff: task.handoff_action ? { direction: task.handoff_action.direction, angle_deg: task.handoff_action.angle_deg } : null,
+              reply: gesture ? { gesture: gesture.kind, instruction: gesture.instruction } : null } });
           log(`队列回答音频已发送 · ${task.event.nickname}，等待实际播放结束`);
         },
         stopSong: async task => {
@@ -270,7 +278,8 @@ export function ConsoleApp() {
   }, []);
   const queuePlaying = interactionState.tasks.some(task => task.status === 'playing' || task.status === 'uncertain');
   const manualPlaying = !!manualQuestions[0] && manualQuestions[0].status !== 'waiting';
-  const captionTask = interactionState.tasks.find(task => task.status === 'playing' && interactionState.handoff_action?.task_id !== task.id);
+  const waitingReason = queueWaitingReason({ hasSession: !!session, creating: creatingAvatar || recoveringSession, controlReady: ready, rtcJoined, auto, micEnabled, micPending, occupied: busy && !queuePlaying && !manualPlaying });
+  const captionTask = interactionState.tasks.find(task => task.status === 'playing');
   const handoff = interactionState.handoff || { enabled: false, direction: 'left_down' as const };
   const recognitionMatchPercent = interactionState.recognition?.match_percent ?? 70;
   const [recognitionMatchDraft, setRecognitionMatchDraft] = useState('70');
@@ -284,19 +293,15 @@ export function ConsoleApp() {
     }
     void manageQueue(() => interactionQueueRef.current?.configureRecognition(asrEnabled, matchPercent));
   };
-  const [handoffWaitDraft, setHandoffWaitDraft] = useState('1699');
-  const [handoffAngleDraft, setHandoffAngleDraft] = useState('30');
-  const [handoffTriggerDraft, setHandoffTriggerDraft] = useState('50');
-  useEffect(() => { setHandoffTriggerDraft(String(handoff.trigger_percent ?? 50)); }, [handoff.trigger_percent]);
-  const saveHandoffTrigger = () => {
-    const triggerPercent = handoffTriggerDraft.trim() ? Number(handoffTriggerDraft) : NaN;
-    if (!Number.isInteger(triggerPercent) || triggerPercent < 1 || triggerPercent > 100) {
-      setHandoffTriggerDraft(String(handoff.trigger_percent ?? 50));
-      reportError('承接动作触发匹配度需为1–100%的整数');
-      return;
-    }
-    void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, handoff.direction, undefined, undefined, triggerPercent));
+  const replyActionDelay = interactionState.reply_action_delay_ms ?? 0;
+  const [replyActionDelayDraft, setReplyActionDelayDraft] = useState('0');
+  useEffect(() => { setReplyActionDelayDraft(String(replyActionDelay)); }, [replyActionDelay]);
+  const saveReplyActionDelay = () => {
+    const delay = replyActionDelayDraft.trim() ? Number(replyActionDelayDraft) : NaN;
+    if (!Number.isInteger(delay) || delay < 0 || delay > 60000) { setReplyActionDelayDraft(String(replyActionDelay)); reportError('回复动作延迟需为0–60000毫秒的整数'); return; }
+    void manageQueue(() => interactionQueueRef.current?.configureReplyActionDelay(delay));
   };
+  const [handoffAngleDraft, setHandoffAngleDraft] = useState('30');
   useEffect(() => { setHandoffAngleDraft(String(handoff.angle_deg ?? 30)); }, [handoff.angle_deg]);
   const saveHandoffAngle = () => {
     const angle = handoffAngleDraft.trim() ? Number(handoffAngleDraft) : NaN;
@@ -307,23 +312,12 @@ export function ConsoleApp() {
     }
     void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, handoff.direction, undefined, angle));
   };
-  useEffect(() => { setHandoffWaitDraft(String(handoff.wait_ms ?? 1699)); }, [handoff.wait_ms]);
-  const saveHandoffWait = () => {
-    const waitMs = handoffWaitDraft.trim() ? Number(handoffWaitDraft) : NaN;
-    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 3000) {
-      setHandoffWaitDraft(String(handoff.wait_ms ?? 1699));
-      reportError('承接动作等待时间需为0–3000毫秒的整数');
-      return;
-    }
-    void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, handoff.direction, waitMs));
-  };
-  const lastHandoff = interactionState.handoff_action;
   useEffect(() => {
     const liveId = session?.live_id;
     if (!liveId) return;
     const task = captionTask?.status === 'playing' && captionTask.live_id === liveId ? captionTask : undefined;
-    void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', enabled: asrEnabled && !!task && !task.song });
-  }, [session?.live_id, captionTask?.id, captionTask?.status, captionTask?.playback_token, asrEnabled]);
+    void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', audio_sent_at: task?.audio_sent_at, enabled: asrEnabled && !!task && !task.song });
+  }, [session?.live_id, captionTask?.id, captionTask?.status, captionTask?.playback_token, captionTask?.audio_sent_at, asrEnabled]);
   useEffect(() => {
     const liveId = session?.live_id;
     if (!liveId) return;
@@ -437,6 +431,34 @@ export function ConsoleApp() {
   }, [showCreditDetails]);
   useEffect(() => {
     const cleanup: Array<() => void> = [];
+    let disposed = false;
+    let snapshotTimer: number | undefined;
+    const sync = new SessionSnapshotSync<Session>(() => call('session_snapshot'), snapshot => {
+      if (!snapshot) {
+        if (activeLiveIdRef.current) {
+          activeLiveIdRef.current = null; readyRef.current = false;
+          setReady(false); setSession(null); setRtcJoined(false); setAuto(false);
+          setBusyState(false); setMicEnabled(false); micRef.current = false;
+          setInitStage('本机已无活动数字人会话');
+        }
+        return;
+      }
+      if (expectedDisconnectRef.current || endedLiveIdsRef.current.has(snapshot.live_id) || disconnectedLiveIdsRef.current.has(snapshot.live_id)) return;
+      const changed = activeLiveIdRef.current !== snapshot.live_id;
+      const wasReady = readyRef.current;
+      activeLiveIdRef.current = snapshot.live_id;
+      setSession(old => old?.live_id === snapshot.live_id ? old : snapshot);
+      setLiveState(old => old?.live_id === snapshot.live_id ? old : { live_id: snapshot.live_id, status: 'waiting' });
+      if (typeof snapshot.ready === 'boolean') {
+        readyRef.current = snapshot.ready; setReady(snapshot.ready);
+        if (snapshot.ready && (changed || !wasReady)) {
+          setInitStage('控制连接已就绪，正在同步播放窗口状态');
+          log('已从本机会话同步 Vidu 控制连接就绪状态');
+        }
+      }
+      void emitTo('obs', 'rtc-status-request', { live_id: snapshot.live_id, include_mic: changed }).catch(() => {});
+    }, error => log(`读取本机会话状态失败：${errorText(error)}`));
+    sessionSyncRef.current = sync;
     recoveryRef.current = new SessionRecovery<Session>({
       prepare: async liveId => {
         await interactionQueueRef.current?.disconnectSession(liveId, 'ai_output_closed：会话中断，播放完成情况未知；自动恢复时不重复播报');
@@ -470,12 +492,14 @@ export function ConsoleApp() {
     });
     void (async () => {
       cleanup.push(await listen<{ live_id: string; status?: string }>('live-created', event => {
+        sync.invalidate();
         setLiveState({ live_id: event.payload.live_id, status: event.payload.status || 'waiting' });
         setLiveStatusError('');
         setInitStage('正在建立控制连接');
         log(`Vidu 已分配会话：${event.payload.live_id}`);
       }));
       cleanup.push(await listen<Session>('session-changed', event => {
+        sync.invalidate(); readyRef.current = event.payload.ready === true; setReady(readyRef.current);
         modelRequestRef.current += 1; generatingReplyRef.current = false;
         const liveId = event.payload.live_id;
         activeLiveIdRef.current = liveId;
@@ -500,9 +524,10 @@ export function ConsoleApp() {
         const liveId = String(signal.live_id || '');
         if (liveId && activeLiveIdRef.current && liveId !== activeLiveIdRef.current) return;
         if (signal.type === 2) {
+          sync.invalidate();
           const ack = signal.payload?.conn_init_ack;
           if (endedLiveIdsRef.current.has(liveId) || disconnectedLiveIdsRef.current.has(liveId) || expectedDisconnectRef.current) return;
-          if (ack?.success) { setReady(true); setInitStage('控制连接就绪，等待播放窗口确认画面'); setAvatarNotice({ kind: 'success', message: '控制连接已就绪，正在连接视频画面。' }); log('Vidu 控制连接就绪'); }
+          if (ack?.success) { readyRef.current = true; setReady(true); setInitStage('控制连接就绪，等待播放窗口确认画面'); setAvatarNotice({ kind: 'success', message: '控制连接已就绪，正在连接视频画面。' }); log('Vidu 控制连接就绪'); }
           else if (ack?.error_code === 'NOT_READY') setInitStage('渲染端尚未就绪，正在重试初始化');
           else if (ack?.error_code !== 'NOT_READY') { const message = `Vidu 初始化失败：${ack?.error_code || '未知原因'} ${ack?.error_msg || ''}`; setAvatarNotice({ kind: 'error', message }); reportError(message); log(message); }
         }
@@ -513,6 +538,7 @@ export function ConsoleApp() {
           }
         }
         if (signal.type === 6) {
+          sync.invalidate();
           if (endedLiveIdsRef.current.has(liveId)) return;
           const reason = String(signal.payload?.hangup?.hangup_reason || '');
           const shouldRecover = reason === 'ai_output_closed' && !expectedDisconnectRef.current && !!sessionCreationRef.current;
@@ -539,7 +565,7 @@ export function ConsoleApp() {
           reportError(message); log(message);
         }
       }));
-      cleanup.push(await listen<{ live_id: string; forced: boolean }>('vidu-disconnected', event => { const liveId = event.payload.live_id; if (activeLiveIdRef.current && liveId !== activeLiveIdRef.current) return; disconnectedLiveIdsRef.current.add(liveId); modelRequestRef.current += 1; generatingReplyRef.current = false; setReady(false); setBusyState(false); setRtcJoined(false); setMicEnabled(false); micRef.current = false; if (!expectedDisconnectRef.current && !event.payload.forced && !endedLiveIdsRef.current.has(liveId)) { const message = 'Vidu 控制连接断开，请点击“结束会话”清理当前会话。'; setAvatarNotice({ kind: 'error', message }); reportError(message); } expectedDisconnectRef.current = false; log('Vidu 控制连接断开'); }));
+      cleanup.push(await listen<{ live_id: string; forced: boolean }>('vidu-disconnected', event => { sync.invalidate(); const liveId = event.payload.live_id; if (activeLiveIdRef.current && liveId !== activeLiveIdRef.current) return; disconnectedLiveIdsRef.current.add(liveId); modelRequestRef.current += 1; generatingReplyRef.current = false; setReady(false); setBusyState(false); setRtcJoined(false); setMicEnabled(false); micRef.current = false; if (!expectedDisconnectRef.current && !event.payload.forced && !endedLiveIdsRef.current.has(liveId)) { const message = 'Vidu 控制连接断开，请点击“结束会话”清理当前会话。'; setAvatarNotice({ kind: 'error', message }); reportError(message); } expectedDisconnectRef.current = false; log('Vidu 控制连接断开'); }));
       cleanup.push(await listen<{ live_id: string }>('microphone-speech-start', event => {
         if (event.payload.live_id !== activeLiveIdRef.current) return;
         modelRequestRef.current++;
@@ -565,6 +591,11 @@ export function ConsoleApp() {
         if (event.payload.live_id !== activeLiveIdRef.current) return;
         void interactionQueueRef.current?.observeRecognition(event.payload).catch(error => reportError(`语音识别匹配失败：${errorText(error)}`));
       }));
+      cleanup.push(await listen<Parameters<InteractionQueue['observeSlotAction']>[0]>('component-slot-action', event => {
+        if (event.payload.live_id !== activeLiveIdRef.current) return;
+        void interactionQueueRef.current?.observeSlotAction(event.payload).catch(error => reportError(`更新槽位动作失败：${errorText(error)}`));
+        if (event.payload.state === 'failed') log(`${event.payload.kind === 'handoff' ? '承接' : '回复'}动作发送失败：${event.payload.error || '未确认写入'}`);
+      }));
       cleanup.push(await listen<SongPlaybackState>('song-playback-state', event => {
         void interactionQueueRef.current?.observeSong(event.payload).catch(error => reportError(`歌曲导播调度失败：${errorText(error)}`));
       }));
@@ -588,7 +619,7 @@ export function ConsoleApp() {
         if (liveId !== activeLiveIdRef.current) return;
         const task = interactionQueueRef.current?.snapshot().tasks.find(item => item.status === 'playing' && item.live_id === liveId);
         void emit('queue-caption', { live_id: liveId, content: formatQueueCaption(task) }).catch(error => log(`OBS 字幕同步失败：${errorText(error)}`));
-        void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', enabled: interactionQueueRef.current?.snapshot().recognition?.enabled === true && !!task && !task.song });
+        void emit('whisper-task', { live_id: liveId, task_id: task?.id || '', capture_id: task?.playback_token || '', audio_sent_at: task?.audio_sent_at, enabled: interactionQueueRef.current?.snapshot().recognition?.enabled === true && !!task && !task.song });
       }));
       cleanup.push(await listen<{ live_id?: string; joined: boolean; error?: string }>('rtc-status', event => {
         if (event.payload.live_id && event.payload.live_id !== activeLiveIdRef.current) return;
@@ -616,6 +647,7 @@ export function ConsoleApp() {
         setAvatarNotice({ kind: 'error', message }); reportError(message);
       }));
       cleanup.push(await listen<{ live_id?: string; live?: NonNullable<LiveResponse['live']> }>('session-ended', event => {
+        sync.invalidate();
         if (event.payload?.live_id && activeLiveIdRef.current && event.payload.live_id !== activeLiveIdRef.current) return;
         const live = event.payload?.live;
         if (live?.status) setLiveState(old => old && old.live_id === event.payload.live_id ? { ...old, ...live, status: live.status!, refreshed_at: Date.now() } : old);
@@ -640,8 +672,12 @@ export function ConsoleApp() {
         if (event.payload.error) { reportError(event.payload.error); log(event.payload.error); }
         else log(event.payload.enabled ? '麦克风本地识别已开启，自动弹幕提问已暂停' : '麦克风本地识别已关闭');
       }));
+      if (!disposed) {
+        await sync.refresh();
+        if (!disposed) snapshotTimer = window.setInterval(() => void sync.refresh(), 2000);
+      }
     })().catch(error => reportError(`注册实时事件失败：${errorText(error)}`));
-    return () => { recoveryRef.current?.cancel(); cleanup.forEach(fn => fn()); };
+    return () => { disposed = true; sync.dispose(); if (snapshotTimer !== undefined) clearInterval(snapshotTimer); recoveryRef.current?.cancel(); cleanup.forEach(fn => fn()); };
   }, []);
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -650,32 +686,30 @@ export function ConsoleApp() {
     return () => clearInterval(timer);
   }, []);
   useEffect(() => {
-    if (!roomConnected || !settings.roomId) return;
     let disposed = false;
-    const ws = new WebSocket(`ws://127.0.0.1:8757/ws?roomId=${encodeURIComponent(settings.roomId)}&types=chat,gift,follow,like,member`);
-    wsRef.current = ws;
-    ws.onopen = () => log('弹幕流已连接');
-    ws.onclose = () => { log('弹幕流断开'); if (!disposed) reportError('弹幕流意外断开，请检查弹幕采集服务。'); };
-    ws.onmessage = event => {
-      try {
-        const raw = JSON.parse(String(event.data));
-        const normalized = normalizeInteraction(raw);
-        const giftUpdate = normalized?.gift ? `:${normalized.gift.combo_id}:${normalized.gift.count}:${normalized.gift.is_final}` : '';
-        const eventId = `${raw.roomId || settings.roomId}:${raw.id || normalized?.event_id || crypto.randomUUID()}${giftUpdate}`;
-        void call<boolean>('queue_archive_event', { eventId, raw }).then(async fresh => {
-          if (!fresh || disposed || !interactionQueueRef.current) return;
-          if (normalized && (normalized.type === 'gift' || !blockReason(normalized.content, settings.rules))) await interactionQueueRef.current.ingest(normalized);
-          if (disposed) return;
-          await call('queue_ack_event', { eventId });
-        }).catch(error => { const message = `保存直播事件失败：${errorText(error)}`; setAuto(false); reportError(message); });
-      } catch { log('忽略无法解析的直播事件'); }
-      const item = parseDyhubEvent(event.data);
-      if (!item) return;
-      item.blocked = blockReason(item.content, settings.rules);
-      setMessages(old => [item, ...old].slice(0, 100));
-    };
-    return () => { disposed = true; ws.close(); wsRef.current = null; };
-  }, [roomConnected, settings.roomId, settings.rules]);
+    const connection = new DouyinConnection({
+      listen: <T,>(channel: string, callback: (payload: T) => void) => listen<T>(channel, event => callback(event.payload)),
+      invoke: call, uuid: () => crypto.randomUUID(),
+    }, raw => {
+      const normalized = normalizeInteraction(raw);
+      const giftUpdate = normalized?.gift ? `:${normalized.gift.combo_id}:${normalized.gift.count}:${normalized.gift.is_final}` : '';
+      const eventId = `${raw.roomId}:${raw.id}${giftUpdate}`;
+      void call<boolean>('queue_archive_event', { eventId, raw }).then(async fresh => {
+        if (!fresh || disposed || !interactionQueueRef.current) return;
+        if (normalized && (normalized.type === 'gift' || !blockReason(normalized.content, danmakuRulesRef.current))) await interactionQueueRef.current.ingest(normalized);
+        if (!disposed) await call('queue_ack_event', { eventId });
+      }).catch(error => { const message = `保存直播事件失败：${errorText(error)}`; setAuto(false); reportError(message); });
+      const item = parseDanmakuEvent(JSON.stringify(raw));
+      if (item) { item.blocked = blockReason(item.content, danmakuRulesRef.current); setMessages(old => [item, ...old].slice(0, 100)); }
+    }, state => {
+      setDanmakuStatus(state.message);
+      setRoomConnected(!state.terminal);
+      log(`douyinLive：${state.message}`);
+      if (state.terminal) { reportError(state.message); void connection.stop().catch(error => log(errorText(error))); }
+    });
+    danmakuRef.current = connection;
+    return () => { disposed = true; danmakuRef.current = null; void connection.stop().catch(() => {}); };
+  }, []);
 
   async function action(task: () => Promise<void>) {
     setPending(true);
@@ -692,21 +726,24 @@ export function ConsoleApp() {
     await avatars.selectProfile(id);
   }
   const startDanmaku = () => action(async () => {
-    if (!settings.roomId.trim()) throw new Error('请先输入直播间号');
-    await call('start_dyhub');
-    await call('dyhub_connect', { roomId: settings.roomId });
-    setRoomConnected(true);
-    log(`开始获取直播间 ${settings.roomId} 的弹幕`);
+    if (!settings.roomId.trim()) throw new Error('请先输入直播间号或直播分享链接');
+    if (!interactionQueueRef.current) throw new Error('互动队列尚未加载，请稍后再启动弹幕采集');
+    setDanmakuStatus('正在连接 douyinLive…');
+    try {
+      const room = await danmakuRef.current?.start(settings.roomId);
+      if (room) update({ roomId: room });
+    } catch (error) { setRoomConnected(false); setDanmakuStatus(errorText(error)); throw error; }
   });
   const stopDanmaku = () => action(async () => {
-    try { if (roomConnected) await call('dyhub_disconnect', { roomId: settings.roomId }); }
-    catch (error) { const message = `断开直播间失败：${errorText(error)}`; reportError(message); log(message); }
-    finally { await call('stop_dyhub'); }
+    await danmakuRef.current?.stop();
     setRoomConnected(false);
+    setDanmakuStatus('已停止获取弹幕');
     log('已停止获取弹幕');
   });
   const startAvatar = async () => {
     if (creatingAvatarRef.current || recoveryRef.current?.pending || session || avatars.loading || avatars.saving || !avatars.library) return;
+    sessionSyncRef.current?.invalidate();
+    readyRef.current = false; setReady(false);
     creatingAvatarRef.current = true;
     expectedDisconnectRef.current = false;
     setLiveState(null);
@@ -744,7 +781,7 @@ export function ConsoleApp() {
       log(message);
     } finally { creatingAvatarRef.current = false; setCreatingAvatar(false); setPending(false); }
   };
-  const stopAvatar = () => action(async () => { recoveryRef.current?.cancel(); resumeRecoveredRef.current = null; recoveryAutoRef.current = false; modelRequestRef.current += 1; generatingReplyRef.current = false; setBusyState(false); setAuto(false); expectedDisconnectRef.current = true; try { await call('end_session'); } catch (error) { expectedDisconnectRef.current = false; throw error; } const liveId = activeLiveIdRef.current || session?.live_id; if (liveId) endedLiveIdsRef.current.add(liveId); activeLiveIdRef.current = null; setSession(null); setInitStage('Vidu 已确认会话结束'); setReady(false); setBusyState(false); setRtcJoined(false); setMicEnabled(false); micRef.current = false; setAvatarNotice({ kind: 'success', message: '数字人会话已结束。' }); log('Vidu 会话已结束'); });
+  const stopAvatar = () => action(async () => { sessionSyncRef.current?.invalidate(); recoveryRef.current?.cancel(); resumeRecoveredRef.current = null; recoveryAutoRef.current = false; modelRequestRef.current += 1; generatingReplyRef.current = false; setBusyState(false); setAuto(false); expectedDisconnectRef.current = true; try { await call('end_session'); } catch (error) { expectedDisconnectRef.current = false; throw error; } const liveId = activeLiveIdRef.current || session?.live_id; if (liveId) endedLiveIdsRef.current.add(liveId); activeLiveIdRef.current = null; setSession(null); setInitStage('Vidu 已确认会话结束'); setReady(false); setBusyState(false); setRtcJoined(false); setMicEnabled(false); micRef.current = false; setAvatarNotice({ kind: 'success', message: '数字人会话已结束。' }); log('Vidu 会话已结束'); });
   const toggleMicrophone = async () => {
     if (!rtcJoined || micPending || !session) return;
     setMicPending(true);
@@ -816,7 +853,7 @@ export function ConsoleApp() {
     }));
     await queue.importTestBatch(items);
     if (activeLiveIdRef.current !== liveId || !readyRef.current) throw new Error('数字人会话已结束，测试已保留在队列中，未启动播报');
-    setMessages(old => [...items.map(({ event }) => ({ id: event.event_id, ts: event.created_at, nickname: event.nickname, content: event.content, blocked: null })), ...old].slice(0, 100));
+    setMessages(old => [...[...items].reverse().map(({ event }) => ({ id: event.event_id, ts: event.created_at, nickname: event.nickname, content: event.content, blocked: null })), ...old].slice(0, 100));
     setShowTestDanmaku(false);
     setAuto(true);
     log(`测试批次 ${batchId} · 会话 ${liveId} · 已按输入顺序导入 ${items.length} 条互动，新一轮等待下行音频静音确认后串行播报；协议诊断记录在应用数据目录 douyin-live/data/vidu-signals.jsonl`);
@@ -847,9 +884,9 @@ export function ConsoleApp() {
       </div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><h1>{tab === 'live' ? '直播中控台' : tab === 'rules' ? '弹幕配置' : tab === 'songs' ? '唱歌模块' : tab === 'voice' ? '音色克隆' : tab === 'models' ? '模型配置' : '形象设定'}</h1></div><div className="top-actions"><span className="pill"><span className={roomConnected ? 'status-dot good' : 'status-dot'}/> 弹幕采集 {roomConnected ? '获取中' : '未启动'}</span><span className="pill"><span className={ready ? 'status-dot good' : 'status-dot'}/> 数字人 {ready ? '已就绪' : session ? '连接中' : '未创建'}</span></div></header>
+      <header className="topbar"><div><h1>{tab === 'live' ? '直播中控台' : tab === 'rules' ? '弹幕配置' : tab === 'songs' ? '唱歌模块' : tab === 'voice' ? '音色克隆' : tab === 'models' ? '模型配置' : '形象设定'}</h1></div><div className="top-actions"><span className="pill"><span className={roomConnected ? 'status-dot good' : 'status-dot'}/> 弹幕采集 {danmakuStatus}</span><span className="pill"><span className={ready ? 'status-dot good' : 'status-dot'}/> 数字人 {ready ? '已就绪' : session ? '连接中' : '未创建'}</span></div></header>
       {tab === 'live' && <div className="content live-grid">
-        <section className="card control-card"><div className="section-title"><div><h2>连接抖音弹幕</h2></div><Radio size={19}/></div><div className="fields-row"><label className="grow">直播间号<input value={settings.roomId} disabled={roomConnected} onChange={e => update({ roomId: e.target.value })} placeholder="输入 web_rid"/></label></div><div className="button-row"><button className="primary" disabled={pending || roomConnected} onClick={startDanmaku}><Play size={16}/> 启动获取弹幕</button><button disabled={pending || !roomConnected} onClick={stopDanmaku}><Square size={16}/> 停止获取弹幕</button><button disabled={pending} aria-expanded={showTestDanmaku} aria-controls="test-danmaku-panel" onClick={() => setShowTestDanmaku(value => !value)}><Plus size={16}/> 测试输入弹幕</button></div>
+        <section className="card control-card"><div className="section-title"><div><h2>连接抖音弹幕</h2><p className="muted">douyinLive · {danmakuStatus}</p></div><Radio size={19}/></div><div className="fields-row"><label className="grow">直播间号<input value={settings.roomId} disabled={roomConnected} onChange={e => update({ roomId: e.target.value })} placeholder="输入直播间号或抖音直播分享链接"/></label></div><div className="button-row"><button className="primary" disabled={pending || roomConnected || !queueDirectory} onClick={startDanmaku}><Play size={16}/> 启动获取弹幕</button><button disabled={pending || !roomConnected} onClick={stopDanmaku}><Square size={16}/> 停止获取弹幕</button><button disabled={pending} aria-expanded={showTestDanmaku} aria-controls="test-danmaku-panel" onClick={() => setShowTestDanmaku(value => !value)}><Plus size={16}/> 测试输入弹幕</button></div>
           {showTestDanmaku && <div className="test-danmaku-panel" id="test-danmaku-panel">
             <label htmlFor="test-danmaku-input">测试弹幕 / 礼物（每次 1～{INTERACTION_SLOT_COUNT} 条）</label>
             <textarea id="test-danmaku-input" rows={6} value={testDanmakuInput} disabled={pending} onChange={event => setTestDanmakuInput(event.target.value)} spellCheck={false}/>
@@ -871,32 +908,35 @@ export function ConsoleApp() {
             <button disabled={!rtcJoined || micPending} onClick={() => void toggleMicrophone()}>{micEnabled ? <MicOff size={16}/> : <Mic2 size={16}/>} {micPending ? '麦克风连接中…' : micEnabled ? '关闭麦克风' : '开启麦克风识别'}</button>
             <span className="hint">{micError || (micEnabled ? '麦克风已开启' : '麦克风已关闭')}</span>
           </div>
-          <div className="auto-row"><div><strong>自动回答弹幕</strong></div><button className={auto ? 'switch on' : 'switch'} onClick={toggleAutomaticQueue} aria-label="切换自动回答" aria-pressed={auto}><span/></button></div>
+          <div className="auto-row"><div><strong>自动回答弹幕</strong><p className="hint">{auto ? '已开启，就绪后自动生成回答并播报。' : '当前关闭：只采集与入槽，不生成回答；启动数字人后仍需开启此开关。'}</p></div><button className={auto ? 'switch on' : 'switch'} onClick={toggleAutomaticQueue} aria-label="切换自动回答" aria-pressed={auto}><span/></button></div>
         </section>
         <section className="card interaction-queue-card"><div className="section-title"><div><h2>互动任务队列</h2></div><span className="count">{interactionState.tasks.length}/{INTERACTION_SLOT_COUNT} 槽位</span></div>
+          <p className="hint">3个槽位固定保留，不因超时或新弹幕替换；完成或手动跳过后前移，再从最新候选补位。手动插歌会替换槽位3。启动数字人并开启自动回答后生成和播报。</p>
+          {!!interactionState.deferred_tasks?.length && <p className="hint">旧版待补位任务 {interactionState.deferred_tasks.length} 条，已保留为候选。</p>}
           <p className="hint">候选弹幕 {interactionState.candidates.filter(event => event.type === 'chat').length} · 待感谢礼物 {interactionState.candidates.filter(event => event.type === 'gift').length + Object.keys(interactionState.combos).length} · 模型生成 {interactionState.tasks.filter(task => task.status === 'generating').length}/2 · 已播报 {interactionState.totals?.played ?? 0}</p>
-          <div className="queue-handoff-controls"><strong>本地语音输入</strong><p className="hint">FunASR 中文麦克风识别；播报结束由全部 PCM 发送完成和 RTC 实际下行静音共同判断。</p><div className="button-row"><button disabled={asrStatus === 'loading' || micEnabled} onClick={() => void checkAsr()}>{asrStatus === 'loading' ? '加载中…' : '检查 FunASR 服务'}</button><span className="hint" role="status">{asrMessage || '请先启动本机语音服务'}</span></div></div>
+          <div className="queue-handoff-controls"><strong>FunASR 下行播报确认</strong><p className="hint">识别 RTC 实际播放声音：长回答比较末尾10字，短回答比较全文，匹配度达标且最后3字一致后结束当前槽位；不再固定等待静音。</p><label>播报结束匹配度（%）<input type="number" min={50} max={100} step={1} disabled={!queueDirectory || queuePlaying} value={recognitionMatchDraft} onChange={event => setRecognitionMatchDraft(event.target.value)} onBlur={saveRecognitionMatch} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><div className="button-row"><button disabled={asrStatus === 'loading' || micEnabled} onClick={() => void checkAsr()}>{asrStatus === 'loading' ? '加载中…' : '检查 FunASR 服务'}</button><span className="hint" role="status">{asrMessage || '请先启动本机语音服务'}</span></div></div>
           <div className="queue-handoff-controls">
             <div className="auto-row"><div><strong>承接动作</strong></div><button className={handoff.enabled ? 'switch on' : 'switch'} disabled={!queueDirectory} aria-label="切换承接动作" aria-pressed={handoff.enabled} onClick={() => void manageQueue(() => interactionQueueRef.current?.configureHandoff(!handoff.enabled, handoff.direction))}><span/></button></div>
-            <div className="fields-row"><label>当前槽位语音识别匹配度（%）<input type="number" min={1} max={100} step={1} disabled={!handoff.enabled || !queueDirectory} value={handoffTriggerDraft} onChange={event => setHandoffTriggerDraft(event.target.value)} onBlur={saveHandoffTrigger} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>承接动作方向<select disabled={!handoff.enabled || !queueDirectory} value={handoff.direction} onChange={event => void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, event.target.value as HandoffDirection))}>{HANDOFF_DIRECTIONS.map(direction => <option key={direction.value} value={direction.value}>{direction.label}</option>)}</select></label><label>查看角度（度）<input type="number" min={0} max={90} step={1} disabled={!handoff.enabled || !queueDirectory || handoff.direction === 'front'} value={handoffAngleDraft} onChange={event => setHandoffAngleDraft(event.target.value)} onBlur={saveHandoffAngle} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>动作提交后的等待时间（毫秒）<input type="number" min={0} max={3000} step={1} disabled={!handoff.enabled || !queueDirectory} value={handoffWaitDraft} onChange={event => setHandoffWaitDraft(event.target.value)} onBlur={saveHandoffWait} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
+            <div className="fields-row"><label>承接动作方向<select disabled={!handoff.enabled || !queueDirectory} value={handoff.direction} onChange={event => void manageQueue(() => interactionQueueRef.current?.configureHandoff(handoff.enabled, event.target.value as HandoffDirection))}>{HANDOFF_DIRECTIONS.map(direction => <option key={direction.value} value={direction.value}>{direction.label}</option>)}</select></label><label>查看角度（度）<input type="number" min={0} max={90} step={1} disabled={!handoff.enabled || !queueDirectory || handoff.direction === 'front'} value={handoffAngleDraft} onChange={event => setHandoffAngleDraft(event.target.value)} onBlur={saveHandoffAngle} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label><label>回复动作延迟（毫秒）<input type="number" min={0} max={60000} step={100} disabled={!queueDirectory} value={replyActionDelayDraft} onChange={event => setReplyActionDelayDraft(event.target.value)} onBlur={saveReplyActionDelay} onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}/></label></div>
             {handoff.direction === 'front' && <p className="hint">平视前方不使用查看角度，其他方向继续使用已保存的角度。</p>}
-            {lastHandoff && <p className="hint" role="status">承接动作：{handoffActionLabel(lastHandoff.direction, lastHandoff.angle_deg ?? 30)} · {{ pending: '正在提交', submitted: '已提交，下一条延后' + (lastHandoff.wait_ms ?? 1699) + '毫秒', failed: '发送失败', cancelled: '已取消' }[lastHandoff.status]}{lastHandoff.error && '：' + errorText(lastHandoff.error)}</p>}
+            <p className="hint">每个槽位先提交承接动作，再发送缓存PCM；回复动作从首帧PCM成功发送起计时，0毫秒为同时提交，500毫秒为延后500毫秒。</p>
           </div>
           <div className="interaction-slots">{Array.from({ length: INTERACTION_SLOT_COUNT }, (_, index) => { const task = interactionState.tasks[index]; const gesture = task?.result ? avatarActionFor(task) : null; return <div className={task ? 'interaction-slot occupied' : 'interaction-slot'} key={index}>
             <strong>槽位 {index + 1}{task && ' · ' + task.event.nickname}</strong>
-            {task ? <><span className="tag">{task.song ? '播放歌曲' : task.event.type === 'gift' ? '礼物优先' : '弹幕'} · {task.song && task.status === 'ready' ? '等待播放' : task.song && task.status === 'playing' ? task.song_playback === 'blocked' ? '等待点击恢复播放' : task.song_playback === 'playing' ? '正在播放原歌曲' : '正在启动原歌曲' : lastHandoff?.task_id === task.id && lastHandoff.status === 'pending' ? '承接动作中' : { pending: '等待生成', generating: '后台生成回答中', ready: task.prepared_audio?.state === 'ready' ? '声音已就绪，等待播放' : task.prepared_audio?.state === 'preparing' ? '正在预合成声音' : '回答已生成，等待合成', playing: '正在播报', uncertain: '等待人工确认', failed: '生成失败' }[task.status]}</span><p>{task.event.content}</p>{task.song ? <p className="interaction-reply">{`原歌曲时长 ${(task.song.duration_ms / 1000).toFixed(1)} 秒 · 使用预生成歌词时间轴`}</p> : <TaskDialogue task={task}/>}{task.error && <p className="hint">{errorText(task.error)}</p>}
+            {task ? <><span className="tag">{task.song ? '播放歌曲' : task.event.type === 'gift' ? '礼物优先' : '弹幕'} · {task.song && task.status === 'ready' ? '等待播放' : task.song && task.status === 'playing' ? task.song_playback === 'blocked' ? '等待点击恢复播放' : task.song_playback === 'playing' ? '正在播放原歌曲' : '正在启动原歌曲' : task.handoff_action?.status === 'pending' ? '承接动作中' : { pending: waitingReason || '等待生成', generating: '后台生成回答中', ready: task.prepared_audio?.state === 'ready' ? '声音已就绪，等待播放' : task.prepared_audio?.state === 'preparing' ? '正在预合成声音' : '回答已生成，等待合成', playing: '正在播报', uncertain: '等待人工确认', failed: '生成失败' }[task.status]}</span><p>{task.event.content}</p>{task.song ? <p className="interaction-reply">{`原歌曲时长 ${(task.song.duration_ms / 1000).toFixed(1)} 秒 · 使用预生成歌词时间轴`}</p> : <TaskDialogue task={task} waitingReason={waitingReason}/>}{task.error && <p className="hint">{errorText(task.error)}</p>}
               {task.song && task.status === 'ready' && <p className="hint">{!session || !ready ? '等待数字人连接就绪' : !rtcJoined ? '等待 OBS 播放窗口连接' : micEnabled || micPending ? '请先关闭麦克风识别' : index > 0 ? '等待前面的槽位播放完成；自动回答关闭时，需先处理前面的弹幕任务' : busy && !queuePlaying ? '等待当前提问结束' : !videoPlaying ? '等待 OBS 实时画面恢复' : '等待 OBS 启动原歌曲，无需开启自动回答'}</p>}
               {task.song && task.status === 'playing' && task.song_playback === 'blocked' && <p className="hint">请在 OBS 窗口点击“恢复播放”，歌曲将从头开始。</p>}
-              {!task.song && asrEnabled && ['playing', 'uncertain'].includes(task.status) && <p className="hint">语音识别：{task.recognition?.error ? errorText(task.recognition.error) : task.status === 'uncertain' ? '等待人工确认' : (task.recognition?.progress || 0) * 100 + 1e-9 >= (handoff.enabled ? handoff.trigger_percent ?? 50 : recognitionMatchPercent) ? '匹配通过' : !task.answer?.text ? '等待数字人返回回答' : '匹配实际回答中'} · 匹配度 {Math.floor((task.recognition?.progress || 0) * 100 + 1e-9)}%{task.recognition?.text && <span> · {task.recognition.text}</span>}</p>}
-              {gesture && <p className="interaction-action">[动作] {gesture.label} · {task.action_state === 'submitted' ? '已发送' : task.action_state === 'failed' ? '发送失败' : '播报时触发'}{task.action_error && <span>：{task.action_error}</span>}</p>}
+              {!task.song && asrEnabled && ['playing', 'uncertain'].includes(task.status) && <p className="hint">语音识别：{task.recognition?.error ? errorText(task.recognition.error) : task.status === 'uncertain' ? '等待人工确认' : (task.recognition?.progress || 0) * 100 + 1e-9 >= (task.result?.generation_mode === 'component' ? recognitionMatchPercent : handoff.enabled ? handoff.trigger_percent ?? 50 : recognitionMatchPercent) && task.recognition?.ending_matched !== false ? '匹配通过' : !(task.result?.prepared_reply || task.answer?.text) ? '等待回答生成' : '匹配实际回答结尾中'} · 匹配度 {Math.floor((task.recognition?.progress || 0) * 100 + 1e-9)}%{task.result?.generation_mode === 'component' && <span> · 末尾3字{task.recognition?.ending_matched ? '已确认' : '待确认'}</span>}{task.recognition?.text && <span> · {task.recognition.text}</span>}</p>}
+              {!task.song && task.handoff_action && <p className="interaction-action">[承接动作] {handoffActionLabel(task.handoff_action.direction, task.handoff_action.angle_deg)} · {{ waiting: '槽位开始时提交', pending: '正在提交', submitted: '已发送', failed: '发送失败', cancelled: '已取消' }[task.handoff_action.status]}{task.handoff_action.error && <span>：{task.handoff_action.error}</span>}</p>}
+              {gesture && <p className="interaction-action">[回复动作] {gesture.label} · {task.action_state === 'submitted' ? '已发送' : task.action_state === 'failed' ? '发送失败' : task.action_state === 'cancelled' ? '已取消' : `PCM开始后${task.reply_action_delay_ms ?? replyActionDelay}毫秒提交`}{task.action_error && <span>：{task.action_error}</span>}</p>}
               <div className="button-row">{task.status === 'uncertain' && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.finish('played', '操作员确认完成'))}>确认完成</button>}{!task.song && ['failed', 'ready'].includes(task.status) && <button onClick={() => void manageQueue(() => interactionQueueRef.current?.retry(task.id))}>重新生成</button>}{['playing', 'uncertain'].includes(task.status) ? <button onClick={() => void skipCurrentQueue()}>打断并跳过</button> : <button onClick={() => void manageQueue(() => interactionQueueRef.current?.skip(task.id))}>跳过</button>}</div></> : <p className="hint">等待最新候选事件补位</p>}
           </div>; })}</div>{queueDirectory && <p className="hint queue-directory">文件目录：{queueDirectory}</p>}
         </section>
-        <section className="card stream-card"><div className="section-title"><div><h2>弹幕流</h2></div><span className="count">{messages.length} 条</span></div><div className="stream-list">{messages.length ? messages.map(m => <div className="message" key={m.id}><div className="message-meta"><strong>{m.nickname}</strong><time>{new Date(m.ts).toLocaleTimeString()}</time>{m.blocked && <span className="blocked">{m.blocked}</span>}</div><div className={m.blocked ? 'message-text muted' : 'message-text'}>{m.content}</div></div>) : <div className="empty">连接直播间后，这里会显示收到的弹幕。</div>}</div></section>
+        <section className="card stream-card"><div className="section-title"><div><h2>弹幕流</h2></div><span className="count">{messages.length} 条 · 最新在上</span></div><div className="stream-list" ref={streamListRef}>{messages.length ? messages.map(m => <div className="message" key={m.id}><div className="message-meta"><strong>{m.nickname}</strong><time>{new Date(m.ts).toLocaleTimeString()}</time>{m.blocked && <span className="blocked">{m.blocked}</span>}</div><div className={m.blocked ? 'message-text muted' : 'message-text'}>{m.content}</div></div>) : <div className="empty">连接直播间后，这里会显示收到的弹幕。</div>}</div></section>
         <section className="card monitor-card"><div className="section-title"><div><h2>操作日志</h2></div><Activity size={19}/></div><div className="monitor-status"><div className={busy ? 'pulse busy' : 'pulse'}/><div><strong>{busy ? '数字人正在回答' : ready ? '等待下一个问题' : '等待连接'}</strong><span>{auto ? '自动模式已开启' : '自动模式已关闭'}</span></div></div><div className="log-list">{logs.map((l, i) => <div key={i}>{l}</div>)}</div><TtsLog/></section>
       </div>}
       {tab === 'rules' && <DanmakuSettings avatarSrc={previewSrc} filters={<FilterRules rules={settings.rules} onChange={rules => update({ rules })} onError={message => { reportError(message); log(message); }}/>}/>}
-      <SingingModule active={tab === 'songs'} onConfigureModel={() => { setModelTab('reply'); setTab('models'); }} queueAvailable={!!queueDirectory && interactionState.tasks.length < INTERACTION_SLOT_COUNT} queuedSongIds={interactionState.tasks.flatMap(task => task.song ? [task.song.id] : [])} onEnqueue={async song => { const queue = interactionQueueRef.current; if (!queue) throw new Error('互动任务队列尚未加载'); await queue.enqueueSong(song); }}/>
+      <SingingModule active={tab === 'songs'} onConfigureModel={() => { setModelTab('reply'); setTab('models'); }} queueAvailable={!!queueDirectory && !['playing', 'uncertain'].includes(interactionState.tasks[INTERACTION_SLOT_COUNT - 1]?.status || '')} queuedSongIds={[...interactionState.tasks, ...(interactionState.deferred_tasks || [])].flatMap(task => task.song ? [task.song.id] : [])} onEnqueue={async song => { const queue = interactionQueueRef.current; if (!queue) throw new Error('互动任务队列尚未加载'); await queue.enqueueSong(song); }}/>
       {tab === 'models' && <ModelConfiguration tab={modelTab} onTabChange={setModelTab} apiKey={apiKey} onApiKeyChange={setApiKey} storageError={keyStorageError}/>}
       <AvatarSettings active={tab === 'settings'} library={avatars.library} loading={avatars.loading} saving={avatars.saving} error={avatars.error} runtimeBusy={runtimeBusy}
         apiKey={apiKey} onConfigureApi={openViduSettings}

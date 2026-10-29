@@ -1,8 +1,10 @@
 export type SongCue = { start_ms: number; end_ms: number; text: string; lead_ms: number };
+export type SongPcmSegment = { index: number; start_ms: number; end_ms: number; sample_count: number; pcm_path: string };
 export type SongDirector = {
   id: string; title: string; created_at: number; duration_ms: number;
   audio_name: string; audio_path: string; directory: string; available: boolean;
   lyrics: string; status: string; raw_segments: SongCue[]; cues: SongCue[]; error: string | null;
+  pcm_ready?: boolean; pcm_segments?: SongPcmSegment[]; pcm_error?: string; pcm_lead_ms?: number;
 };
 export type SongPlaybackIdentity = { live_id: string; task_id: string; playback_token: string };
 export type SongPlaybackState = SongPlaybackIdentity & { state: 'started' | 'blocked' | 'ended' | 'error' | 'stopped'; error?: string };
@@ -71,6 +73,7 @@ export class SongDirectorPlayer {
     prepare?: () => Promise<void>;
     activateAudio?: () => Promise<void>;
     cleanup?: () => void;
+    drain?: () => Promise<void>;
     caption: (text: string) => void;
     state: (state: SongPlaybackState['state'], error?: string) => void;
     observe?: (observation: SongSyncObservation) => void;
@@ -78,7 +81,7 @@ export class SongDirectorPlayer {
   }) {}
   async start() {
     this.adapter.mute(true);
-    this.audio.onended = () => { void this.stop('ended'); };
+    this.audio.onended = () => { void (async () => { try { await this.adapter.drain?.(); if (!this.closed) await this.stop('ended'); } catch (error) { await this.stop('error', String(error)); } })(); };
     this.audio.onerror = () => { void this.stop('error', '原歌曲播放失败，请检查本地音频'); };
     this.lastProgress = Date.now();
     try {

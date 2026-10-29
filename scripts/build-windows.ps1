@@ -8,8 +8,8 @@ $env:TEMP = $temporary
 $env:TMP = $temporary
 Push-Location $workspace
 try {
-  npm run prepare:dyhub
-  if ($LASTEXITCODE -ne 0) { throw 'Preparing dyhub failed' }
+  npm run prepare:douyin
+  if ($LASTEXITCODE -ne 0) { throw 'Preparing douyinLive failed' }
   npm run tauri build
   if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
 } finally { Pop-Location }

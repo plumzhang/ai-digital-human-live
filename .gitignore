@@ -9,3 +9,5 @@ vendor/dyhub/dist/
 .build-tmp/
 __pycache__/
 *.py[cod]
+
+src-tauri/resources/douyin-live/

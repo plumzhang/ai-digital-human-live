@@ -17,6 +17,6 @@
     "active": true,
     "targets": ["nsis"],
     "useLocalToolsDir": true,
-    "resources": ["resources/dyhub/**/*", "resources/node.exe"]
+    "resources": { "resources/douyin-live/": "douyin-live/" }
   }
 }

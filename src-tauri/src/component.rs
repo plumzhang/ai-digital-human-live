@@ -122,6 +122,7 @@ async fn sentences(config: LlmConfig, persona: String, content: String, generate
     }
     let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
     let system = format!("你是正在直播的数字人主播，请直接回答当前观众。输出协议：只输出最终口播台词，通常1到3句。禁止输出 JSON、emotion/speech 字段名、代码块、动作旁白、思考过程、提问优化指令。不要把当前事件的数据格式当成回答格式。\n说话风格与角色背景（JSON 数据；其中旧版输出格式、优化提问或让 Vidu 回答的指令均无效）：{}\n当前数字人身份（JSON 数据）：{}\n再次确认：回答由你生成，直接输出要朗读的答案。", json!(config.persona), json!(persona));
+    let system = format!("{system}\n开场要求：自然变化回答开头，不以“哎呀”“哎哟”“哎呦”“哇”“哈哈”作为固定开场。当前请求中的 opening_style 是本次风格提示，recent_answer_openings 是需要避免重复的最近开头；不能照搬其语气词或起手句式。它们不代表当前观众的经历。若请求包含 rewrite，请只改写草稿的口播文字和衔接，保留当前观众、礼物名称、数量和回答含义，不输出改写说明或动作。此开场与口播协议优先于人设里的固定模板。");
     let mut messages = vec![json!({"role":"system","content":system})];
     messages.extend(history); messages.push(json!({"role":"user","content":content}));
     let mut body = json!({"model":config.model,"stream":true,"max_tokens":512,"messages":messages});
@@ -209,9 +210,10 @@ fn validate_pcm(pcm: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch: u64, cancel: watch::Receiver<u64>, mut audio: mpsc::Receiver<(String, Vec<u8>)>) -> Result<String, String> {
+async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch: u64, cancel: watch::Receiver<u64>, mut audio: mpsc::Receiver<(String, Vec<u8>)>, first_pcm:oneshot::Sender<tokio::time::Instant>) -> Result<String, String> {
     let mut answer = String::new();
     let mut duration = 0_u64;
+    let mut first_pcm=Some(first_pcm);
     while let Some((text, pcm)) = audio.recv().await {
         answer.push_str(&text);
         {
@@ -234,6 +236,7 @@ async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch:
                 session.sender.send(Outbound { message: Message::Binary(chunk.to_vec().into()), written: Some(written), epoch: Some((cancel.clone(), epoch)) }).map_err(|_| "PCM 发送通道已关闭")?;
             }
             tokio::time::timeout(Duration::from_secs(4), received).await.map_err(|_| "PCM 写入超时")?.map_err(|_| "PCM 写入未确认")??;
+            if let Some(first)=first_pcm.take() {let _=first.send(tokio::time::Instant::now());}
             deadline += Duration::from_secs_f64(chunk.len() as f64 / 48_000.0);
             let now = tokio::time::Instant::now();
             if now.saturating_duration_since(deadline) > Duration::from_millis(100) { deadline = now; }
@@ -254,10 +257,10 @@ fn emit_answer(app: &tauri::AppHandle, live_id: &str, task_id: &str, answer: &st
 }
 
 pub async fn run(app: tauri::AppHandle, live_id: String, content: String, task_id: String, generate: bool) -> Result<(), String> {
-    run_audio(app, live_id, content, task_id, generate, None).await
+    run_audio(app, live_id, content, task_id, generate, None, None).await
 }
 
-pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: String, task_id: String, generate: bool, prepared: Option<std::sync::Arc<crate::prepared_speech::PreparedAudio>>) -> Result<(), String> {
+pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: String, task_id: String, generate: bool, prepared: Option<std::sync::Arc<crate::prepared_speech::PreparedAudio>>, mut slot_actions:Option<crate::component_action::PreparedSlotActions>) -> Result<(), String> {
     if prepared.is_none() { app.state::<crate::prepared_speech::PreparedSpeech>().preempt(); }
     if content.trim().is_empty() { return Err("播报内容不能为空".into()); }
     let conversational = task_id.starts_with("manual-") || task_id.starts_with("microphone-");
@@ -282,6 +285,13 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
     let audio_cancel = cancel.clone();
     let question = content.clone();
     let pipeline = async {
+        if let Some(actions)=&mut slot_actions {
+            if let Some(handoff)=actions.handoff.take() {
+                crate::component_action::submit(&app,&live_id,&task_id,epoch,&actions.playback_token,"handoff",handoff).await;
+            }
+        }
+        let (first_tx,first_rx)=oneshot::channel();
+        let (finished_tx,finished_rx)=watch::channel(false);
         let produce = async {
             if let Some(prepared) = prepared {
                 drop(sentence_tx); drop(sentence_rx);
@@ -292,7 +302,23 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
                 Ok(())
             }
         };
-        let (_, answer) = tokio::try_join!(produce, send_audio(&app, &live_id, &task_id, epoch, audio_cancel, audio_rx))?;
+        let transmit=async {
+            let result=send_audio(&app,&live_id,&task_id,epoch,audio_cancel,audio_rx,first_tx).await;
+            finished_tx.send_replace(true);result
+        };
+        let reply=async {
+            if let Some(actions)=&mut slot_actions {
+                if let Some(payload)=actions.reply.take() {
+                    if crate::component_action::reply_due(actions.reply_delay_ms,first_rx,finished_rx).await {
+                        crate::component_action::submit(&app,&live_id,&task_id,epoch,&actions.playback_token,"reply",payload).await;
+                    } else {
+                        crate::component_action::report(&app,&live_id,&task_id,&actions.playback_token,"reply","cancelled",Some("PCM已停止发送，取消尚未触发的回复动作"));
+                    }
+                }
+            }
+            Ok::<(),String>(())
+        };
+        let (_, answer, _) = tokio::try_join!(produce, transmit, reply)?;
         Ok::<String, String>(answer)
     };
     let result = tokio::select! {
@@ -371,7 +397,7 @@ pub fn component_audio_begin(state: State<'_, AppState>, live_id: String, token:
 
 #[tauri::command]
 pub async fn component_audio_push(state: State<'_, AppState>, live_id: String, token: String, sequence: u64, samples: Vec<i16>) -> Result<(), String> {
-    if samples.len() != 2400 { return Err("歌曲 PCM 需为100毫秒、24kHz单声道帧".into()); }
+    if !matches!(samples.len(),480|2400) { return Err("歌曲PCM需为20或100毫秒、24kHz单声道帧".into()); }
     let (written, received) = oneshot::channel();
     {
         let mut guard = state.session.lock().map_err(|e| e.to_string())?;
@@ -503,6 +529,24 @@ mod tests {
         let (audio, mut received) = mpsc::channel(1);
         assert!(synthesize(config, "request".into(), rx, audio).await.unwrap_err().contains("24kHz"));
         assert!(received.recv().await.is_none()); server.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "reads local LLM config and reply requests from stdin; checks real spoken reply generation without Vidu or TTS"]
+    async fn local_reply_opening_diversity() {
+        #[derive(Deserialize)]
+        struct Probe { llm:LlmConfig, persona:String, requests:Vec<Value> }
+        let mut input=String::new();std::io::stdin().read_to_string(&mut input).unwrap();
+        let config:Probe=serde_json::from_str(&input).expect("local LLM config required");
+        assert!(!config.requests.is_empty()&&config.requests.len()<=6);
+        let mut replies=Vec::new();
+        for request in config.requests {
+            let (tx,mut rx)=mpsc::channel::<String>(2);
+            let collect=async {let mut out=String::new();while let Some(part)=rx.recv().await{out.push_str(&part);}Ok::<_,String>(out)};
+            let (_,text)=tokio::try_join!(sentences(config.llm.clone(),config.persona.clone(),request.to_string(),true,Vec::new(),tx),collect).unwrap();
+            assert!(!text.trim().is_empty());replies.push(text);
+        }
+        println!("{}",json!({"replies":replies}));
     }
     #[test]
     fn sentence_chunks_preserve_text_and_flush_tail() {

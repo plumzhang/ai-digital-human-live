@@ -17,13 +17,14 @@ impl Drop for DirectorJob {
     fn drop(&mut self) { if let Ok(mut jobs) = self.app.state::<DirectorRuntime>().0.lock() { jobs.remove(&self.id); } }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Cue { pub start_ms: u64, pub end_ms: u64, pub text: String, pub lead_ms: u64 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Director {
     id: String, title: String, created_at: u128, duration_ms: u64,
     audio_name: String, audio_file: String, lyrics: String, status: String,
     raw_segments: Vec<Cue>, cues: Vec<Cue>, error: Option<String>,
+    #[serde(default)] pcm_lead_ms:u64,
 }
 #[derive(Deserialize)]
 pub struct CreateRequest { title: String, audio_name: String, audio_data: String, duration_ms: u64, lyrics: String }
@@ -47,6 +48,10 @@ fn public(path: &Path, song: &Director) -> Value {
     value["audio_path"] = json!(path.join(&song.audio_file).to_string_lossy());
     value["directory"] = json!(path.to_string_lossy());
     value["available"] = json!(path.join(&song.audio_file).is_file());
+    match crate::song_pcm::load(path,&path.join(&song.audio_file),&song.cues) {
+        Ok(cache)=>{value["pcm_ready"]=json!(true);value["pcm_segments"]=cache.segments(path).unwrap_or(json!([]));},
+        Err(error)=>{value["pcm_ready"]=json!(false);value["pcm_error"]=json!(error);value["pcm_segments"]=json!([]);},
+    }
     value
 }
 fn timestamp(ms: u64) -> String { format!("{:02}:{:02}:{:02},{:03}", ms / 3600000, ms / 60000 % 60, ms / 1000 % 60, ms % 1000) }
@@ -100,7 +105,7 @@ pub async fn director_create(app: tauri::AppHandle, request: CreateRequest, tts:
     let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "歌曲 Base64 编码无效")?;
     if bytes.is_empty() || bytes.len() >= 100 * 1024 * 1024 { return Err("歌曲文件不能为空且需小于 100 MB".into()); }
     let mut song = Director { id: uuid::Uuid::new_v4().to_string(), title: request.title.trim().into(), created_at: crate::unix_ms(), duration_ms: request.duration_ms,
-        audio_name: request.audio_name, audio_file: format!("audio.{ext}"), lyrics: request.lyrics, status: "transcribing".into(), raw_segments: vec![], cues: vec![], error: None };
+        audio_name: request.audio_name, audio_file: format!("audio.{ext}"), lyrics: request.lyrics, status: "transcribing".into(), raw_segments: vec![], cues: vec![], error: None, pcm_lead_ms:0 };
     let path = folder(&app, &song.id)?; fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     let _job = DirectorJob::acquire(&app, &song.id)?;
     fs::write(path.join(&song.audio_file), bytes).map_err(|e| e.to_string())?;
@@ -139,14 +144,25 @@ pub async fn director_correct(app: tauri::AppHandle, id: String, base_url: Strin
     let path = folder(&app, &id)?; let mut song = read(&path)?;
     if song.raw_segments.is_empty() { return Err("请先完成语音识别".into()); }
     let cues = crate::model_api::correct_song_lyrics(base_url, key, model, &song.lyrics, &song.raw_segments).await?;
-    save_timeline(&path, &mut song, cues)?; Ok(public(&path, &song))
+    save_timeline(&path, &mut song, cues)?; prepare_pcm(&app,&path,&song).await?; Ok(public(&path, &song))
 }
 #[tauri::command]
-pub fn director_save(app: tauri::AppHandle, id: String, cues: Vec<Cue>) -> Result<Value, String> {
+pub async fn director_save(app: tauri::AppHandle, id: String, cues: Vec<Cue>, pcm_lead_ms:Option<u64>) -> Result<Value, String> {
     let _job = DirectorJob::acquire(&app, &id)?;
     crate::queue_store::ensure_song_not_queued(&app, &id)?;
     let path = folder(&app, &id)?; let mut song = read(&path)?;
-    save_timeline(&path, &mut song, cues)?; Ok(public(&path, &song))
+    if let Some(lead)=pcm_lead_ms {if lead>5000{return Err("PCM提前量需为0–5000毫秒".into());}song.pcm_lead_ms=lead;}
+    save_timeline(&path, &mut song, cues)?; prepare_pcm(&app,&path,&song).await?; Ok(public(&path, &song))
+}
+async fn prepare_pcm(app:&tauri::AppHandle,path:&Path,song:&Director)->Result<(),String> {
+    validate(&song.cues,song.duration_ms)?;
+    let app=app.clone();let path=path.to_path_buf();let song=song.clone();
+    tauri::async_runtime::spawn_blocking(move||crate::song_pcm::build(&path,&path.join(&song.audio_file),&song.cues,|src,dst|crate::speech_runtime::decode_song_audio(&app,src,dst)).map(|_|())).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+pub async fn director_prepare_pcm(app:tauri::AppHandle,id:String)->Result<Value,String> {
+    let _job=DirectorJob::acquire(&app,&id)?;crate::queue_store::ensure_song_not_queued(&app,&id)?;
+    let path=folder(&app,&id)?;let song=read(&path)?;prepare_pcm(&app,&path,&song).await?;Ok(public(&path,&song))
 }
 #[tauri::command]
 pub fn director_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
@@ -180,7 +196,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("director-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("raw.srt"), "original whisper").unwrap();
-        let mut song = Director { id:uuid::Uuid::new_v4().to_string(), title:"测试".into(), created_at:1, duration_ms:3000, audio_name:"song.mp3".into(), audio_file:"audio.mp3".into(), lyrics:"参考歌词".into(), status:"draft".into(), raw_segments:vec![], cues:vec![], error:None };
+        let mut song = Director { id:uuid::Uuid::new_v4().to_string(), title:"测试".into(), created_at:1, duration_ms:3000, audio_name:"song.mp3".into(), audio_file:"audio.mp3".into(), lyrics:"参考歌词".into(), status:"draft".into(), raw_segments:vec![], cues:vec![], error:None, pcm_lead_ms:0 };
         let cues = vec![Cue { start_ms:100, end_ms:400, text:"开头".into(), lead_ms:500 }, Cue { start_ms:1000, end_ms:2000, text:"校正歌词".into(), lead_ms:600 }];
         save_timeline(&path, &mut song, cues).unwrap();
         assert_eq!(fs::read_to_string(path.join("raw.srt")).unwrap(), "original whisper");

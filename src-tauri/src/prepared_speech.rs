@@ -76,8 +76,8 @@ impl PreparedSpeech {
         live_id: String,
         tokens: Vec<String>,
     ) -> Result<(), String> {
-        if tokens.len() > 6 || tokens.iter().any(|t| uuid::Uuid::parse_str(t).is_err()) {
-            return Err("预生成音频最多保留6个有效槽位".into());
+        if tokens.len() > crate::queue_store::INTERACTION_SLOT_COUNT || tokens.iter().any(|t| uuid::Uuid::parse_str(t).is_err()) {
+            return Err("预生成音频最多保留3个有效槽位".into());
         }
         let mut store = self.0.lock().map_err(|e| e.to_string())?;
         // A disposed/reloaded webview may finish an old cleanup after the new
@@ -292,14 +292,16 @@ pub async fn component_play_prepared(
     token: String,
     text: String,
     tts: TtsConfig,
+    slot_actions: Option<crate::component_action::SlotActions>,
 ) -> Result<(), String> {
     if !valid_session(&app, &live_id) {
         return Err("原会话已结束，缓存音频未发送".into());
     }
+    let actions=slot_actions.map(|a|a.prepare(&task_id)).transpose()?;
     let prepared = app
         .state::<PreparedSpeech>()
         .take(&token, &live_id, &task_id, &text, &tts)?;
-    component::run_audio(app, live_id, text, task_id, false, Some(prepared)).await
+    component::run_audio(app, live_id, text, task_id, false, Some(prepared), actions).await
 }
 
 #[cfg(test)]
