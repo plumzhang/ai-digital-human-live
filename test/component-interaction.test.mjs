@@ -11,6 +11,14 @@ const config = { baseUrl: 'https://model.test', apiKey: 'local-key', selectedMod
 const diversity = { openingStyle: '自然回答', recentOpenings: [] };
 const task = content => ({ id: 'slot', event: { event_id: 'event', type: 'chat', nickname: '小宇', content } });
 
+test('singing action-only planning does not generate a spoken answer or call TTS', async () => {
+  const calls=[];
+  const result=await exports.planComponentInteraction({...task('涂一下口红'),action_only:true},[],diversity,config,async(name,args)=>{
+    calls.push(name);assert.equal(name,'generate_interaction');return {speech:'请求',intent:'action_request',action_instruction:'自然涂一下口红',emotion:'happy',segments:[]};
+  },'live');
+  assert.deepEqual(calls,['generate_interaction']);assert.equal(result.prepared_reply,undefined);assert.equal(result.action_instruction,'自然涂一下口红');
+});
+
 test('every chat reaches intent planning, including a typo and actions outside the old keyword filter', async () => {
   for (const content of ['札一下马尾', '笑一下', '眨眨眼', '涂一下口红']) {
     const calls = [];

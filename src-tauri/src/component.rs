@@ -236,6 +236,14 @@ async fn send_audio(app: &tauri::AppHandle, live_id: &str, task_id: &str, epoch:
                 session.sender.send(Outbound { message: Message::Binary(chunk.to_vec().into()), written: Some(written), epoch: Some((cancel.clone(), epoch)) }).map_err(|_| "PCM 发送通道已关闭")?;
             }
             tokio::time::timeout(Duration::from_secs(4), received).await.map_err(|_| "PCM 写入超时")?.map_err(|_| "PCM 写入未确认")??;
+            {
+                // Serialize local playback with interruption. A late write
+                // receipt must never restart audio from a cancelled epoch.
+                let state = app.state::<AppState>();
+                let guard = state.session.lock().map_err(|e| e.to_string())?;
+                guard.as_ref().filter(|s| s.live_id == live_id && *s.speech_cancel.borrow() == epoch && s.ready).ok_or("播报已取消")?;
+                app.emit_to("obs", "component-pcm", json!({"live_id":live_id,"task_id":task_id,"epoch":epoch,"state":"frame","pcm":chunk})).map_err(|e| format!("本地PCM播放投递失败：{e}"))?;
+            }
             if let Some(first)=first_pcm.take() {let _=first.send(tokio::time::Instant::now());}
             deadline += Duration::from_secs_f64(chunk.len() as f64 / 48_000.0);
             let now = tokio::time::Instant::now();
@@ -268,7 +276,9 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
         let state = app.state::<AppState>();
         let mut guard = state.session.lock().map_err(|e| e.to_string())?;
         let session = guard.as_mut().filter(|s| s.live_id == live_id && s.ready).ok_or("组件会话尚未就绪或已结束")?;
+        if session.song_audio.as_ref().is_some_and(|s|s.active) {return Err("歌曲唱词期间暂停弹幕PCM".into());}
         if session.speaking { return Err("当前仍有音频在发送，请等待完成或先打断".into()); }
+        session.reply_task=Some(task_id.clone());
         if conversational {
             queue_signal(&app, session, 9, json!({"text_msg":{"msg_id":format!("input-{task_id}"),"content":content,"timestamp":unix_ms()}}), None)?;
         }
@@ -327,6 +337,7 @@ pub(crate) async fn run_audio(app: tauri::AppHandle, live_id: String, content: S
         result = pipeline => result,
     };
     if let Err(error) = &result {
+        let _ = app.emit_to("obs", "component-pcm", json!({"live_id":live_id,"epoch":epoch,"state":"stop"}));
         // A partial reply can already be rendering when its next LLM/TTS
         // request fails. Clear that generation without interrupting a new one.
         let state = app.state::<AppState>();
@@ -378,6 +389,7 @@ pub fn component_configure(state: State<'_, AppState>, live_id: String, tts: Tts
     validate(&tts, &llm)?;
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().filter(|s| s.live_id == live_id).ok_or("会话已结束")?;
+    if session.song_audio.as_ref().is_some_and(|s|s.active) {return Err("歌曲唱词期间暂停弹幕PCM".into());}
     if session.speaking { return Err("请等待当前播报发送结束再修改语音配置".into()); }
     session.tts = tts; session.llm = llm;
     Ok(())
@@ -388,6 +400,7 @@ pub fn component_audio_begin(state: State<'_, AppState>, live_id: String, token:
     if token.is_empty() || token.len() > 200 { return Err("歌曲音频标识无效".into()); }
     let mut guard = state.session.lock().map_err(|e| e.to_string())?;
     let session = guard.as_mut().filter(|s| s.live_id == live_id && s.ready).ok_or("组件会话尚未就绪")?;
+    if session.song_audio.is_some(){return Err("歌曲请使用分段音频通道".into());}
     if session.speaking { return Err("请先停止当前音频再播放歌曲".into()); }
     session.speech_cancel.send_modify(|value| *value += 1);
     session.speaking = true;

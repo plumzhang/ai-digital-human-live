@@ -7,6 +7,7 @@ export type SongDirector = {
   pcm_ready?: boolean; pcm_segments?: SongPcmSegment[]; pcm_error?: string; pcm_lead_ms?: number;
 };
 export type SongPlaybackIdentity = { live_id: string; task_id: string; playback_token: string };
+export type SongPcmPhase = SongPlaybackIdentity & { active: boolean };
 export type SongPlaybackState = SongPlaybackIdentity & { state: 'started' | 'blocked' | 'ended' | 'error' | 'stopped'; error?: string };
 export type SongSyncObservation = {
   index: number; text: string; status: 'audio_detected' | 'unconfirmed' | 'overlap' | 'skipped';
@@ -27,6 +28,26 @@ export function songTimelineGaps(cues: SongCue[]): Array<{ start_ms: number; end
 }
 
 export function songCueSendAt(cue: SongCue): number { return Math.max(0, cue.start_ms - cue.lead_ms); }
+
+export function songPcmSchedule<T extends { start_ms:number; end_ms:number }>(segments:T[],leadMs:number):Array<T&{send_at_ms:number;send_end_ms:number}>{
+  if(!Number.isInteger(leadMs)||leadMs<0||leadMs>5000)throw new Error('PCM提前量需为0–5000毫秒的整数');
+  const scheduled:Array<T&{send_at_ms:number;send_end_ms:number}>=[];
+  for(let i=0;i<segments.length;i++){
+    const part=segments[i];
+    if(!Number.isInteger(part.start_ms)||!Number.isInteger(part.end_ms)||part.start_ms<0||part.end_ms<=part.start_ms||(i>0&&part.start_ms<segments[i-1].start_ms))throw new Error('歌词PCM时间轴无效');
+  }
+  let previousEnd=0;
+  for(let first=0;first<segments.length;){
+    let last=first+1,sourceEnd=segments[first].end_ms;
+    while(last<segments.length&&segments[last].start_ms<=sourceEnd){sourceEnd=Math.max(sourceEnd,segments[last].end_ms);last++;}
+    // Negative lead-in times clamp to zero. Preserve complete early phrases
+    // in order when several would otherwise collide before playback starts.
+    const sendStart=Math.max(0,segments[first].start_ms-leadMs,previousEnd);
+    for(let i=first;i<last;i++)scheduled.push({...segments[i],send_at_ms:sendStart+segments[i].start_ms-segments[first].start_ms,send_end_ms:sendStart+segments[i].end_ms-segments[first].start_ms});
+    previousEnd=sendStart+sourceEnd-segments[first].start_ms;first=last;
+  }
+  return scheduled;
+}
 
 export async function readDirectorAudio(file: File): Promise<{ name: string; data: string; duration_ms: number }> {
   const mime = ({ mp3: 'audio/mpeg', wav: 'audio/wav', aac: 'audio/aac', m4a: 'audio/mp4' } as Record<string,string>)[file.name.split('.').at(-1)?.toLowerCase() || ''];

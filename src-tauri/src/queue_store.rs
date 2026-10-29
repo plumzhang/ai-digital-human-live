@@ -119,7 +119,12 @@ pub(crate) fn ensure_song_not_queued(app: &tauri::AppHandle, id: &str) -> Result
 
 fn commit_snapshot(store: &mut Store, snapshot: &Value) -> Result<(), String> {
     let tasks = snapshot["tasks"].as_array().ok_or("无效的队列快照")?;
-    if tasks.len() > INTERACTION_SLOT_COUNT || tasks.iter().filter(|task| matches!(task["status"].as_str(), Some("playing" | "uncertain"))).count() > 1 || tasks.iter().filter(|task| task["status"] == "generating").count() > 2 {
+    let active=tasks.iter().filter(|task|matches!(task["status"].as_str(),Some("playing"|"uncertain"))).count();
+    let song_child=tasks.len()>=2&&active==2&&tasks[0]["song"].is_object()&&matches!(tasks[0]["status"].as_str(),Some("playing"|"uncertain"))
+        &&!tasks[1]["song"].is_object()&&matches!(tasks[1]["status"].as_str(),Some("playing"|"uncertain"))
+        &&tasks[0]["playback_token"].as_str().is_some_and(|token|!token.is_empty()&&tasks[1].pointer("/song_parent/playback_token").and_then(Value::as_str)==Some(token))
+        &&tasks[0]["id"].as_str().is_some_and(|id|tasks[1].pointer("/song_parent/task_id").and_then(Value::as_str)==Some(id));
+    if tasks.len() > INTERACTION_SLOT_COUNT || (active>1&&!song_child) || tasks.iter().filter(|task| task["status"] == "generating").count() > 2 {
         return Err(format!("队列超过 {INTERACTION_SLOT_COUNT} 个槽位或包含多个播报任务"));
     }
     let transaction = store.db.transaction().map_err(|error| error.to_string())?;
@@ -227,6 +232,17 @@ mod tests {
         assert!(commit_snapshot(&mut store, &invalid).is_err());
         let saved: String = store.db.query_row("SELECT snapshot FROM state WHERE id=1", [], |row| row.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), valid);
+        cleanup(store);
+    }
+
+    #[test]
+    fn song_parent_and_gap_chat_can_persist_together_but_unrelated_concurrent_speech_is_rejected(){
+        let mut store=temporary_store();let mut value=snapshot();
+        value["tasks"][0]=json!({"id":"parent","status":"playing","playback_token":"song-token","song":{"id":"song","duration_ms":1000},"event":{"type":"song","content":"歌"}});
+        value["tasks"][1]=json!({"id":"child","status":"playing","song_parent":{"task_id":"parent","playback_token":"song-token"},"event":{"type":"chat","content":"你好"}});
+        commit_snapshot(&mut store,&value).unwrap();
+        value["tasks"][1]["song_parent"]["playback_token"]=json!("old-token");assert!(commit_snapshot(&mut store,&value).is_err());
+        value["tasks"][1]["song_parent"]["playback_token"]=json!("song-token");value["tasks"][2]["status"]=json!("playing");assert!(commit_snapshot(&mut store,&value).is_err());
         cleanup(store);
     }
 

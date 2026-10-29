@@ -21,6 +21,8 @@ async function player(options = {}) {
   const calls = [];
   const monitors = [];
   const songs = [];
+  const bridges = [];
+  const localPlayers = [];
   const refs = [];
   const states = [];
   let refCursor = 0;
@@ -65,7 +67,14 @@ async function player(options = {}) {
     '../microphoneInput': microphoneExports,
     '../ttsConfig': { loadTtsConfig: () => ({ base_url: 'http://127.0.0.1:8766', model: 'k2-fsa/OmniVoice' }) },
     '../songDirector': songDirectorExports,
-    '../songAudioBridge': { createSongAudioBridge: async (audio, send) => ({ dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {}, drain: async () => {} }) },
+    '../localPcmPlayback': { LocalPcmPlayback: class {
+      track = { kind: 'audio', id: 'local-pcm' }; running = true; events = [];
+      constructor() { localPlayers.push(this); }
+      accept(event) { this.events.push(event); }
+      dispose() { this.disposed = true; this.running = false; }
+      async resume() { this.running = true; }
+    } },
+    '../songAudioBridge': { createSongAudioBridge: async (audio, segments, read, lead, send, failed, phase) => { bridges.push({send,phase});return { dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {await phase?.(false,0);}, drain: async () => {} };} },
     '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
       const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
@@ -98,7 +107,7 @@ async function player(options = {}) {
   const tree = render();
   effect();
   await new Promise(resolve => setImmediate(resolve));
-  return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors, songs };
+  return { handlers, rtcHandlers, calls, tree, video, snapshot, render, monitors, songs, bridges, localPlayers };
 }
 
 test('OBS can report its existing join/subscriptions after console listeners reload without rejoining RTC', async () => {
@@ -117,7 +126,7 @@ test('OBS can report its existing join/subscriptions after console listeners rel
   const before=p.calls.length;await p.handlers.get('rtc-status-request')({payload:{live_id:'old'}});assert.equal(p.calls.length,before);
 });
 
-test('OBS song control plays original audio, mutes RTC, submits exact lyrics and restores sound at ended', async () => {
+test('OBS song control plays original audio and keeps RTC muted after the song ends', async () => {
   const p = await player();
   const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
   p.handlers.get('song-control')({ payload:control });
@@ -131,9 +140,29 @@ test('OBS song control plays original audio, mutes RTC, submits exact lyrics and
   assert.equal(p.calls.filter(([name]) => name === 'speech_transcribe').length,0);
   p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
   const interrupt = p.calls.findIndex(([name]) => name === 'interrupt_session');
-  const unmute = p.calls.findIndex(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false);
-  assert.ok(interrupt >= 0 && unmute > interrupt);
+  assert.ok(interrupt >= 0);
+  assert.equal(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false), false);
   assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'ended' && state.playback_token === 'attempt'));
+});
+
+test('OBS switches native song priority before lyric PCM and keeps local gap replies independent of RTC',async()=>{
+  const p=await player();
+  const control={action:'start',live_id:'123',task_id:'song-task',playback_token:'attempt',song_id:'song-id'};
+  p.handlers.get('song-control')({payload:control});await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(p.bridges.length,1);assert.ok(p.calls.some(([name])=>name==='component_song_open'));
+  assert.equal(p.calls.filter(([name])=>name==='component_audio_begin').length,0);
+  const globalStops=p.calls.filter(([name])=>name==='interrupt_session').length;
+  await p.bridges[0].phase(true,0);await p.bridges[0].send(Array(480).fill(100),0);
+  const phase=p.calls.findIndex(([name,args])=>name==='component_song_phase'&&args.active===true);
+  const pcm=p.calls.findIndex(([name])=>name==='component_audio_push');assert.ok(phase>=0&&pcm>phase);
+  await p.bridges[0].phase(false,1);
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',true]);
+  p.handlers.get('whisper-task')({payload:{live_id:'123',task_id:'gap-chat',capture_id:'gap-capture',enabled:true}});
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',true]);
+  assert.equal(p.calls.filter(([name])=>name==='interrupt_session').length,globalStops);
+  p.songs[0].onended();await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(p.calls.some(([name])=>name==='component_song_close'));
+  assert.equal(p.calls.filter(([name])=>name==='interrupt_session').length,globalStops);
 });
 
 test('OBS ignores stale song commands and cancelling a pending load never starts late playback', async () => {
@@ -185,31 +214,52 @@ test('OBS retains the song resume button across video frames and resumes the ori
   p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
 });
 
-test('OBS monitors only subscribed downlink audio and emits VAD events with transport health', async () => {
+test('local playback drives VAD without a remote audio publisher; optional remote silence cannot block it', async () => {
   const p = await player();
+  const local = p.monitors[0];
+  assert.equal(local.track.id, 'local-pcm'); assert.equal(local.receiving(), true);
+  local.activity({ speaking: false, ended: false, healthy: true, quiet_ms: 2000 });
+  assert.equal(p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1].healthy, true);
   const subscribe = p.rtcHandlers.get('audioSubscribeStateChanged');
   subscribe('client', 2, 3);
   subscribe('avatar', 2, 3);
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(p.calls.filter(([name]) => name === 'getAudioTrack'), [['getAudioTrack', 'avatar']]);
-  const monitor = p.monitors[0];
+  const monitor = p.monitors.find(item => item.track.id === 'avatar');
   assert.equal(monitor.receiving(), false);
   p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid: 'avatar', stats: { bytesReceived: 1000 } }]);
   assert.equal(monitor.receiving(), true);
-  monitor.activity({ speaking: true, ended: false, healthy: true });
-  monitor.activity({ speaking: false, ended: true, healthy: true });
+  local.activity({ speaking: true, ended: false, healthy: true });
+  local.activity({ speaking: false, ended: true, healthy: true });
   const end = p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1];
   assert.equal(end.source, 'pcm-vad');
+  assert.equal(end.playback_source, 'local-pcm');
   assert.equal(end.ended, true);
   assert.equal(end.live_id, '123');
   p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid: 'avatar', stats: { bytesReceived: 1000 } }]);
   assert.equal(monitor.receiving(), false);
-  assert.equal(p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1].healthy, false);
+  assert.equal(p.calls.filter(([name]) => name === 'avatar-audio').at(-1)[1].healthy, true);
   subscribe('avatar', 3, 0);
   assert.equal(monitor.disposed, true);
   const before = p.calls.length;
   monitor.activity({ speaking: false, ended: true, healthy: true });
   assert.equal(p.calls.length, before);
+});
+
+test('OBS routes only current-session PCM to its speaker and disposes it on disconnect', async () => {
+  const p = await player(); const local = p.localPlayers[0];
+  const event = { live_id: '123', epoch: 1, state: 'frame', pcm: [0, 1] };
+  p.handlers.get('component-pcm')({ payload: { ...event, live_id: 'old' } });
+  assert.equal(local.events.length, 0);
+  p.handlers.get('component-pcm')({ payload: event });
+  p.handlers.get('component-pcm')({ payload: { ...event, state: 'stop' } });
+  assert.equal(local.events.length, 2);
+  p.handlers.get('vidu-disconnected')({ payload: { live_id: 'old' } });
+  assert.equal(local.disposed, undefined);
+  p.handlers.get('vidu-disconnected')({ payload: { live_id: '123' } });
+  assert.equal(local.disposed, true);
+  p.handlers.get('component-pcm')({ payload: event });
+  assert.equal(local.events.length, 2);
 });
 
 test('OBS binds Whisper PCM and recognition results to the current task and ignores another live', async () => {

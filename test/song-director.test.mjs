@@ -16,6 +16,17 @@ const cues = [
   { start_ms: 1000, end_ms: 2000, text: '第一句', lead_ms: 500 },
   { start_ms: 4000, end_ms: 5000, text: '第二句', lead_ms: 700 },
 ];
+test('PCM and lyric text have independent send times on the unchanged original audio clock',()=>{
+  const cue={start_ms:10000,end_ms:12000,text:'歌词',lead_ms:200};
+  assert.equal(api.songCueSendAt(cue),9800);
+  assert.equal(api.songPcmSchedule([cue],500)[0].send_at_ms,9500);
+  assert.equal(api.songPcmSchedule([cue],0)[0].send_at_ms,10000);
+  assert.equal(api.songPcmSchedule([cue],500)[0].send_end_ms,11500);
+  const early=[{start_ms:100,end_ms:205},{start_ms:300,end_ms:400},{start_ms:1000,end_ms:2000}];
+  assert.deepEqual(Array.from(api.songPcmSchedule(early,500),c=>c.send_at_ms),[0,105,500]);
+  const overlap=[{start_ms:100,end_ms:600},{start_ms:500,end_ms:800},{start_ms:2000,end_ms:2500}];
+  assert.deepEqual(Array.from(api.songPcmSchedule(overlap,500),c=>c.send_at_ms),[0,400,1500]);
+});
 function setup(extra = {}) {
   now = 10000;
   const calls = [];
@@ -160,7 +171,7 @@ test('cancelling during initial AI interruption never starts original audio late
   assert.equal(played,false); assert.equal(p.speaks().length,0);
 });
 
-test('song end waits for the configured audible tail and interruption prevents a late ended event',async()=>{
+test('song end waits for pending PCM writes and interruption prevents a late ended event',async()=>{
   let release;const p=setup({drain:()=>new Promise(resolve=>{release=resolve;})});
   await p.player.start();p.audio.onended();
   assert.equal(p.calls.some(c=>c[0]==='state'&&c[1]==='ended'),false);

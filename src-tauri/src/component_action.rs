@@ -212,7 +212,7 @@ mod tests {
                 voice_provider: "omnivoice".into(),
                 ready: true,
                 speaking: false,
-                external_audio: None,
+                external_audio: None, song_audio: None, reply_task: None,
                 conversation: Vec::new(),
                 speech_cancel: tokio::sync::watch::channel(0).0,
                 tts: crate::component::TtsConfig {

@@ -9,6 +9,7 @@ mod tts_log;
 mod songs;
 mod song_director;
 mod song_pcm;
+mod song_audio;
 mod whisper;
 mod speech_runtime;
 mod speech_stt;
@@ -96,6 +97,8 @@ struct Session {
     ready: bool,
     speaking: bool,
     external_audio: Option<(String, u64)>,
+    song_audio: Option<song_audio::SongAudioOwner>,
+    reply_task: Option<String>,
     conversation: Vec<Value>,
     speech_cancel: tokio::sync::watch::Sender<u64>,
     tts: component::TtsConfig,
@@ -119,7 +122,7 @@ where W: futures_util::Sink<Message> + Unpin, W::Error: std::fmt::Display {
 }
 
 #[derive(Serialize, Clone)]
-struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String, ready: bool }
+struct SessionSnapshot { live_id: String, rtc: Value, voice_provider: String, ready: bool, song_phase: Option<Value> }
 
 #[derive(Deserialize)]
 struct AvatarSettings {
@@ -196,9 +199,9 @@ async fn create_session(app: tauri::AppHandle, state: State<'_, AppState>, key: 
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Authorization", HeaderValue::from_str(&format!("Token {}", key)).map_err(|e| e.to_string())?);
     let (sender, mut receiver) = unbounded_channel::<Outbound>();
-    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: "qwen3_tts".into(), ready: false };
+    let snapshot = SessionSnapshot { live_id: live_id.clone(), rtc: rtc.clone(), voice_provider: "qwen3_tts".into(), ready: false, song_phase: None };
     let task_conn_id = conn_id.clone();
-    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id: conn_id.clone(), key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: "qwen3_tts".into(), ready: false, speaking: false, external_audio: None, conversation: Vec::new(), speech_cancel: tokio::sync::watch::channel(0).0, tts: avatar.tts, llm: avatar.llm, persona: avatar.persona });
+    *state.session.lock().map_err(|e| e.to_string())? = Some(Session { live_id: live_id.clone(), conn_id: conn_id.clone(), key, region, rtc, sender, seq: 100, last_video_frame_ms: unix_ms(), voice_provider: "qwen3_tts".into(), ready: false, speaking: false, external_audio: None, song_audio: None, reply_task: None, conversation: Vec::new(), speech_cancel: tokio::sync::watch::channel(0).0, tts: avatar.tts, llm: avatar.llm, persona: avatar.persona });
     // Retain the live ID before connecting so a failed handshake can still be
     // ended and cannot silently leave an untracked billable session behind.
     let _ = app.emit("session-changed", snapshot.clone());
@@ -322,6 +325,10 @@ fn send_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload
 }
 
 fn queue_signal(app: &tauri::AppHandle, session: &mut Session, kind: u64, payload: Value, written: Option<oneshot::Sender<Result<(), String>>>) -> Result<(), String> {
+    if kind == 7 {
+        let epoch = session.speech_cancel.borrow().saturating_sub(1);
+        let _ = app.emit_to("obs", "component-pcm", json!({"live_id":session.live_id,"epoch":epoch,"state":"stop"}));
+    }
     session.seq += 1;
     let message = json!({"type":kind,"live_id":session.live_id,"conn_id":session.conn_id,"seq_id":session.seq,"payload":payload});
     session.sender.send(Outbound { message: Message::Text(message.to_string().into()), written, epoch: None }).map_err(|error| {
@@ -444,6 +451,7 @@ fn interrupt_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id:
     session.speech_cancel.send_modify(|value| *value += 1);
     session.speaking = false;
     session.external_audio = None;
+    session.song_audio = None; session.reply_task = None;
     send_signal(&app, session, 7, json!({}))
 }
 
@@ -467,6 +475,7 @@ async fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, live_id:
     let current = {
         let mut guard = state.session.lock().map_err(|e| e.to_string())?;
         guard.as_mut().filter(|session| live_id.as_ref().is_none_or(|id| *id == session.live_id)).map(|session| {
+            let _ = app.emit_to("obs", "component-pcm", json!({"live_id":session.live_id,"epoch":*session.speech_cancel.borrow(),"state":"stop"}));
             session.speech_cancel.send_modify(|value| *value += 1);
             session.speaking = false;
             session.seq += 1;
@@ -503,7 +512,7 @@ fn playback_frame(state: State<'_, AppState>, live_id: String) -> Result<(), Str
 
 #[tauri::command]
 fn session_snapshot(state: State<'_, AppState>) -> Result<Option<SessionSnapshot>, String> {
-    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone(), voice_provider: s.voice_provider.clone(), ready: s.ready }))
+    Ok(state.session.lock().map_err(|e| e.to_string())?.as_ref().map(|s| SessionSnapshot { live_id: s.live_id.clone(), rtc: s.rtc.clone(), voice_provider: s.voice_provider.clone(), ready: s.ready, song_phase: s.song_audio.as_ref().map(|song|json!({"live_id":s.live_id,"task_id":song.task_id,"playback_token":song.token,"active":song.active})) }))
 }
 
 #[tauri::command]
@@ -722,7 +731,7 @@ fn main() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![prepared_speech::component_audio_open, prepared_speech::component_audio_retain, prepared_speech::component_prepare_audio, prepared_speech::component_play_prepared, component::component_prepare_reply, speech_runtime::component_local_status, speech_runtime::component_stop_local, component::component_tts_preview, speech_runtime::component_start_local, component::component_audio_begin, component::component_audio_push, component::component_transcription, component::component_local_voice, component::component_preflight, component::component_respond, component::component_configure, create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, douyin_live::douyin_connect, douyin_live::douyin_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, speech_stt::speech_prepare, speech_stt::speech_transcribe, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_prepare_pcm, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
+        .invoke_handler(tauri::generate_handler![song_audio::component_song_open,song_audio::component_song_phase,song_audio::component_song_close,song_audio::component_interrupt_reply,prepared_speech::component_audio_open, prepared_speech::component_audio_retain, prepared_speech::component_prepare_audio, prepared_speech::component_play_prepared, component::component_prepare_reply, speech_runtime::component_local_status, speech_runtime::component_stop_local, component::component_tts_preview, speech_runtime::component_start_local, component::component_audio_begin, component::component_audio_push, component::component_transcription, component::component_local_voice, component::component_preflight, component::component_respond, component::component_configure, create_session, send_question, interrupt_session, tts_log::tts_log_load, tts_log::tts_log_song_observation, end_session, session_snapshot, playback_frame, live_status, open_obs_window, obs_window::fit_obs_video, open_voice_document, douyin_live::douyin_connect, douyin_live::douyin_disconnect, clone_tts_voice, clone_live_voice, list_voices, account_credits, delete_voice, preview_voice, speak_text, send_avatar_action, send_handoff_action, model_api::list_models, model_api::generate_reply, model_api::generate_interaction, queue_store::queue_load, queue_store::queue_commit, queue_store::queue_archive_event, queue_store::queue_ack_event, queue_store::queue_save_config, speech_stt::speech_prepare, speech_stt::speech_transcribe, whisper::whisper_prepare, whisper::whisper_transcribe, songs::songs_create, songs::songs_list, songs::songs_delete, songs::songs_resume, songs::songs_attach_task, songs::songs_open_folder, song_director::director_prepare_pcm, song_director::director_list, song_director::director_get, song_director::director_create, song_director::director_transcribe, song_director::director_correct, song_director::director_save_timing, song_director::director_save, song_director::director_delete, song_director::director_open_folder])
         .run(tauri::generate_context!())
         .expect("Tauri application failed");
 }

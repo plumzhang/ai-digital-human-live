@@ -143,6 +143,58 @@ function operator(p, send) {
   return { manual, sent, idle, voice, questions: () => questions };
 }
 
+test('one test interaction replaces slot three without switching the live room or dropping real chat', async () => {
+  const p=setup();for(const id of ['A','B','C'])await p.engine.ingest(p.event(id));
+  const before=p.engine.snapshot().tasks;
+  const position=await p.engine.insertTestInteraction({event:p.event('test-input','chat',{room_id:'test-isolated',nickname:'测试观众'})});
+  assert.equal(position,3);let state=p.engine.snapshot();
+  assert.equal(state.room_id,'room');assert.equal(state.tasks[2].event.room_id,'room');assert.equal(state.tasks[2].event.source,'test');
+  assert.deepEqual(state.tasks.slice(0,2),before.slice(0,2));assert.equal(state.tasks[2].event.event_id,'test-input');
+  assert.equal(state.history.at(-1).task.id,before[2].id);assert.ok(!state.candidates.some(e=>e.event_id==='C'));
+  await p.engine.ingest(p.event('real-newest'));
+  state=p.engine.snapshot();assert.deepEqual(state.tasks.map(t=>t.event.event_id),['A','B','test-input']);
+  assert.equal(state.candidates[0].event_id,'real-newest');assert.equal(p.jobs.size,0);
+  p.engine.dispose();
+});
+
+test('a single test can be inserted before avatar readiness and does not turn on automatic replies', async () => {
+  const p=setup();
+  await p.engine.insertTestInteraction({event:p.event('pending-test')});
+  assert.equal(p.engine.snapshot().tasks[0].status,'pending');
+  await p.engine.setContext(false,'live',false);await p.engine.tick();
+  await p.engine.setContext(false,'live',true);await p.engine.tick();
+  assert.equal(p.jobs.size,0);assert.equal(p.spoken.length,0);
+  await p.engine.setContext(true,'live',true);assert.ok(p.jobs.has('pending-test'));p.engine.dispose();
+});
+
+test('single test insertion rejects arrays or invalid gifts without replacing any slot', async () => {
+  const p=setup();for(const id of ['A','B','C'])await p.engine.ingest(p.event(id));
+  const before=p.engine.snapshot();
+  await assert.rejects(p.engine.insertTestInteraction([{event:p.event('one')},{event:p.event('two')}]),/只能插入1条/);
+  await assert.rejects(p.engine.insertTestInteraction({event:p.event('gift','gift')}),/只能插入1条/);
+  assert.deepEqual(p.engine.snapshot(),before);p.engine.dispose();
+});
+
+test('test insertion is allowed during current PCM transmission and cannot accept displaced late synthesis', async () => {
+  const playback=deferred(),third=deferred(),retained=[];
+  const p=setup(undefined,false,{
+    prepareAudio:task=>task.event.event_id==='C'?third.promise:Promise.resolve({state:'ready',duration_ms:2000}),
+    retainAudio:async(live,tokens)=>retained.push([...tokens]),speak:async()=>playback.promise,
+  });
+  try {
+    await p.engine.importTestBatch(['A','B','C'].map(id=>({event:p.event(id),result:{...reply(id),generation_mode:'component',prepared_reply:'回答'+id,prepared_for_live:'live'}})));
+    await p.engine.setContext(true,'live',true);await flush();
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');void p.engine.tick();await flush();
+    const before=p.engine.snapshot().tasks;assert.equal(before[0].status,'playing');assert.equal(before[2].prepared_audio.state,'preparing');
+    await p.engine.insertTestInteraction({event:p.event('new-test')});
+    third.resolve({state:'ready',duration_ms:2000});await flush();
+    const after=p.engine.snapshot().tasks;
+    assert.deepEqual(after.slice(0,2),before.slice(0,2));assert.equal(after[2].event.event_id,'new-test');
+    assert.ok(!retained.at(-1).includes(before[2].prepared_audio.token));assert.ok(p.jobs.has('new-test'));
+    assert.ok(!after.some(t=>t.id===before[2].id));
+  }finally{p.engine.dispose();playback.resolve();third.resolve({state:'cancelled'});await flush();}
+});
+
 test('ABC remains fixed during collection and only advances to BCF when A is skipped', async () => {
   const p = setup();
   for (const id of ['A', 'B', 'C']) await p.engine.ingest(p.event(id));
@@ -1354,6 +1406,129 @@ test('normal recognition uses the configured percentage and still waits for 350m
 });
 
 const songDirector = { pcm_ready: true, pcm_segments: [{index:0,start_ms:2000,end_ms:3000,sample_count:24000,pcm_path:'test.pcm'}], id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
+
+async function startSong(p,active){
+  await p.engine.enqueueSong(songDirector);await p.engine.setContext(false,'live',true);p.engine.observeVideo('live');await p.engine.tick();
+  const song=p.engine.snapshot().tasks[0],identity={live_id:'live',task_id:song.id,playback_token:song.playback_token};
+  await p.engine.observeSong({...identity,state:'started'});await p.engine.observeSongPhase({...identity,active});return identity;
+}
+
+test('song stays in slot one while lyrics discard no-action chat and execute explicit actions from slots two/three', async () => {
+  const actions=[],audio=[];
+  const p=setup(undefined,false,{act:async task=>actions.push(task.event.event_id),prepareAudio:async task=>{audio.push(task.id);return {state:'ready'};}});
+  try{
+    const song=await startSong(p,true);
+    for(const id of ['A','B','C','D'])await p.engine.ingest(p.event(id));
+    await p.engine.setContext(true,'live',true);
+    assert.ok(p.jobs.get('A').task.action_only);assert.ok(p.jobs.get('B').task.action_only);
+    p.jobs.get('A').resolve({...reply('问题A'),generation_mode:'component',intent:'question',action_instruction:'目光注视前方'});await flush();
+    assert.deepEqual(p.engine.snapshot().tasks.map(t=>t.event.event_id),[p.engine.snapshot().tasks[0].event.event_id,'B','D']);
+    assert.equal(actions.length,0);assert.equal(audio.length,0);
+    p.jobs.get('B').resolve({...reply('问题B'),generation_mode:'component',intent:'action_request',action_instruction:'向镜头挥手'});await flush();
+    assert.deepEqual(actions,['B']);assert.equal(audio.length,0);
+    const state=p.engine.snapshot();assert.equal(state.tasks[0].id,song.task_id);assert.equal(state.tasks[0].status,'playing');
+    assert.equal(state.tasks[1].event.event_id,'D');assert.equal(state.tasks[2].event.event_id,'C');
+    assert.equal(state.history.find(h=>h.task.event.event_id==='A').outcome,'skipped');
+    assert.match(state.history.find(h=>h.task.event.event_id==='B').reason,/仅执行弹幕动作/);
+  }finally{p.engine.dispose();}
+});
+
+test('automatic replies off preserves the two child slots during lyrics without planning, TTS or actions', async () => {
+  const actions=[],audio=[];const p=setup(undefined,false,{act:async t=>actions.push(t.id),prepareAudio:async()=>{audio.push(1);return {state:'ready'};}});
+  try{
+    await startSong(p,true);for(const id of ['A','B','C'])await p.engine.ingest(p.event(id));
+    await p.engine.tick();assert.equal(p.jobs.size,0);assert.equal(actions.length,0);assert.equal(audio.length,0);
+    assert.deepEqual(p.engine.snapshot().tasks.slice(1).map(t=>t.event.event_id),['A','B']);assert.equal(p.engine.snapshot().candidates[0].event_id,'C');
+  }finally{p.engine.dispose();}
+});
+
+test('a lyric phase preempts gap speech immediately without stopping the song or sending another chat PCM', async () => {
+  const speech=deferred(),spoken=[],interrupts=[],audio=[];
+  const p=setup(undefined,false,{autoAnswer:false,
+    speak:async task=>{if(task.song)return;spoken.push(task.event.event_id);await speech.promise;},
+    interruptReply:async task=>{interrupts.push(task.id);speech.reject(new Error('播报已打断'));},
+    prepareAudio:async task=>{audio.push(task.event.event_id);return {state:'ready',duration_ms:5000};},act:async()=>{},
+  });
+  try{
+    const song=await startSong(p,false);
+    for(const id of ['A','B','C','D'])await p.engine.ingest(p.event(id));
+    await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true,quiet_ms:2000},'live');
+    p.jobs.get('A').resolve({...reply('A'),generation_mode:'component',prepared_reply:'回答A',prepared_for_live:'live',intent:'question'});await flush();
+    let state=p.engine.snapshot();assert.equal(state.tasks[1].status,'playing');assert.equal(state.tasks[1].song_parent.task_id,song.task_id);assert.deepEqual(spoken,['A']);
+    const child=state.tasks[1],preparedCount=audio.length;
+    await p.engine.observeSongPhase({...song,active:true});await flush();
+    state=p.engine.snapshot();assert.deepEqual(interrupts,[child.id]);assert.equal(state.tasks[0].id,song.task_id);assert.equal(state.tasks[0].status,'playing');
+    assert.ok(!state.tasks.some(t=>t.id===child.id));assert.equal(state.tasks[1].event.event_id,'B');assert.equal(state.tasks[2].event.event_id,'D');
+    assert.equal(audio.length,preparedCount);assert.deepEqual(spoken,['A']);
+  }finally{p.engine.dispose();speech.resolve();await flush();}
+});
+
+test('song ended during gap speech releases only the parent and lets its child continue as slot one', async () => {
+  const speech=deferred(),stops=[],interrupted=[];
+  const p=setup(undefined,false,{autoAnswer:false,speak:async t=>{if(!t.song)await speech.promise;},stopSong:async t=>stops.push(t.id),interruptReply:async t=>interrupted.push(t.id),prepareAudio:async()=>({state:'ready',duration_ms:5000})});
+  try{
+    const song=await startSong(p,false);await p.engine.ingest(p.event('chat'));await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');
+    p.jobs.get('chat').resolve({...reply('chat'),generation_mode:'component',prepared_reply:'间奏回答',prepared_for_live:'live'});await flush();
+    const child=p.engine.snapshot().tasks[1];assert.equal(child.status,'playing');
+    await p.engine.observeSong({...song,state:'ended'});
+    const state=p.engine.snapshot();assert.equal(state.tasks[0].id,child.id);assert.equal(state.tasks[0].status,'playing');assert.equal(state.tasks[0].song_parent,undefined);
+    assert.deepEqual(stops,[song.task_id]);assert.equal(interrupted.length,0);assert.equal(state.history[0].task.id,song.task_id);
+  }finally{p.engine.dispose();speech.resolve();await flush();}
+});
+
+test('FunASR completes a gap reply and advances child slots while the song stays pinned',async()=>{
+  const spoken=[];
+  const p=setup(undefined,false,{autoAnswer:false,prepareAudio:async()=>({state:'ready',duration_ms:2000}),speak:async task=>{
+    if(task.song)return;spoken.push(task.event.event_id);
+    await p.engine.observeOutput({live_id:'live',text:task.result.prepared_reply,received_at:p.now(),final:true,request_id:task.id,msg_id:'tts-'+task.id});
+  }});
+  try{
+    await p.engine.configureRecognition(true);const song=await startSong(p,false);
+    for(const id of ['A','B','C','D'])await p.engine.ingest(p.event(id));await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');
+    const prepared=id=>({...reply(id),generation_mode:'component',prepared_reply:'今天一起聊聊天，祝大家开心。',prepared_for_live:'live'});
+    p.jobs.get('A').resolve(prepared('A'));p.jobs.get('B').resolve(prepared('B'));await flush();
+    const child=p.engine.snapshot().tasks[1];assert.equal(child.status,'playing');
+    p.engine.observeVad({speaking:true,healthy:true,quiet_ms:0},'live');p.engine.observeVad({speaking:false,healthy:true,quiet_ms:0},'live');
+    await p.engine.observeRecognition({live_id:'live',task_id:child.id,capture_id:child.playback_token,text:prepared('A').prepared_reply,captured_at:p.now(),inference_ms:10});await flush();
+    const state=p.engine.snapshot();assert.equal(state.tasks[0].id,song.task_id);assert.equal(state.tasks[0].status,'playing');
+    assert.equal(state.tasks[1].event.event_id,'B');assert.equal(state.tasks[2].event.event_id,'D');assert.equal(state.history[0].task.id,child.id);
+    assert.deepEqual(spoken,['A','B']);
+  }finally{p.engine.dispose();}
+});
+
+test('ending a song during an unconfirmed action never replays that action as a new spoken reply',async()=>{
+  const action=deferred(),calls=[];const p=setup(undefined,false,{act:async t=>{calls.push(t.id);await action.promise;}});
+  try{
+    const song=await startSong(p,true);await p.engine.ingest(p.event('action'));await p.engine.setContext(true,'live',true);
+    p.jobs.get('action').resolve({...reply('action'),generation_mode:'component',intent:'action_request',action_instruction:'挥手'});await flush();
+    assert.equal(calls.length,1);await p.engine.observeSong({...song,state:'ended'});
+    action.resolve();await flush();const state=p.engine.snapshot();assert.equal(state.tasks.length,0);assert.equal(state.history.at(-1).task.action_state,'submitted');
+    assert.equal(calls.length,1);assert.equal(p.spoken.filter(id=>id==='action').length,0);
+  }finally{p.engine.dispose();action.resolve();await flush();}
+});
+
+test('old song tokens cannot change the active lyric phase or discard current children', async () => {
+  const p=setup();try{
+    const song=await startSong(p,false);await p.engine.ingest(p.event('A'));const before=p.engine.snapshot();
+    await p.engine.observeSongPhase({...song,playback_token:'old',active:true});assert.deepEqual(p.engine.snapshot(),before);
+    await p.engine.observeSongPhase({...song,live_id:'old',active:true});assert.deepEqual(p.engine.snapshot(),before);
+  }finally{p.engine.dispose();}
+});
+
+test('disconnecting a song with a gap reply archives both active tasks and leaves no orphan parent',async()=>{
+  const speech=deferred(),stops=[];const p=setup(undefined,false,{autoAnswer:false,prepareAudio:async()=>({state:'ready',duration_ms:5000}),speak:async t=>{if(!t.song)await speech.promise;},stopSong:async t=>stops.push(t.id)});
+  try{
+    const song=await startSong(p,false);await p.engine.ingest(p.event('child'));await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');
+    p.jobs.get('child').resolve({...reply('child'),generation_mode:'component',prepared_reply:'间奏回复',prepared_for_live:'live'});await flush();
+    assert.equal(p.engine.snapshot().tasks.filter(t=>t.status==='playing').length,2);
+    await p.engine.disconnectSession('live','测试断开');
+    const state=p.engine.snapshot();assert.equal(state.tasks.length,0);assert.deepEqual(stops,[song.task_id]);assert.equal(state.history.length,2);assert.ok(state.history.every(h=>h.outcome==='failed'));
+  }finally{p.engine.dispose();speech.resolve();await flush();}
+});
 test('manually queued songs start with auto replies off and no remote audio, and never generate pending chat', async () => {
   const p = setup();
   await p.engine.configureRecognition(true);

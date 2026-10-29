@@ -30,6 +30,7 @@ export async function planComponentInteraction(task: InteractionTask, history: H
     openingStyle: diversity.openingStyle, recentOpenings: diversity.recentOpenings, eventType: 'chat',
   }) : { speech: task.event.content, intent: 'gift' as const, emotion: 'natural', gesture: giftActionFor(task)?.kind || 'none' as const, segments: [] };
   if (plan.intent === 'action_request' && !plan.action_instruction?.trim()) throw new Error('模型识别到动作请求但没有返回动作描述，请重新生成');
+  if(task.action_only)return {...plan,generation_mode:'component',speech:task.event.content,prepared_for_live:liveId};
   const request = replyRequest(task, history, diversity);
   const prepared = await invoke<string>('component_prepare_reply', { liveId, llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona }, content: request });
   if (typeof prepared !== 'string' || !prepared.trim()) throw new Error('模型未返回有效的主播回答');

@@ -1,8 +1,6 @@
-import { INTERACTION_SLOT_COUNT, type GeneratedReply, type InteractionEvent } from './interactionQueue';
+import type { GeneratedReply, InteractionEvent } from './interactionQueue';
 
-export const defaultTestDanmaku = `[弹幕][小杰] 姐姐今天好漂亮啊//等待生成
-[礼物][阿豪][玫瑰×5]//等待生成
-[弹幕][小宇] 姐姐你有男朋友吗？//等待生成`;
+export const defaultTestDanmaku = '[弹幕][小杰] 姐姐今天好漂亮啊//等待生成';
 
 export type TestDanmaku = { type: 'chat' | 'gift'; nickname: string; content: string; gift?: InteractionEvent['gift']; result?: GeneratedReply };
 
@@ -11,7 +9,7 @@ export const countTestDanmaku = (input: string): number => testLines(input).leng
 
 export function parseTestDanmaku(input: string): TestDanmaku[] {
   const lines = testLines(input);
-  if (lines.length < 1 || lines.length > INTERACTION_SLOT_COUNT) throw new Error(`请输入 1～${INTERACTION_SLOT_COUNT} 条弹幕或礼物，每条占一行`);
+  if (lines.length !== 1) throw new Error('每次只能插入1条测试弹幕或礼物，请仅保留一行');
   return lines.map((line, index) => {
     const match = /^\[弹幕\]\[([^\]\r\n]+)\]\s*(.*?)\/\/(.*)$/.exec(line.trim());
     const giftMatch = /^\[礼物\]\[([^\]\r\n]+)\]\[([^\]\r\n]+)×(\d+)\]\s*\/\/(.*)$/.exec(line.trim());

@@ -50,7 +50,8 @@ pub(crate) fn load(directory: &Path, source: &Path, cues: &[Cue]) -> Result<Song
         return Err("歌词PCM格式无效，请重新截取".into());
     }
     let (len, modified) = stamp(source)?;
-    if cache.cues != cues || cache.source_len != len || cache.source_modified != modified {
+    let same_crops=cache.cues.len()==cues.len()&&cache.cues.iter().zip(cues).all(|(old,new)|old.start_ms==new.start_ms&&old.end_ms==new.end_ms&&old.text==new.text);
+    if !same_crops || cache.source_len != len || cache.source_modified != modified {
         return Err("原歌曲或歌词时间轴已变化，请重新截取PCM".into());
     }
     for (index, cue) in cues.iter().enumerate() {

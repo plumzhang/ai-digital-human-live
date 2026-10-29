@@ -5,6 +5,7 @@ import { emit, listen } from '@tauri-apps/api/event';
 import AliRtcEngine, { AliRtcSdkChannelProfile } from 'aliyun-rtc-sdk';
 import { monitorDownlinkAudio, type DownlinkMonitor, type VadActivity } from '../rtcVad';
 import { createSongAudioBridge } from '../songAudioBridge';
+import { LocalPcmPlayback, type LocalPcmEvent } from '../localPcmPlayback';
 import { MicrophoneInput } from '../microphoneInput';
 import { WhisperCapture, type RecognitionTarget, type WhisperResult } from '../whisperRecognition';
 import { ObsCaption } from './ObsCaption';
@@ -19,6 +20,7 @@ type TranscriptionSignal = { type: number; live_id: string; payload?: { text_msg
 export function ObsWindow() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const rtcRef = useRef<AliRtcEngine | null>(null);
+  const localPcmRef = useRef<LocalPcmPlayback | null>(null);
   const downlinkMonitorsRef = useRef(new Map<string, DownlinkMonitor>());
   const vadNeedsResumeRef = useRef(false);
   const joinedRef = useRef(false);
@@ -63,7 +65,7 @@ export function ObsWindow() {
     const downlinks = new Map<string, { token: object; bytes?: number; progressAt: number; activity: VadActivity }>();
     let videoSubscribed = false;
     let audioSubscribed = false;
-    let song: { identity: SongPlaybackIdentity; player?: SongDirectorPlayer } | undefined;
+    let song: { identity: SongPlaybackIdentity; player?: SongDirectorPlayer; singing?: boolean } | undefined;
     let songCleanup = Promise.resolve();
     const stopSong = async () => {
       const previous = song; song = undefined;
@@ -77,7 +79,6 @@ export function ObsWindow() {
     let microphoneInput: MicrophoneInput | undefined;
     let microphoneGeneration = 0;
     const stopMicrophone = () => { microphoneGeneration++; microphoneInput?.stop(); microphoneInput = undefined; microphoneMonitor?.dispose(); microphoneMonitor = undefined; microphoneStream?.getTracks().forEach(track => track.stop()); microphoneStream = undefined; };
-    let whisperUid: string | undefined;
     const whisper = new WhisperCapture(
       request => invoke<WhisperResult>('speech_transcribe', { request, tts: loadTtsConfig() }),
       result => { if (!disposed && result.live_id === liveIdRef.current) void emit('whisper-recognition', result); },
@@ -90,8 +91,8 @@ export function ObsWindow() {
       const healthy = all.length > 0 && all.every(item => item.activity.healthy);
       const speaking = all.some(item => item.activity.speaking);
       song?.player?.observeAudio({ healthy, speaking, quiet_ms: Math.min(...all.map(item => item.activity.quiet_ms ?? 0)) });
-      if (!healthy && whisperUid === uid) whisper.invalidate('RTC 下行音频中断，识别已停止，请确认当前任务');
-      void emit('avatar-audio', { live_id: liveIdRef.current, source: 'pcm-vad', speaking, healthy, quiet_ms: state.quiet_ms, ended: healthy && !speaking && state.ended, at: Date.now() });
+      // Remote audio, when present, is diagnostic evidence for song rendering.
+      // Reply playback and recognition observe our local speaker branch below.
     };
     async function reportMic(enabled: boolean, error?: string) {
       micRef.current = enabled;
@@ -102,9 +103,10 @@ export function ObsWindow() {
     async function leave() {
       stopMicrophone();
       await stopSong();
-      whisper.start(); whisperUid = undefined;
+      whisper.start();
       for (const monitor of downlinkMonitorsRef.current.values()) monitor.dispose();
       downlinkMonitorsRef.current.clear(); downlinks.clear();
+      localPcmRef.current?.dispose(); localPcmRef.current = null;
       vadNeedsResumeRef.current = false;
       setMicrophoneCaption('');
       setQueueCaption('');
@@ -201,7 +203,7 @@ export function ObsWindow() {
       const onAudioSubscribe = (_uid: string, _old: number, next: number) => {
         if (disposed || rtcRef.current !== rtc || liveIdRef.current !== snapshot.live_id) return;
         audioSubscribed = next === 3;
-        if (song) rtc.muteAllRemoteAudioPlaying(true);
+        rtc.muteAllRemoteAudioPlaying(true);
         void emit('rtc-media-status', { live_id: snapshot.live_id, kind: 'audio' satisfies MediaKind, subscribed: audioSubscribed });
         if (!_uid || _uid === snapshot.rtc.user_id) return;
         downlinkMonitorsRef.current.get(_uid)?.dispose();
@@ -209,7 +211,7 @@ export function ObsWindow() {
         const entry = { token: {}, progressAt: 0, activity: { speaking: false, ended: false, healthy: false } };
         downlinks.set(_uid, entry);
         reportVad(_uid, entry.activity);
-        if (next !== 3) { downlinks.delete(_uid); if (whisperUid === _uid) { whisper.invalidate('RTC 下行音频取消订阅，请确认当前任务'); whisperUid = undefined; } return; }
+        if (next !== 3) { downlinks.delete(_uid); return; }
         void (async () => {
           const track = await rtc.getAudioTrack(_uid);
           const current = () => !disposed && rtcRef.current === rtc && liveIdRef.current === snapshot.live_id && downlinks.get(_uid)?.token === entry.token;
@@ -218,12 +220,7 @@ export function ObsWindow() {
           const monitor = await monitorDownlinkAudio(track,
             () => current() && entry.progressAt > 0 && Date.now() - entry.progressAt < 3500,
             state => { if (current()) reportVad(_uid, state); },
-            message => { if (current()) { vadNeedsResumeRef.current = true; setResumePlayback(true); setStatus(message); void emit('rtc-vad-status', { live_id: snapshot.live_id, error: message }); } },
-            (samples, rate, quietMs) => {
-              if (!current() || micRef.current || song) return;
-              whisperUid ??= _uid;
-              if (whisperUid === _uid) whisper.push(samples, rate, quietMs);
-            },
+            message => { if (current()) void emit('rtc-vad-status', { live_id: snapshot.live_id, message: `可选RTC音频观测：${message}` }); },
           );
           if (!current()) { monitor.dispose(); return; }
           downlinkMonitorsRef.current.set(_uid, monitor);
@@ -231,7 +228,7 @@ export function ObsWindow() {
         })().catch(error => {
           if (disposed || rtcRef.current !== rtc || downlinks.get(_uid)?.token !== entry.token) return;
           reportVad(_uid, { speaking: false, ended: false, healthy: false });
-          void emit('rtc-vad-status', { live_id: snapshot.live_id, error: String(error) });
+          void emit('rtc-vad-status', { live_id: snapshot.live_id, message: `可选RTC音频观测不可用：${String(error)}` });
         });
       };
       const onAudioStats = (stats: { uid: string; stats: { bytesReceived?: number } }[]) => {
@@ -262,6 +259,31 @@ export function ObsWindow() {
         await rtc.publishLocalVideoStream(false);
         await rtc.joinChannel(snapshot.rtc.token, snapshot.rtc.user_id);
         if (disposed || rtcRef.current !== rtc) { await rtc.leaveChannel(); return; }
+        rtc.muteAllRemoteAudioPlaying(true);
+        const localPcm = new LocalPcmPlayback();
+        localPcmRef.current = localPcm;
+        const current = () => !disposed && rtcRef.current === rtc && localPcmRef.current === localPcm && liveIdRef.current === snapshot.live_id;
+        const monitor = await monitorDownlinkAudio(localPcm.track,
+          () => current() && localPcm.running && joinedRef.current,
+          state => {
+            if (!current()) return;
+            if (!state.healthy) whisper.invalidate('本地音频播放中断，请确认当前任务');
+            if (!localPcm.running) { vadNeedsResumeRef.current = true; setResumePlayback(true); }
+            void emit('avatar-audio', { live_id: snapshot.live_id, source: 'pcm-vad', playback_source: 'local-pcm', ...state, at: Date.now() });
+          },
+          message => {
+            if (!current()) return;
+            vadNeedsResumeRef.current = true; setResumePlayback(true);
+            setStatus(`本地音频播放检测：${message}`);
+            void emit('rtc-vad-status', { live_id: snapshot.live_id, error: `本地音频播放检测：${message}` });
+          },
+          (samples, rate, quietMs) => { if (current() && !micRef.current && !song?.singing) whisper.push(samples, rate, quietMs); },
+        );
+        if (!current()) { monitor.dispose(); localPcm.dispose(); return; }
+        downlinkMonitorsRef.current.set('local-pcm', monitor);
+        void emit('rtc-vad-status', { live_id: snapshot.live_id, message: '已接入本地 PCM 播放音轨的语音活动检测与识别' });
+        // Autoplay restrictions are recoverable from the existing resume button.
+        if (!localPcm.running) { vadNeedsResumeRef.current = true; setResumePlayback(true); setStatus('请点击恢复播放启用本地声音'); }
         joinedRef.current = true;
         await emit('rtc-status', { live_id: snapshot.live_id, joined: true });
         if (!videoRef.current?.videoWidth) setStatus('已入会，等待数字人画面');
@@ -283,6 +305,17 @@ export function ObsWindow() {
         if (!disposed) setCaptionSettings(normalizeCaptionSettings(event.payload));
       }));
       await emit('caption-settings-request');
+      unlisteners.push(await listen<LocalPcmEvent>('component-pcm', event => {
+        if (disposed || event.payload.live_id !== liveIdRef.current) return;
+        try { localPcmRef.current?.accept(event.payload); }
+        catch (error) {
+          localPcmRef.current?.accept({ ...event.payload, state: 'stop' });
+          setStatus(`本地声音播放失败：${String(error)}`);
+          vadNeedsResumeRef.current = true; setResumePlayback(true);
+          void invoke('interrupt_session', { liveId: event.payload.live_id }).catch(() => {});
+          void emit('rtc-vad-status', { live_id: event.payload.live_id, error: `本地声音播放失败：${String(error)}` });
+        }
+      }));
       unlisteners.push(await listen<SongPlaybackIdentity & { action: 'start' | 'stop'; song_id?: string }>('song-control', event => {
         const control = event.payload;
         if (disposed || control.live_id !== liveIdRef.current) return;
@@ -312,18 +345,28 @@ export function ObsWindow() {
             audio.src = convertFileSrc(director.audio_path);
             let bridge: Awaited<ReturnType<typeof createSongAudioBridge>> | undefined;
             const player = new SongDirectorPlayer(audio, director.cues, {
-              mute: muted => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(muted); },
+              mute: () => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(true); },
               speak: (content, index) => invoke('component_transcription', { liveId: control.live_id, taskId: `${control.playback_token}-${index}`, content }),
-              interrupt: () => invoke('interrupt_session', { liveId: control.live_id }),
+              interrupt: () => invoke('component_song_close', { liveId: control.live_id, token: control.playback_token }),
               prepare: async () => {
                 await invoke('interrupt_session', { liveId: control.live_id });
                 if (song !== currentSong || disposed || liveIdRef.current !== control.live_id) throw new Error('歌曲已取消');
-                await invoke('component_audio_begin', { liveId: control.live_id, token: control.playback_token });
+                await invoke('component_song_open', { liveId: control.live_id, taskId: control.task_id, token: control.playback_token });
                 bridge = await createSongAudioBridge(audio, director.pcm_segments!, async path => {
                   const response = await fetch(convertFileSrc(path)); if (!response.ok) throw new Error('无法读取歌词PCM片段'); return response.arrayBuffer();
                 }, director.pcm_lead_ms ?? 0,
                   (samples, sequence) => invoke('component_audio_push', { liveId: control.live_id, token: control.playback_token, sequence, samples }),
-                  error => { void player.stop('error', error); });
+                  error => { void player.stop('error', error); },
+                  async (active, sequence) => {
+                    if(song!==currentSong||disposed)throw new Error('歌曲已取消');
+                    await invoke('component_song_phase',{liveId:control.live_id,token:control.playback_token,active,sequence});
+                    if(song!==currentSong||disposed)return;
+                    currentSong.singing=active;
+                    // Songs and gap replies both have their own local audio.
+                    rtc.muteAllRemoteAudioPlaying(true);setQueueCaption('');
+                    if(active)whisper.start();
+                    else void emit('queue-caption-request',{live_id:control.live_id});
+                  });
                 if (song !== currentSong || disposed) { bridge.dispose(); throw new Error('歌曲已取消'); }
               },
               activateAudio: () => bridge?.resume() || Promise.resolve(),
@@ -334,7 +377,7 @@ export function ObsWindow() {
                   .catch(error => { if (!disposed) setStatus(`歌曲同步日志保存失败：${String(error)}`); });
               },
               progress: progress => { void emit('song-sync-progress', { ...control, ...progress }); },
-              caption: text => { if (liveIdRef.current === control.live_id) setQueueCaption(text); },
+              caption: text => { if (liveIdRef.current === control.live_id && (text || currentSong.singing)) setQueueCaption(text); },
               state: (state, error) => {
                 if (state === 'blocked') {
                   resumeSongRef.current = () => player.resume();
@@ -398,14 +441,16 @@ export function ObsWindow() {
       }));
       unlisteners.push(await listen<{ live_id: string; content: string }>('queue-caption', event => {
         if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
-        if (!song && typeof event.payload.content === 'string') setQueueCaption(event.payload.content.trim());
+        if ((!song || !song.singing) && typeof event.payload.content === 'string') setQueueCaption(event.payload.content.trim());
       }));
       unlisteners.push(await listen<RecognitionTarget>('whisper-task', event => {
         if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
-        if (!song) whisper.start(event.payload);
+        if (!song || !song.singing) {
+          whisper.start(event.payload);
+        }
       }));
       unlisteners.push(await listen<{ live_id: string }>('vidu-disconnected', event => {
-        if (event.payload.live_id === liveIdRef.current) { void stopSong().catch(() => {}); setMicrophoneCaption(''); setQueueCaption(''); }
+        if (event.payload.live_id === liveIdRef.current) { localPcmRef.current?.dispose(); localPcmRef.current = null; void stopSong().catch(() => {}); setMicrophoneCaption(''); setQueueCaption(''); }
       }));
       const snapshot = await invoke<Snapshot | null>('session_snapshot');
       if (snapshot) enqueue(() => join(snapshot));
@@ -430,7 +475,7 @@ export function ObsWindow() {
       <ObsCaption content={queueCaption || (microphoneCaption ? `我：${microphoneCaption}` : '')} settings={captionSettings}/>
       {resumePlayback && <button className="obs-status" onClick={() => {
         void resumeSongRef.current?.();
-        void Promise.all([...downlinkMonitorsRef.current.values()].map(monitor => monitor.resume())).then(() => {
+        void Promise.all([localPcmRef.current?.resume(), ...[...downlinkMonitorsRef.current.values()].map(monitor => monitor.resume())]).then(() => {
           vadNeedsResumeRef.current = false; setResumePlayback(!!resumeSongRef.current);
         }).catch(error => setStatus(`音频检测恢复失败：${String(error)}`));
         void videoRef.current?.play().catch(error => setStatus(`恢复播放失败：${String(error)}`));

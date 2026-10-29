@@ -1,7 +1,7 @@
 import { mergeAvatarText, type AvatarOutput } from './avatarOutput';
 import { avatarActionFor } from './giftActions';
 import { matchReplyEnding, matchPlaybackEnding, type RecognitionObservation, type WhisperSegment } from './whisperRecognition';
-import type { SongDirector, SongPlaybackState } from './songDirector';
+import type { SongDirector, SongPlaybackState, SongPcmPhase } from './songDirector';
 import { replyOpening, repeatedOpening } from './replyDiversity';
 
 export type InteractionEvent = {
@@ -25,6 +25,9 @@ export type InteractionTask = {
   answer?: { text: string; received_at: number; message_ids: string[]; final?: boolean };
   song?: { id: string; title: string; duration_ms: number };
   song_playback?: 'starting' | 'blocked' | 'playing';
+  song_pcm_active?: boolean;
+  song_parent?: { task_id: string; playback_token: string };
+  action_only?: boolean;
   recognition?: { text: string; matched: boolean; progress: number; ending_matched?: boolean; method?: 'text' | 'phonetic'; scope?: 'full' | 'tail'; compared_chars?: number; captured_at: number; inference_ms: number; segments?: WhisperSegment[]; error?: string };
 };
 export type HistoryEntry = { task: InteractionTask; outcome: 'played' | 'skipped' | 'failed'; reason: string; at: number };
@@ -75,6 +78,7 @@ export const emptyQueue = (): QueueSnapshot => ({ version: 1, room_id: '', tasks
 // text_msg has no completion acknowledgement. Use one RTC silence window,
 // shared by completion detection and the next submission, without waiting twice.
 const PLAYBACK_SILENCE_MS = 1500;
+const SONG_ENDING_ACTION='歌曲结束时动作仍在提交，请稍候…';
 
 export function normalizeInteraction(raw: unknown, now = Date.now()): InteractionEvent | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -108,6 +112,7 @@ type QueueAdapter = {
   speak: (task: InteractionTask, liveId: string) => Promise<void>;
   stopSong?: (task: InteractionTask) => Promise<void>;
   act?: (task: InteractionTask, liveId: string) => Promise<void>;
+  interruptReply?: (task: InteractionTask) => Promise<void>;
   handoff?: (task: InteractionTask, liveId: string, direction: HandoffDirection, angleDeg: number) => Promise<void>;
   changed: (snapshot: QueueSnapshot) => void;
   error: (message: string) => void;
@@ -146,6 +151,10 @@ export class InteractionQueue {
   private batchNeedsSilence = false;
   private batchQuietSince?: number;
   private playbackTimer?: ReturnType<typeof setTimeout>;
+  private songTimer?: ReturnType<typeof setTimeout>;
+  private songConsuming=new Set<string>();
+  private songActions=new Map<string,Promise<void>>();
+  private songPhaseSeen='';
   private whisperQuietMs = 0;
   private lastActualVoiceAt = 0;
 
@@ -212,7 +221,9 @@ export class InteractionQueue {
       ...candidates.filter(item => item.id !== task.id && ['ready','playing','uncertain'].includes(item.status))];
     return [...new Set(recent.map(item => replyOpening(item.result?.prepared_reply || item.answer?.text || '', item.event.nickname || '')).filter(Boolean))].slice(-8);
   }
-  private current() { return this.state.tasks.find(task => task.status === 'playing' || task.status === 'uncertain'); }
+  private current() { return this.state.tasks.find(task => !task.song && ['playing','uncertain'].includes(task.status)) || this.state.tasks.find(task => ['playing','uncertain'].includes(task.status)); }
+  private activeSong() { const task=this.state.tasks[0];return task?.song && task.status==='playing' ? task : undefined; }
+  private singing() { const song=this.activeSong();return !!song&&song.song_pcm_active!==false; }
   private mutate(change: (next: QueueSnapshot) => boolean): Promise<void> {
     const operation = this.serial.then(async () => {
       if (this.disposed || this.faulted) return;
@@ -253,11 +264,11 @@ export class InteractionQueue {
     this.audioRetryAt = 0; await this.syncAudio(); await this.tick();
   }
   private async prepareNextAudio() {
-    if (!this.adapter.prepareAudio || this.preparingAudio || this.playbackHeld || this.now() < this.audioRetryAt) return;
+    if (!this.adapter.prepareAudio || this.preparingAudio || this.playbackHeld || this.singing() || this.now() < this.audioRetryAt) return;
     let selected: InteractionTask | undefined;
     await this.mutate(next => {
       if (!this.enabled || !this.available || this.disposed) return false;
-      const task = next.tasks.find(t => t.status === 'ready' && !t.song && t.result?.prepared_reply && !t.prepared_audio);
+      const task = next.tasks.find(t => t.status === 'ready' && !t.song && !t.action_only && t.result?.prepared_reply && !t.prepared_audio);
       if (!task) return false;
       task.prepared_audio = { token: crypto.randomUUID(), live_id: this.activeLive, state: 'preparing' };
       selected = structuredClone(task); return true;
@@ -398,12 +409,13 @@ export class InteractionQueue {
       // Stop submissions immediately, before asynchronously persisting the old
       // task. Audio callbacks may tick while storage is still pending.
       this.enabled = false; this.available = false;
-      const current = this.current();
-      if (current?.song) await this.adapter.stopSong?.(current);
+      const current = this.current(),song=this.activeSong();
+      if(current?.song_parent)await this.adapter.interruptReply?.(current);
+      if (song) await this.adapter.stopSong?.(song);
       await this.mutate(next => {
-        const task = next.tasks.find(item => item.status === 'playing');
-        if (task) { task.status = 'uncertain'; task.error = '会话已切换，需人工确认上一条是否已播报'; return true; }
-        return false;
+        const tasks = next.tasks.filter(item => item.status === 'playing');
+        for(const task of tasks){task.status='uncertain';task.error='会话已切换，需人工确认上一条是否已播报';}
+        return tasks.length>0;
       });
     }
     if (this.activeLive !== liveId) {
@@ -431,23 +443,34 @@ export class InteractionQueue {
     if (!song.pcm_ready || !song.pcm_segments?.length) throw new Error('请先在唱歌模块截取歌词PCM');
     if (song.status !== 'ready' || !song.available || !song.cues.length || !Number.isFinite(song.duration_ms) || song.duration_ms <= 0) throw new Error('请先生成并保存有效的歌曲导播');
     if (this.disposed || this.faulted) throw new Error('队列不可用，请重新打开中控台');
-    let added = false;
+    return this.replaceTailSlot({ id: crypto.randomUUID(), status: 'ready', song: { id: song.id, title: song.title, duration_ms: song.duration_ms },
+      event: { event_id: crypto.randomUUID(), type: 'song', room_id: this.state.room_id, user_id: '', nickname: '歌曲导播', content: song.title, created_at: this.now() } }, '歌曲插入槽位3，移除原待播任务');
+  }
+  async insertTestInteraction(item: { event: InteractionEvent; result?: GeneratedReply }) {
+    if (!item?.event || !['chat', 'gift'].includes(item.event.type) || !item.event.content?.trim() || (item.event.type === 'gift' && !item.event.gift)) throw new Error('每次只能插入1条有效的测试弹幕或礼物');
+    const task: InteractionTask = { id: crypto.randomUUID(), event: { ...structuredClone(item.event), source: 'test' }, status: item.result ? 'ready' : 'pending', ...(item.result ? { result: structuredClone(item.result) } : {}) };
+    return this.replaceTailSlot(task, '测试弹幕插入槽位3，移除原待播任务');
+  }
+  private async replaceTailSlot(task: InteractionTask, reason: string) {
+    if (this.disposed || this.faulted) throw new Error('队列不可用，请重新打开中控台');
+    let position = 0;
     await this.mutate(next => {
       const replaced = next.tasks[INTERACTION_SLOT_COUNT - 1];
       if (replaced && ['playing', 'uncertain'].includes(replaced.status)) return false;
-      if (replaced) this.archive(next, replaced, 'skipped', '歌曲插入槽位3，移除原待播任务');
-      next.tasks.push({ id: crypto.randomUUID(), status: 'ready', song: { id: song.id, title: song.title, duration_ms: song.duration_ms },
-        event: { event_id: crypto.randomUUID(), type: 'song', room_id: next.room_id, user_id: '', nickname: '歌曲导播', content: song.title, created_at: this.now() } });
-      added = true; return true;
+      if (replaced) this.archive(next, replaced, 'skipped', reason);
+      task.event.room_id = next.room_id || task.event.room_id;
+      next.tasks.push(task);
+      position = next.tasks.length; return true;
     });
-    if (!added) throw new Error('槽位3正在播报或等待人工确认，请先完成或跳过该任务');
+    if (!position) throw new Error('槽位3正在播报或等待人工确认，请先完成或跳过该任务');
     await this.syncAudio();
     await this.tick();
+    return position;
   }
   async observeSong(state: SongPlaybackState) {
-    const task = this.current();
+    const task = this.state.tasks.find(t=>t.song&&t.id===state.task_id);
     if (!task?.song || task.status !== 'playing' || task.id !== state.task_id || task.playback_token !== state.playback_token || task.live_id !== state.live_id || this.activeLive !== state.live_id) return;
-    if (state.state === 'ended') await this.finish('played', '原歌曲播放结束');
+    if (state.state === 'ended') await this.finishSong(task, 'played', '原歌曲播放结束');
     else if (state.state === 'error') await this.markUncertain(state.error || '歌曲播放失败', task.id);
     else if (state.state === 'started' || state.state === 'blocked') await this.mutate(next => {
       const current = next.tasks.find(item => item.id === state.task_id && item.status === 'playing' && item.playback_token === state.playback_token);
@@ -456,19 +479,104 @@ export class InteractionQueue {
       return true;
     });
   }
+  async observeSongPhase(state: SongPcmPhase) {
+    const parent=this.activeSong();
+    if(!parent||parent.id!==state.task_id||parent.playback_token!==state.playback_token||parent.live_id!==state.live_id||this.activeLive!==state.live_id)return;
+    const phaseKey=`${state.live_id}:${state.playback_token}:${state.active}`;
+    if(this.songPhaseSeen===phaseKey)return;this.songPhaseSeen=phaseKey;
+    await this.mutate(next=>{
+      const song=next.tasks.find(t=>t.id===state.task_id&&t.playback_token===state.playback_token&&t.status==='playing');
+      if(!song)return false;song.song_pcm_active=state.active;
+      if(state.active)for(const task of next.tasks)if(!task.song){delete task.prepared_audio;task.action_only=true;}
+      return true;
+    });
+    if(state.active){
+      const child=this.state.tasks.find(t=>!t.song&&['playing','uncertain'].includes(t.status)&&t.song_parent?.task_id===parent.id);
+      if(child){await this.adapter.interruptReply?.(child);await this.consumeSongTask(child,parent);}
+    }
+    await this.tick();
+  }
+  private hasSongAction(task:InteractionTask){return task.event.type==='gift'||(task.result?.intent==='action_request'&&!!task.result.action_instruction?.trim());}
+  private async songAction(task:InteractionTask){
+    const existing=this.songActions.get(task.id);if(existing)return existing;
+    const current=this.state.tasks.find(t=>t.id===task.id);
+    if(!current||!this.hasSongAction(current)||current.action_state==='submitted')return;
+    const live=this.activeLive;
+    const action=(async()=>{
+      if(!this.adapter.act)throw new Error('唱歌动作通道不可用');
+      await this.mutate(next=>{const current=next.tasks.find(t=>t.id===task.id);if(!current)return false;current.action_state='pending';const parent=this.activeSong();if(parent)current.song_parent={task_id:parent.id,playback_token:parent.playback_token!};return true;});
+      await this.adapter.act(task,live);
+      await this.mutate(next=>{const current=next.tasks.find(t=>t.id===task.id);if(!current)return false;current.action_state='submitted';if(current.status==='uncertain'&&current.error===SONG_ENDING_ACTION)this.archive(next,current,'played','歌曲已结束，弹幕动作已确认提交，不重复播报');return true;});
+    })();
+    this.songActions.set(task.id,action);
+    try{await action;}finally{this.songActions.delete(task.id);}
+  }
+  private async consumeSongTask(task:InteractionTask,parent:InteractionTask){
+    if(this.songConsuming.has(task.id)||this.activeSong()?.id!==parent.id||!this.state.tasks.some(t=>t.id===task.id))return;
+    this.songConsuming.add(task.id);
+    try{
+    if(['playing','uncertain'].includes(task.status))clearTimeout(this.playbackTimer);
+    let outcome:HistoryEntry['outcome']=this.hasSongAction(task)?'played':'skipped';
+    let reason=this.hasSongAction(task)?'歌曲唱词期间仅执行弹幕动作，不发送弹幕PCM':'歌曲唱词期间无动作，立即释放弹幕';
+    try{if(this.enabled)await this.songAction(task);else{outcome='skipped';reason='歌曲唱词打断弹幕，自动回答已关闭';}}catch(error){outcome='failed';reason='唱歌动作提交失败：'+String(error);}
+    if(this.activeSong()?.playback_token!==parent.playback_token){
+      if(outcome==='failed')await this.mutate(next=>{const current=next.tasks.find(t=>t.id===task.id);if(!current)return false;current.error=reason;return true;});
+      return;
+    }
+    await this.mutate(next=>{const current=next.tasks.find(t=>t.id===task.id);if(!current)return false;this.archive(next,current,outcome,reason);return true;});
+    await this.tick();
+    }finally{this.songConsuming.delete(task.id);}
+  }
+  private async finishSong(task:InteractionTask,outcome:HistoryEntry['outcome'],reason:string){
+    clearTimeout(this.songTimer);
+    await this.adapter.stopSong?.(task);
+    await this.mutate(next=>{
+      const song=next.tasks.find(t=>t.id===task.id&&t.playback_token===task.playback_token);if(!song)return false;
+      this.archive(next,song,outcome,reason);
+      for(const child of [...next.tasks])if(child.song_parent?.task_id===task.id){
+        if(child.action_only&&child.action_state==='submitted')this.archive(next,child,'played','歌曲结束，已执行的弹幕动作不重复播报');
+        else if(child.action_only&&child.action_state==='pending'){child.status='uncertain';child.error=SONG_ENDING_ACTION;delete child.song_parent;}
+        else delete child.song_parent;
+      }
+      return true;
+    });
+    await this.tick();
+  }
+  private async pumpSongInteraction(parent:InteractionTask){
+    if(!this.enabled||!this.available||parent.song_playback!=='playing')return;
+    for(let step=0;step<INTERACTION_SLOT_COUNT;step++){
+      if(this.activeSong()?.id!==parent.id||this.playbackHeld||!this.enabled)return;
+      const task=this.state.tasks[1];if(!task||task.song||['playing','uncertain','pending','generating'].includes(task.status))return;
+      if(this.singing()){
+        if(task.status==='failed')await this.mutate(next=>{const t=next.tasks.find(t=>t.id===task.id);if(!t)return false;this.archive(next,t,'failed',t.error||'唱歌期间动作解析失败');return true;}).then(()=>this.tick());
+        else await this.consumeSongTask(task,parent);
+        continue;
+      }
+      if(task.status!=='ready'||task.action_only||this.speaking||this.videoAt<this.now()-2000||this.audioAt<this.now()-(this.vadMode?500:2000)||(this.vadMode?!this.vadIdle:this.now()-this.quietSince<PLAYBACK_SILENCE_MS))return;
+      if(this.adapter.prepareAudio&&task.prepared_audio?.state!=='ready')return;
+      try{await this.songAction(task);}catch(error){await this.mutate(next=>{const t=next.tasks.find(t=>t.id===task.id);if(!t)return false;t.status='failed';t.error=String(error);return true;});return;}
+      let selected:InteractionTask|undefined;
+      await this.mutate(next=>{
+        const song=next.tasks[0],child=next.tasks[1];
+        if(song?.id!==parent.id||song.song_pcm_active!==false||child?.id!==task.id||child.status!=='ready'||!this.enabled||!this.available)return false;
+        child.status='playing';child.started_at=this.now();child.live_id=this.activeLive;child.playback_token=crypto.randomUUID();
+        child.song_parent={task_id:parent.id,playback_token:parent.playback_token!};
+        delete child.audio_sent_at;delete child.recognition;delete child.answer;selected=structuredClone(child);return true;
+      });
+      if(selected){this.speaking=true;await this.submitPlayback(selected,this.activeLive);}return;
+    }
+  }
   async disconnectSession(liveId: string, reason: string) {
     if (this.activeLive && this.activeLive !== liveId) return;
     // Invalidate media callbacks and delayed speech/action submissions before
     // awaiting storage; no old-session evidence may complete another task.
     this.enabled = false; this.available = false; this.activeLive = '';
-    clearTimeout(this.playbackTimer);
+    clearTimeout(this.playbackTimer);clearTimeout(this.songTimer);
     await this.mutate(next => {
-      const task = next.tasks.find(item => item.live_id === liveId && ['playing', 'uncertain'].includes(item.status));
-      if (!task) return false;
-      task.status = 'uncertain'; task.error = reason;
-      return true;
+      const tasks = next.tasks.filter(item => item.live_id === liveId && ['playing', 'uncertain'].includes(item.status));
+      for(const task of tasks){task.status='uncertain';task.error=reason;}return tasks.length>0;
     });
-    await this.finish('failed', reason);
+    for(const task of [...this.state.tasks].filter(t=>['playing','uncertain'].includes(t.status)))await this.finish('failed',reason,false,task.id);
   }
   async ingest(event: InteractionEvent) {
     if (this.faulted || this.disposed) throw new Error('队列不可用，事件仍保留在数据库待恢复');
@@ -567,9 +675,12 @@ export class InteractionQueue {
         }
       }
       for (const task of next.tasks) {
-        if (this.adapter.prepareAudio && !task.song && task.status === 'ready' && !task.result?.prepared_reply) { task.status = 'pending'; delete task.result; }
+        if(task.song_parent&&next.tasks.some(parent=>parent.id===task.song_parent!.task_id&&parent.song&&parent.status==='uncertain'))continue;
+        if (task.action_only&&!this.singing()&&task.status==='ready'){if(!task.result?.prepared_reply){task.status='pending';delete task.result;}delete task.action_only;}
+        if (this.adapter.prepareAudio && !task.song && !task.action_only && task.status === 'ready' && !task.result?.prepared_reply) { task.status = 'pending'; delete task.result; }
         if (this.running.size + jobs.length >= 2) break;
         if (task.status !== 'pending') continue;
+        task.action_only=this.singing();
         next.next_opening_style ??= parseInt(crypto.randomUUID().slice(0, 2), 16) % OPENING_STYLES.length;
         task.opening_style = OPENING_STYLES[next.next_opening_style % OPENING_STYLES.length];
         next.next_opening_style += 1;
@@ -588,7 +699,7 @@ export class InteractionQueue {
           ? await this.adapter.rewriteReply(task, task.result, history, diversity, generationLive)
           : await this.adapter.generate(task, history, diversity, generationLive);
         for (let attempt = 0; ; attempt++) {
-          if (!result.speech.trim() || (this.adapter.prepareAudio && !result.prepared_reply?.trim())) throw new Error('模型未返回有效的主播回答');
+          if (!result.speech.trim() || (this.adapter.prepareAudio && !task.action_only && !result.prepared_reply?.trim())) throw new Error('模型未返回有效的主播回答');
           let revise: ReplyDiversity | undefined;
           await this.mutate(next => {
             const target = next.tasks.find(item => item.id === task.id && item.status === 'generating' && item.generation_token === generation && this.activeLive === generationLive);
@@ -624,6 +735,8 @@ export class InteractionQueue {
     if (this.disposed || this.faulted || this.importing || (!this.enabled && !this.state.tasks[0]?.song) || !this.available || !this.activeLive) return;
     const handoff = this.state.handoff_action;
     if (this.playbackHeld) return;
+    const parent=this.activeSong();
+    if(parent){await this.pumpSongInteraction(parent);return;}
     if (this.state.tasks[0]?.result?.generation_mode !== 'component' && handoff?.status === 'submitted' && handoff.live_id === this.activeLive && this.now() < (handoff.resume_at || 0)) return;
     const nextIsSong = !!this.state.tasks[0]?.song;
     if (!nextIsSong && this.batchNeedsSilence && (this.batchQuietSince === undefined || this.now() - this.batchQuietSince < (this.vadMode ? 900 : PLAYBACK_SILENCE_MS))) return;
@@ -643,7 +756,7 @@ export class InteractionQueue {
         if (task.handoff_action) task.handoff_action.status = 'pending';
         task.action_state = 'pending'; delete task.action_error;
       }
-      if (task.song) task.song_playback = 'starting';
+      if (task.song) {task.song_playback = 'starting';task.song_pcm_active=true;}
       delete task.audio_sent_at; delete task.recognition; delete task.answer; selected = structuredClone(task); return true;
     });
     if (!selected) { this.speaking = false; return; }
@@ -655,7 +768,8 @@ export class InteractionQueue {
     this.heardSpeech = false; this.lastSpeechAt = 0; this.vadEndTask = undefined;
     this.whisperQuietMs = 0; this.lastActualVoiceAt = 0;
     const selectedId = selected.id;
-    this.playbackTimer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, selected.song ? selected.song.duration_ms + 60_000 : 60_000);
+    const timer = setTimeout(() => { void this.markUncertain('未收到足够的播放结束信号，请确认完成或跳过', selectedId).catch(() => {}); }, selected.song ? selected.song.duration_ms + 60_000 : 60_000);
+    if(selected.song)this.songTimer=timer;else this.playbackTimer=timer;
     try {
       await this.adapter.speak(selected, liveId);
       if (selected.result?.generation_mode === 'component') await this.mutate(next => {
@@ -664,7 +778,7 @@ export class InteractionQueue {
       });
       // Submit the reply's action alongside speech. Late
       // completions, interruption and crash recovery must never replay it.
-      if (!selected.song && selected.result?.generation_mode !== 'component' && this.adapter.act && avatarActionFor(selected) && !this.disposed && this.activeLive === liveId && this.current()?.id === selectedId && this.current()?.status === 'playing') {
+      if (!selected.song && !selected.song_parent && selected.result?.generation_mode !== 'component' && this.adapter.act && avatarActionFor(selected) && !this.disposed && this.activeLive === liveId && this.current()?.id === selectedId && this.current()?.status === 'playing') {
         let actionError: string | undefined;
         try { await this.adapter.act(selected, liveId); }
         catch (error) { actionError = String(error); }
@@ -677,7 +791,11 @@ export class InteractionQueue {
         });
       }
     }
-    catch (error) { await this.markUncertain(`播报提交未确认：${String(error)}`, selectedId); }
+    catch (error) {
+      const parent=this.activeSong(),child=this.state.tasks.find(t=>t.id===selectedId);
+      if(selected.song_parent&&parent&&child&&(this.singing()||String(error).includes('歌曲唱词')))await this.consumeSongTask(child,parent);
+      else await this.markUncertain(`播报提交未确认：${String(error)}`, selectedId);
+    }
     finally { this.speaking = false; }
   }
   observeAudio(speaking: boolean, liveId: string) {
@@ -726,13 +844,13 @@ export class InteractionQueue {
             evidence.captured_at >= task.audio_sent_at && evidence.captured_at >= this.lastActualVoiceAt &&
             this.now() - this.audioAt < 500 && this.now() - this.videoAt < 2000) {
           this.vadIdle = true;
-          await this.finish('played', `FunASR 实际下行回答末尾匹配达到${this.state.recognition.match_percent ?? 70}%，最后3字已确认，全部PCM已发送`, true);
+          await this.finish('played', `FunASR 实际本地播放回答末尾匹配达到${this.state.recognition.match_percent ?? 70}%，最后3字已确认，全部PCM已发送`, true);
         }
         return;
       }
       if (this.speaking || !task.audio_sent_at || this.now() - task.audio_sent_at < 1500 || task.answer?.final !== true) return;
       if (this.heardSpeech && this.vadIdle && this.whisperQuietMs >= 1200 && this.now() - this.audioAt < 500 && this.now() - this.videoAt < 2000) {
-        await this.finish('played', '全部句子 PCM 已发送，RTC 实际下行语音后持续静音且画面健康', true);
+        await this.finish('played', '全部句子 PCM 已发送，本地实际播放语音后持续静音且画面健康', true);
       }
       return;
     }
@@ -769,10 +887,14 @@ export class InteractionQueue {
     if (task && !task.song) { clearTimeout(this.playbackTimer); await this.markUncertain(reason, task.id); }
   }
   private async markUncertain(reason: string, taskId?: string) {
-    const current = this.current();
+    const current = taskId?this.state.tasks.find(t=>t.id===taskId):this.current();
     if (current?.song && (!taskId || taskId === current.id)) {
+      clearTimeout(this.songTimer);
+      const child=this.state.tasks.find(t=>t.song_parent?.task_id===current.id&&t.status==='playing');
+      if(child){clearTimeout(this.playbackTimer);await this.adapter.interruptReply?.(child);}
       try { await this.adapter.stopSong?.(current); }
       catch (error) { reason += `；停止歌曲失败：${String(error)}`; }
+      await this.mutate(next=>{const child=next.tasks.find(t=>t.song_parent?.task_id===current.id&&t.status==='playing');if(!child)return false;child.status='uncertain';child.error=reason;return true;});
     }
     await this.mutate(next => {
       const task = next.tasks.find(item => item.status === 'playing' && (!taskId || item.id === taskId));
@@ -780,8 +902,9 @@ export class InteractionQueue {
       task.status = 'uncertain'; task.error = reason; return true;
     });
   }
-  async finish(outcome: HistoryEntry['outcome'], reason: string, preserveObservedSilence = false) {
-    const current = this.current();
+  async finish(outcome: HistoryEntry['outcome'], reason: string, preserveObservedSilence = false, targetId?:string) {
+    const current = targetId?this.state.tasks.find(t=>t.id===targetId&&['playing','uncertain'].includes(t.status)):this.current();
+    if(current?.song){await this.finishSong(current,outcome,reason);return;}
     if (this.finishing) {
       if (current && outcome !== 'played') this.finishOverride = { outcome, reason };
       return;
@@ -850,5 +973,5 @@ export class InteractionQueue {
     });
     await this.tick();
   }
-  dispose() { this.disposed = true; void this.syncAudio().catch(() => {}); this.enabled = false; clearTimeout(this.playbackTimer); const task = this.current(); if (task?.song) void this.adapter.stopSong?.(task).catch(() => {}); }
+  dispose() { const song=this.activeSong();this.disposed = true; void this.syncAudio().catch(() => {}); this.enabled = false; clearTimeout(this.playbackTimer);clearTimeout(this.songTimer);if(song)void this.adapter.stopSong?.(song).catch(()=>{}); const task=this.current();if(task?.song_parent)void this.adapter.interruptReply?.(task).catch(()=>{}); }
 }
