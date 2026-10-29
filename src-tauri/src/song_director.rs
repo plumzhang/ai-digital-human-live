@@ -25,7 +25,9 @@ pub struct Director {
     audio_name: String, audio_file: String, lyrics: String, status: String,
     raw_segments: Vec<Cue>, cues: Vec<Cue>, error: Option<String>,
     #[serde(default)] pcm_lead_ms:u64,
+    #[serde(default = "default_lyric_display_delay_ms")] lyric_display_delay_ms: i64,
 }
+fn default_lyric_display_delay_ms() -> i64 { 1500 }
 #[derive(Deserialize)]
 pub struct CreateRequest { title: String, audio_name: String, audio_data: String, duration_ms: u64, lyrics: String }
 
@@ -48,7 +50,13 @@ fn public(path: &Path, song: &Director) -> Value {
     value["audio_path"] = json!(path.join(&song.audio_file).to_string_lossy());
     value["directory"] = json!(path.to_string_lossy());
     value["available"] = json!(path.join(&song.audio_file).is_file());
-    match crate::song_pcm::load(path,&path.join(&song.audio_file),&song.cues) {
+    let stems = crate::song_stems::load(path, &path.join(&song.audio_file));
+    value["stems_ready"] = json!(stems.is_ok());
+    value["stems_error"] = json!(stems.as_ref().err());
+    value["vocals_path"] = json!(stems.as_ref().ok().and_then(|s| s.vocals(path).ok()).map(|p| p.to_string_lossy().to_string()));
+    value["accompaniment_path"] = json!(stems.as_ref().ok().and_then(|s| s.accompaniment(path).ok()).map(|p| p.to_string_lossy().to_string()));
+    let pcm = stems.and_then(|cache| crate::song_pcm::load(path, &cache.vocals(path)?, &song.cues));
+    match pcm {
         Ok(cache)=>{value["pcm_ready"]=json!(true);value["pcm_segments"]=cache.segments(path).unwrap_or(json!([]));},
         Err(error)=>{value["pcm_ready"]=json!(false);value["pcm_error"]=json!(error);value["pcm_segments"]=json!([]);},
     }
@@ -80,15 +88,15 @@ fn pcm_send_times(cues:&[Cue],lead_ms:u64)->Vec<u64>{
         previous_end=start+source_end-cues[first].start_ms;first=last;
     }times
 }
-fn write_dispatch_timeline(path:&Path,cues:&[Cue],pcm_lead_ms:u64)->Result<(),String>{
+fn write_dispatch_timeline(path:&Path,cues:&[Cue],pcm_lead_ms:u64,lyric_display_delay_ms:i64)->Result<(),String>{
     let pcm_times=pcm_send_times(cues,pcm_lead_ms);
-    let timeline: Vec<Value> = cues.iter().enumerate().map(|(i,c)| json!({"start_ms":c.start_ms,"end_ms":c.end_ms,"text":c.text,"lead_ms":c.lead_ms,"send_at_ms":c.start_ms.saturating_sub(c.lead_ms),"text_send_at_ms":c.start_ms.saturating_sub(c.lead_ms),"pcm_send_at_ms":pcm_times[i]})).collect();
+    let timeline: Vec<Value> = cues.iter().enumerate().map(|(i,c)| json!({"start_ms":c.start_ms,"end_ms":c.end_ms,"text":c.text,"lead_ms":c.lead_ms,"send_at_ms":c.start_ms.saturating_sub(c.lead_ms),"text_send_at_ms":c.start_ms.saturating_sub(c.lead_ms),"pcm_send_at_ms":pcm_times[i],"lyric_display_delay_ms":lyric_display_delay_ms,"lyric_display_at_ms":pcm_times[i].saturating_add_signed(lyric_display_delay_ms)})).collect();
     crate::queue_store::atomic_write(path, "timeline.json", &serde_json::to_string_pretty(&timeline).map_err(|e| e.to_string())?)
 }
 fn save_timeline(path: &Path, song: &mut Director, cues: Vec<Cue>) -> Result<(), String> {
     validate(&cues, song.duration_ms)?;
     crate::queue_store::atomic_write(path, "corrected.srt", &srt(&cues))?;
-    write_dispatch_timeline(path,&cues,song.pcm_lead_ms)?;
+    write_dispatch_timeline(path,&cues,song.pcm_lead_ms,song.lyric_display_delay_ms)?;
     song.cues = cues; song.status = "ready".into(); song.error = None; write(path, song)
 }
 
@@ -119,7 +127,7 @@ pub async fn director_create(app: tauri::AppHandle, request: CreateRequest, tts:
     let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "歌曲 Base64 编码无效")?;
     if bytes.is_empty() || bytes.len() >= 100 * 1024 * 1024 { return Err("歌曲文件不能为空且需小于 100 MB".into()); }
     let mut song = Director { id: uuid::Uuid::new_v4().to_string(), title: request.title.trim().into(), created_at: crate::unix_ms(), duration_ms: request.duration_ms,
-        audio_name: request.audio_name, audio_file: format!("audio.{ext}"), lyrics: request.lyrics, status: "transcribing".into(), raw_segments: vec![], cues: vec![], error: None, pcm_lead_ms:0 };
+        audio_name: request.audio_name, audio_file: format!("audio.{ext}"), lyrics: request.lyrics, status: "transcribing".into(), raw_segments: vec![], cues: vec![], error: None, pcm_lead_ms:0, lyric_display_delay_ms:default_lyric_display_delay_ms() };
     let path = folder(&app, &song.id)?; fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     let _job = DirectorJob::acquire(&app, &song.id)?;
     fs::write(path.join(&song.audio_file), bytes).map_err(|e| e.to_string())?;
@@ -158,7 +166,7 @@ pub async fn director_correct(app: tauri::AppHandle, id: String, base_url: Strin
     let path = folder(&app, &id)?; let mut song = read(&path)?;
     if song.raw_segments.is_empty() { return Err("请先完成语音识别".into()); }
     let cues = crate::model_api::correct_song_lyrics(base_url, key, model, &song.lyrics, &song.raw_segments).await?;
-    save_timeline(&path, &mut song, cues)?; prepare_pcm(&app,&path,&song).await?; Ok(public(&path, &song))
+    save_timeline(&path, &mut song, cues)?; prepare_stems(&app,&path,&song).await?; prepare_pcm(&app,&path,&song).await?; Ok(public(&path, &song))
 }
 #[tauri::command]
 pub async fn director_save(app: tauri::AppHandle, id: String, cues: Vec<Cue>, pcm_lead_ms:Option<u64>) -> Result<Value, String> {
@@ -170,26 +178,48 @@ pub async fn director_save(app: tauri::AppHandle, id: String, cues: Vec<Cue>, pc
 }
 async fn prepare_pcm(app:&tauri::AppHandle,path:&Path,song:&Director)->Result<(),String> {
     validate(&song.cues,song.duration_ms)?;
+    let vocals = crate::song_stems::load(path, &path.join(&song.audio_file))?.vocals(path)?;
     let app=app.clone();let path=path.to_path_buf();let song=song.clone();
-    tauri::async_runtime::spawn_blocking(move||crate::song_pcm::build(&path,&path.join(&song.audio_file),&song.cues,|src,dst|crate::speech_runtime::decode_song_audio(&app,src,dst)).map(|_|())).await.map_err(|e|e.to_string())?
+    tauri::async_runtime::spawn_blocking(move||crate::song_pcm::build(&path,&vocals,&song.cues,|src,dst|crate::speech_runtime::decode_song_audio(&app,src,dst)).map(|_|())).await.map_err(|e|e.to_string())?
 }
-fn save_timing(path:&Path,song:&mut Director,pcm_lead_ms:u64,text_lead_ms:Option<u64>)->Result<(),String>{
-    if pcm_lead_ms>5000||text_lead_ms.is_some_and(|lead|lead>5000){return Err("提前量需为0–5000毫秒的整数".into());}
-    let mut cues=song.cues.clone();
-    if let Some(lead)=text_lead_ms{
-        if cues.is_empty(){return Err("请先生成或保存歌词时间轴，再调整歌词文字提前量".into());}
-        for cue in &mut cues{cue.lead_ms=lead;}
-    }
-    if !cues.is_empty(){validate(&cues,song.duration_ms)?;}
+async fn prepare_stems(app: &tauri::AppHandle, path: &Path, song: &Director) -> Result<(), String> {
+    let app = app.clone(); let path = path.to_path_buf(); let source = path.join(&song.audio_file);
+    tauri::async_runtime::spawn_blocking(move || crate::song_stems::build(&path, &source,
+        |src, dst| crate::speech_runtime::separate_song_audio(&app, src, dst)).map(|_| ())).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn director_separate(app: tauri::AppHandle, id: String) -> Result<Value, String> {
+    let _job = DirectorJob::acquire(&app, &id)?; crate::queue_store::ensure_song_not_queued(&app, &id)?;
+    let path = folder(&app, &id)?; let song = read(&path)?;
+    prepare_stems(&app, &path, &song).await?;
+    if !song.cues.is_empty() { prepare_pcm(&app, &path, &song).await?; }
+    Ok(public(&path, &song))
+}
+fn save_timing(path:&Path,song:&mut Director,pcm_lead_ms:u64,text_lead_ms:Option<i64>)->Result<(),String>{
+    if pcm_lead_ms>5000{return Err("PCM提前量需为0–5000毫秒的整数".into());}
+    if text_lead_ms.is_some_and(|lead| !(-10000..=10000).contains(&lead)){return Err("歌词文字提前量需为-10000–10000毫秒的整数".into());}
+    if !song.cues.is_empty(){validate(&song.cues,song.duration_ms)?;}
     song.pcm_lead_ms=pcm_lead_ms;
-    if !cues.is_empty(){write_dispatch_timeline(path,&cues,pcm_lead_ms)?;song.cues=cues;}
+    if let Some(lead)=text_lead_ms{song.lyric_display_delay_ms=lead;}
+    if !song.cues.is_empty(){write_dispatch_timeline(path,&song.cues,pcm_lead_ms,song.lyric_display_delay_ms)?;}
     write(path,song)
 }
 #[tauri::command]
-pub fn director_save_timing(app:tauri::AppHandle,id:String,pcm_lead_ms:u64,text_lead_ms:Option<u64>)->Result<Value,String>{
+pub fn director_save_timing(app:tauri::AppHandle,id:String,pcm_lead_ms:u64,text_lead_ms:Option<i64>)->Result<Value,String>{
     let _job=DirectorJob::acquire(&app,&id)?;
     let path=folder(&app,&id)?;let mut song=read(&path)?;
     save_timing(&path,&mut song,pcm_lead_ms,text_lead_ms)?;Ok(public(&path,&song))
+}
+fn save_lyric_delay(path: &Path, song: &mut Director, delay_ms: i64) -> Result<(), String> {
+    if !(-10000..=10000).contains(&delay_ms) { return Err("歌词文字提前量需为-10000–10000毫秒的整数".into()); }
+    if !song.cues.is_empty() { write_dispatch_timeline(path, &song.cues, song.pcm_lead_ms, delay_ms)?; }
+    song.lyric_display_delay_ms = delay_ms; write(path, song)
+}
+#[tauri::command]
+pub fn director_save_lyric_delay(app: tauri::AppHandle, id: String, delay_ms: i64) -> Result<Value, String> {
+    let _job = DirectorJob::acquire(&app, &id)?;
+    let path = folder(&app, &id)?; let mut song = read(&path)?;
+    save_lyric_delay(&path, &mut song, delay_ms)?; Ok(public(&path, &song))
 }
 #[tauri::command]
 pub async fn director_prepare_pcm(app:tauri::AppHandle,id:String)->Result<Value,String> {
@@ -215,6 +245,27 @@ pub fn director_open_folder(app: tauri::AppHandle, id: Option<String>) -> Result
 mod tests {
     use super::*;
     #[test]
+    fn lyric_delay_migrates_and_persists_without_changing_pcm_or_other_timing() {
+        let path=std::env::temp_dir().join(format!("song-lyric-delay-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&path).unwrap();
+        let old=json!({"id":"saved","title":"歌","created_at":1,"duration_ms":3000,"audio_name":"a.mp3","audio_file":"audio.mp3","lyrics":"歌词","status":"ready","raw_segments":[],"cues":[{"start_ms":1000,"end_ms":2000,"text":"歌词","lead_ms":700}],"error":null,"pcm_lead_ms":500});
+        fs::write(path.join("director.json"),serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::write(path.join("pcm.json"),b"unchanged cached audio").unwrap();fs::write(path.join("corrected.srt"),b"unchanged subtitles").unwrap();
+        let mut song=read(&path).unwrap();assert_eq!(song.lyric_display_delay_ms,1500);
+        save_lyric_delay(&path,&mut song,2000).unwrap();
+        let saved=read(&path).unwrap();assert_eq!(saved.lyric_display_delay_ms,2000);assert_eq!(saved.pcm_lead_ms,500);assert_eq!(saved.cues[0].lead_ms,700);
+        let timeline:Value=serde_json::from_slice(&fs::read(path.join("timeline.json")).unwrap()).unwrap();assert_eq!(timeline[0]["pcm_send_at_ms"],500);assert_eq!(timeline[0]["lyric_display_at_ms"],2500);
+        save_lyric_delay(&path,&mut song,0).unwrap();assert_eq!(read(&path).unwrap().lyric_display_delay_ms,0);
+        save_lyric_delay(&path,&mut song,10000).unwrap();assert_eq!(read(&path).unwrap().lyric_display_delay_ms,10000);
+        save_timing(&path,&mut song,500,Some(-250)).unwrap();assert_eq!(read(&path).unwrap().lyric_display_delay_ms,-250);
+        let timeline:Value=serde_json::from_slice(&fs::read(path.join("timeline.json")).unwrap()).unwrap();assert_eq!(timeline[0]["lyric_display_at_ms"],250);
+        save_timing(&path,&mut song,500,Some(-1500)).unwrap();assert_eq!(read(&path).unwrap().lyric_display_delay_ms,-1500);
+        let timeline:Value=serde_json::from_slice(&fs::read(path.join("timeline.json")).unwrap()).unwrap();assert_eq!(timeline[0]["lyric_display_at_ms"],0);
+        let bytes=fs::read(path.join("director.json")).unwrap();assert!(save_lyric_delay(&path,&mut song,10001).is_err());assert_eq!(fs::read(path.join("director.json")).unwrap(),bytes);
+        assert!(save_timing(&path,&mut song,500,Some(-10001)).is_err());assert_eq!(fs::read(path.join("director.json")).unwrap(),bytes);
+        assert_eq!(fs::read(path.join("pcm.json")).unwrap(),b"unchanged cached audio");assert_eq!(fs::read(path.join("corrected.srt")).unwrap(),b"unchanged subtitles");
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
     fn srt_and_timeline_bounds() {
         let mut cues = vec![Cue { start_ms:1234, end_ms:2500, text:"歌词".into(), lead_ms:500 }];
         assert_eq!(srt(&cues), "1\n00:00:01,234 --> 00:00:02,500\n歌词\n\n");
@@ -228,7 +279,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("director-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("raw.srt"), "original whisper").unwrap();
-        let mut song = Director { id:uuid::Uuid::new_v4().to_string(), title:"测试".into(), created_at:1, duration_ms:3000, audio_name:"song.mp3".into(), audio_file:"audio.mp3".into(), lyrics:"参考歌词".into(), status:"draft".into(), raw_segments:vec![], cues:vec![], error:None, pcm_lead_ms:0 };
+        let mut song = Director { id:uuid::Uuid::new_v4().to_string(), title:"测试".into(), created_at:1, duration_ms:3000, audio_name:"song.mp3".into(), audio_file:"audio.mp3".into(), lyrics:"参考歌词".into(), status:"draft".into(), raw_segments:vec![], cues:vec![], error:None, pcm_lead_ms:0, lyric_display_delay_ms:1500 };
         let cues = vec![Cue { start_ms:100, end_ms:400, text:"开头".into(), lead_ms:500 }, Cue { start_ms:1000, end_ms:2000, text:"校正歌词".into(), lead_ms:600 }];
         save_timeline(&path, &mut song, cues).unwrap();
         assert_eq!(fs::read_to_string(path.join("raw.srt")).unwrap(), "original whisper");
@@ -246,18 +297,20 @@ mod tests {
     fn timing_only_save_preserves_audio_clips_and_sample_boundaries(){
         let path=std::env::temp_dir().join(format!("director-timing-test-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&path).unwrap();
         fs::write(path.join("audio.wav"),b"original audio").unwrap();
-        let mut song=Director{id:uuid::Uuid::new_v4().to_string(),title:"歌".into(),created_at:1,duration_ms:3000,audio_name:"audio.wav".into(),audio_file:"audio.wav".into(),lyrics:"歌词".into(),status:"draft".into(),raw_segments:vec![],cues:vec![],error:None,pcm_lead_ms:0};
+        let mut song=Director{id:uuid::Uuid::new_v4().to_string(),title:"歌".into(),created_at:1,duration_ms:3000,audio_name:"audio.wav".into(),audio_file:"audio.wav".into(),lyrics:"歌词".into(),status:"draft".into(),raw_segments:vec![],cues:vec![],error:None,pcm_lead_ms:0,lyric_display_delay_ms:1500};
         let cues=vec![Cue{start_ms:100,end_ms:400,text:"第一段".into(),lead_ms:500},Cue{start_ms:1000,end_ms:2000,text:"第二段".into(),lead_ms:600}];
         save_timeline(&path,&mut song,cues).unwrap();
         crate::song_pcm::build(&path,&path.join("audio.wav"),&song.cues,|_,out|fs::write(out,vec![0u8;144000]).map_err(|e|e.to_string())).unwrap();
         let manifest=fs::read(path.join("pcm.json")).unwrap();let subtitle=fs::read(path.join("corrected.srt")).unwrap();
         save_timing(&path,&mut song,500,Some(750)).unwrap();
-        assert_eq!(read(&path).unwrap().pcm_lead_ms,500);assert!(song.cues.iter().all(|c|c.lead_ms==750));
+        assert_eq!(read(&path).unwrap().pcm_lead_ms,500);assert_eq!(song.lyric_display_delay_ms,750);assert_eq!(song.cues[0].lead_ms,500);assert_eq!(song.cues[1].lead_ms,600);
         assert_eq!(song.cues[0].start_ms,100);assert_eq!(song.cues[1].end_ms,2000);
         assert_eq!(fs::read(path.join("corrected.srt")).unwrap(),subtitle);assert_eq!(fs::read(path.join("pcm.json")).unwrap(),manifest);
-        assert!(public(&path,&song)["pcm_ready"].as_bool().unwrap());
-        let timeline:Value=serde_json::from_slice(&fs::read(path.join("timeline.json")).unwrap()).unwrap();assert_eq!(timeline[1]["send_at_ms"],250);assert_eq!(timeline[1]["text_send_at_ms"],250);assert_eq!(timeline[1]["pcm_send_at_ms"],500);
-        song.cues[1].lead_ms=900;save_timing(&path,&mut song,100,None).unwrap();assert_eq!(song.cues[0].lead_ms,750);assert_eq!(song.cues[1].lead_ms,900);
+        assert!(crate::song_pcm::load(&path,&path.join("audio.wav"),&song.cues).is_ok());
+        assert_eq!(public(&path,&song)["stems_ready"],false);
+        assert_eq!(public(&path,&song)["pcm_ready"],false); // Old mixed-song PCM is not playable as separated vocals.
+        let timeline:Value=serde_json::from_slice(&fs::read(path.join("timeline.json")).unwrap()).unwrap();assert_eq!(timeline[1]["send_at_ms"],400);assert_eq!(timeline[1]["text_send_at_ms"],400);assert_eq!(timeline[1]["pcm_send_at_ms"],500);
+        song.cues[1].lead_ms=900;save_timing(&path,&mut song,100,None).unwrap();assert_eq!(song.cues[0].lead_ms,500);assert_eq!(song.cues[1].lead_ms,900);
         let saved=fs::read(path.join("director.json")).unwrap();assert!(save_timing(&path,&mut song,5001,None).is_err());assert_eq!(fs::read(path.join("director.json")).unwrap(),saved);
         song.status="failed".into();song.error=Some("保留原错误".into());save_timing(&path,&mut song,200,None).unwrap();
         assert_eq!(read(&path).unwrap().status,"failed");assert_eq!(read(&path).unwrap().error.as_deref(),Some("保留原错误"));

@@ -1,10 +1,15 @@
 export type SongCue = { start_ms: number; end_ms: number; text: string; lead_ms: number };
+export const DEFAULT_LYRIC_DISPLAY_DELAY_MS = 1500;
+export const MAX_LYRIC_DISPLAY_DELAY_MS = 10000;
+export const MIN_LYRIC_DISPLAY_DELAY_MS = -10000;
 export type SongPcmSegment = { index: number; start_ms: number; end_ms: number; sample_count: number; pcm_path: string };
 export type SongDirector = {
   id: string; title: string; created_at: number; duration_ms: number;
   audio_name: string; audio_path: string; directory: string; available: boolean;
   lyrics: string; status: string; raw_segments: SongCue[]; cues: SongCue[]; error: string | null;
   pcm_ready?: boolean; pcm_segments?: SongPcmSegment[]; pcm_error?: string; pcm_lead_ms?: number;
+  stems_ready?: boolean; stems_error?: string; vocals_path?: string; accompaniment_path?: string;
+  lyric_display_delay_ms?: number;
 };
 export type SongPlaybackIdentity = { live_id: string; task_id: string; playback_token: string };
 export type SongPcmPhase = SongPlaybackIdentity & { active: boolean };
@@ -87,6 +92,11 @@ export class SongDirectorPlayer {
   private lastTime = -1;
   private cleanupPromise?: Promise<void>;
   private blocked = false;
+  private audioUnhealthySince?: number;
+  private ending = false;
+  private pcmCaptions = new Map<number, { showAt: number; endAt: number }>();
+  private captionIndex = -1;
+  private captionSchedule: ReturnType<typeof songPcmSchedule<SongCue>>;
   constructor(private audio: HTMLAudioElement, private cues: SongCue[], private adapter: {
     mute: (muted: boolean) => void;
     speak: (text: string, index: number) => Promise<void>;
@@ -95,21 +105,54 @@ export class SongDirectorPlayer {
     activateAudio?: () => Promise<void>;
     cleanup?: () => void;
     drain?: () => Promise<void>;
-    caption: (text: string) => void;
+    caption: (text: string, following?: string[], previous?: string) => void;
     state: (state: SongPlaybackState['state'], error?: string) => void;
     observe?: (observation: SongSyncObservation) => void;
     progress?: (progress: SongSyncProgress) => void;
-  }) {}
+    audioHealthy?: () => boolean;
+  }, private lyricDisplayDelayMs = DEFAULT_LYRIC_DISPLAY_DELAY_MS, pcmLeadMs = 0) {
+    if (!Number.isInteger(lyricDisplayDelayMs) || lyricDisplayDelayMs < MIN_LYRIC_DISPLAY_DELAY_MS || lyricDisplayDelayMs > MAX_LYRIC_DISPLAY_DELAY_MS) throw new Error('歌词文字提前量需为-10000–10000毫秒的整数');
+    this.captionSchedule = lyricDisplayDelayMs < 0 ? songPcmSchedule(cues, pcmLeadMs) : [];
+  }
+  // Called only after the frame containing this cue's first sample was written.
+  pcmSent(index: number, sentAt = Date.now()) {
+    if (this.closed || !Number.isInteger(index) || !this.cues[index] || !Number.isFinite(sentAt) || this.pcmCaptions.has(index)) return;
+    if (this.lyricDisplayDelayMs < 0) { this.updateCaption(); return; }
+    const cue = this.cues[index], showAt = sentAt + this.lyricDisplayDelayMs;
+    this.pcmCaptions.set(index, { showAt, endAt: showAt + cue.end_ms - cue.start_ms });
+    this.updateCaption();
+  }
+  get hasPendingCaptions() {
+    if (this.lyricDisplayDelayMs < 0) return !this.closed && this.captionSchedule.some(cue => Math.max(0, cue.send_at_ms + this.lyricDisplayDelayMs) + cue.end_ms - cue.start_ms > this.audio.currentTime * 1000);
+    return !this.closed && [...this.pcmCaptions].some(([index, frame]) => index >= this.captionIndex && frame.endAt > Date.now());
+  }
+  private updateCaption() {
+    if (this.lyricDisplayDelayMs < 0) {
+      const time = this.audio.currentTime * 1000;
+      for (let index = 0; index < this.captionSchedule.length; index++) if (index > this.captionIndex && Math.max(0, this.captionSchedule[index].send_at_ms + this.lyricDisplayDelayMs) <= time) this.captionIndex = index;
+      const cue = this.captionSchedule[this.captionIndex];
+      this.showCaption(!!cue && time < Math.max(0, cue.send_at_ms + this.lyricDisplayDelayMs) + cue.end_ms - cue.start_ms);
+      return;
+    }
+    const now = Date.now();
+    for (const [index, frame] of this.pcmCaptions) if (index > this.captionIndex && frame.showAt <= now) this.captionIndex = index;
+    const current = this.pcmCaptions.get(this.captionIndex);
+    const active = current && now >= current.showAt && now < current.endAt;
+    this.showCaption(!!active);
+  }
+  private showCaption(active: boolean) {
+    this.adapter.caption(active ? this.cues[this.captionIndex].text : '', active ? this.cues.slice(this.captionIndex + 1, this.captionIndex + 2).map(cue => cue.text) : undefined, active ? this.cues[this.captionIndex - 1]?.text : undefined);
+  }
   async start() {
     this.adapter.mute(true);
-    this.audio.onended = () => { void (async () => { try { await this.adapter.drain?.(); if (!this.closed) await this.stop('ended'); } catch (error) { await this.stop('error', String(error)); } })(); };
-    this.audio.onerror = () => { void this.stop('error', '原歌曲播放失败，请检查本地音频'); };
+    this.audio.onended = () => { this.ending = true; void (async () => { try { await this.adapter.drain?.(); if (!this.closed) await this.stop('ended'); } catch (error) { await this.stop('error', String(error)); } })(); };
+    this.audio.onerror = () => { void this.stop('error', '伴奏播放失败，请检查本地伴奏文件'); };
     this.lastProgress = Date.now();
     try {
       await this.adapter.prepare?.();
       if (this.closed) return;
       await this.play();
-    } catch (error) { await this.stop('error', `原歌曲无法播放：${String(error)}`); }
+    } catch (error) { await this.stop('error', `伴奏无法播放：${String(error)}`); }
   }
   private async play() {
     const position = this.audio.currentTime;
@@ -120,7 +163,7 @@ export class SongDirectorPlayer {
       if (error && typeof error === 'object' && 'name' in error && error.name === 'NotAllowedError') {
         this.audio.pause(); this.audio.currentTime = position;
         this.blocked = true;
-        this.adapter.state('blocked', '请在 OBS 窗口点击“恢复播放”以播放原歌曲');
+        this.adapter.state('blocked', '请在 OBS 窗口点击“恢复播放”以播放伴奏');
         return;
       }
       throw error;
@@ -136,21 +179,24 @@ export class SongDirectorPlayer {
     if (this.closed || !this.blocked) return;
     // Call play directly during the click gesture, before awaiting other work.
     try { await this.play(); }
-    catch (error) { await this.stop('error', `原歌曲无法播放：${String(error)}`); }
+    catch (error) { await this.stop('error', `伴奏无法播放：${String(error)}`); }
   }
   async tick() {
     if (this.closed) return;
+    if (this.adapter.audioHealthy && !this.adapter.audioHealthy()) {
+      this.audioUnhealthySince ??= Date.now();
+      if (Date.now() - this.audioUnhealthySince > 3500) { await this.stop('error', 'RTC下行人声中断，已停止伴奏，请检查连接后重试'); return; }
+    } else this.audioUnhealthySince = undefined;
     const time = this.audio.currentTime * 1000;
     if (time !== this.lastTime) { this.lastTime = time; this.lastProgress = Date.now(); }
-    if (Date.now() - this.lastProgress > 15000) { await this.stop('error', '原歌曲播放停滞超过15秒，已停止导播'); return; }
-    const current = this.cues.find(cue => cue.start_ms <= time && time < cue.end_ms);
-    this.adapter.caption(current?.text || '');
+    if (!this.ending && Date.now() - this.lastProgress > 15000) { await this.stop('error', '伴奏播放停滞超过15秒，已停止导播'); return; }
+    this.updateCaption();
     if (Date.now() - this.progressAt >= 1000) { this.progressAt = Date.now(); this.reportProgress(); }
     if (this.observation && Date.now() - this.observation.submittedAt >= 5000) this.finishObservation('unconfirmed');
     if (this.pending && Date.now() - this.pendingAt > 5000) {
-      await this.stop('error', '歌词发送超过5秒未返回，已停止原歌曲以避免继续错位；请检查控制连接'); return;
+      await this.stop('error', '歌词发送超过5秒未返回，已停止伴奏以避免继续错位；请检查控制连接'); return;
     }
-    if (this.pending || this.audio.paused) return;
+    if (this.pending || this.audio.paused || this.ending) return;
     this.pending = true; this.pendingAt = Date.now();
     try {
       for (let i = 0; i < this.cues.length; i++) {

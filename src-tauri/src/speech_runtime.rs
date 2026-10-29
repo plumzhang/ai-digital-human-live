@@ -88,6 +88,26 @@ pub(crate) fn decode_song_audio(app:&tauri::AppHandle,source:&Path,target:&Path)
     let config=read_config(&directory(app)?)?;
     decode_song_audio_in(&config.distro,source,target)
 }
+pub(crate) fn separate_song_audio(app: &tauri::AppHandle, source: &Path, target: &Path) -> Result<(), String> {
+    let path = directory(app)?; let config = read_config(&path)?;
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    let script = path.join("separate_song.py");
+    std::fs::write(&script, include_str!("../../scripts/separate_song.py").replace("\r\n", "\n")).map_err(|e| e.to_string())?;
+    separate_song_audio_in(&config.distro, &config.root, &script, source, target)
+}
+pub(crate) fn separate_song_audio_in(distro: &str, root: &str, script: &Path, source: &Path, target: &Path) -> Result<(), String> {
+    let mut command = Command::new("wsl.exe");
+    command.args(["-d", distro, "-u", "root", "--exec", "/usr/bin/timeout", "--kill-after=10", "2400", "/usr/bin/python3"])
+        .arg(windows_to_wsl(script)?).args(["--root", root, "--source"]).arg(windows_to_wsl(source)?)
+        .arg("--output").arg(windows_to_wsl(target)?);
+    quiet(&mut command);
+    let output = command.output().map_err(|_| "无法启动人声分离，请检查 WSL2 语音环境")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("人声与伴奏分离失败：{}", detail.chars().rev().take(1400).collect::<String>().chars().rev().collect::<String>()));
+    }
+    Ok(())
+}
 pub(crate) fn decode_song_audio_in(distro:&str,source:&Path,target:&Path)->Result<(),String> {
     let mut command=Command::new("wsl.exe");
     command.args(["-d",distro,"-u","root","--exec","/usr/bin/ffmpeg","-nostdin","-hide_banner","-loglevel","error","-y","-i"])

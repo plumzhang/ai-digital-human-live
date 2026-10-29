@@ -450,6 +450,7 @@ export class InteractionQueue {
     await this.tick();
   }
   async enqueueSong(song: SongDirector) {
+    if (!song.stems_ready || !song.accompaniment_path || !song.vocals_path) throw new Error('请先在唱歌模块分离人声与伴奏');
     if (!song.pcm_ready || !song.pcm_segments?.length) throw new Error('请先在唱歌模块截取歌词PCM');
     if (song.status !== 'ready' || !song.available || !song.cues.length || !Number.isFinite(song.duration_ms) || song.duration_ms <= 0) throw new Error('请先生成并保存有效的歌曲导播');
     if (this.disposed || this.faulted) throw new Error('队列不可用，请重新打开中控台');
@@ -480,7 +481,7 @@ export class InteractionQueue {
   async observeSong(state: SongPlaybackState) {
     const task = this.state.tasks.find(t=>t.song&&t.id===state.task_id);
     if (!task?.song || task.status !== 'playing' || task.id !== state.task_id || task.playback_token !== state.playback_token || task.live_id !== state.live_id || this.activeLive !== state.live_id) return;
-    if (state.state === 'ended') await this.finishSong(task, 'played', '原歌曲播放结束');
+    if (state.state === 'ended') await this.finishSong(task, 'played', '伴奏与下行人声播放结束');
     else if (state.state === 'error') await this.markUncertain(state.error || '歌曲播放失败', task.id);
     else if (state.state === 'started' || state.state === 'blocked') await this.mutate(next => {
       const current = next.tasks.find(item => item.id === state.task_id && item.status === 'playing' && item.playback_token === state.playback_token);

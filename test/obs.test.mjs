@@ -53,7 +53,7 @@ async function player(options = {}) {
     '@tauri-apps/api/core': { convertFileSrc: path => `asset://${path}`, invoke: async (name, args) => {
       calls.push([name, args]);
       if (name === 'speech_transcribe' && options.transcribe) return options.transcribe(args.request);
-      if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, pcm_ready:true, pcm_segments:[{index:0,start_ms:0,end_ms:1000,sample_count:24000,pcm_path:'clip.pcm'}], audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
+      if (name === 'director_get') return options.getDirector ? options.getDirector() : { status:'ready', available:true, stems_ready:true, vocals_path:'vocals.wav', accompaniment_path:'accompaniment.wav', lyric_display_delay_ms:options.lyricDelay??1500, pcm_ready:true, pcm_segments:[{index:0,start_ms:0,end_ms:1000,sample_count:24000,pcm_path:'clip.pcm'}], audio_path:'song.mp3', cues:[{ start_ms:0, end_ms:1000, lead_ms:500, text:'原歌词' }] };
       return name === 'session_snapshot' ? snapshot : undefined;
     } },
     '@tauri-apps/api/event': {
@@ -74,7 +74,7 @@ async function player(options = {}) {
       dispose() { this.disposed = true; this.running = false; }
       async resume() { this.running = true; }
     } },
-    '../songAudioBridge': { createSongAudioBridge: async (audio, segments, read, lead, send, failed, phase) => { bridges.push({send,phase});return { dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {await phase?.(false,0);}, drain: async () => {} };} },
+    '../songAudioBridge': { createSongAudioBridge: async (audio, segments, read, lead, send, failed, phase, cueSent) => { bridges.push({send,phase,cueSent});return { dispose: () => calls.push(['songBridgeDisposed']), resume: async () => {await phase?.(false,0);}, drain: async () => {} };} },
     '../rtcVad': { monitorDownlinkAudio: async (track, receiving, activity, failed, pcm) => {
       const monitor = { track, receiving, activity, failed, pcm, disposed: false, dispose() { this.disposed = true; }, resume: async () => {} };
       monitors.push(monitor);
@@ -126,12 +126,20 @@ test('OBS can report its existing join/subscriptions after console listeners rel
   const before=p.calls.length;await p.handlers.get('rtc-status-request')({payload:{live_id:'old'}});assert.equal(p.calls.length,before);
 });
 
-test('OBS song control plays original audio and keeps RTC muted after the song ends', async () => {
+async function readySongAudio(p) {
+  p.rtcHandlers.get('audioSubscribeStateChanged')('avatar', 0, 3);
+  await new Promise(resolve => setImmediate(resolve));
+  p.rtcHandlers.get('rtcRemoteAudioStats')([{ uid:'avatar', stats:{ bytesReceived:1000 } }]);
+  p.monitors.find(m => m.track.id === 'avatar').activity({ healthy:true, speaking:false, ended:false, quiet_ms:2000 });
+}
+
+test('OBS song control plays accompaniment and RTC vocals, then restores local reply routing', async () => {
   const p = await player();
+  await readySongAudio(p);
   const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
   p.handlers.get('song-control')({ payload:control });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(p.songs.length,1); assert.equal(p.songs[0].src,'asset://song.mp3'); assert.equal(p.songs[0].paused,false);
+  assert.equal(p.songs.length,1); assert.equal(p.songs[0].src,'asset://accompaniment.wav'); assert.equal(p.songs[0].paused,false);
   const loaded=p.calls.find(([name])=>name==='songAudioSource')[1];
   assert.equal(loaded.crossOrigin,'anonymous');assert.equal(loaded.muted,false);assert.equal(loaded.volume,1);
   assert.ok(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === true));
@@ -141,12 +149,27 @@ test('OBS song control plays original audio and keeps RTC muted after the song e
   p.songs[0].onended(); await new Promise(resolve => setImmediate(resolve));
   const interrupt = p.calls.findIndex(([name]) => name === 'interrupt_session');
   assert.ok(interrupt >= 0);
-  assert.equal(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false), false);
+  assert.ok(p.calls.some(([name, muted]) => name === 'muteAllRemoteAudioPlaying' && muted === false));
+  assert.deepEqual(p.calls.filter(([name]) => name === 'muteAllRemoteAudioPlaying').at(-1), ['muteAllRemoteAudioPlaying', true]);
   assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'ended' && state.playback_token === 'attempt'));
 });
 
-test('OBS switches native song priority before lyric PCM and keeps local gap replies independent of RTC',async()=>{
+test('OBS displays a PCM-triggered lyric even in a gap, protects it from queue captions and clears it on stop',async()=>{
+  const p=await player({lyricDelay:0});await readySongAudio(p);
+  const control={action:'start',live_id:'123',task_id:'song',playback_token:'token',song_id:'saved'};
+  p.handlers.get('song-control')({payload:control});await new Promise(resolve=>setImmediate(resolve));
+  const caption=()=>p.render().props.children[1].props.children[0].props.content;
+  assert.equal(caption(),'');
+  p.bridges[0].cueSent(0,Date.now());assert.equal(caption(),'原歌词');
+  await p.bridges[0].phase(false,1);assert.equal(caption(),'原歌词');
+  p.handlers.get('queue-caption')({payload:{live_id:'123',content:'弹幕'}});assert.equal(caption(),'原歌词');
+  p.handlers.get('song-control')({payload:{...control,action:'stop'}});await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(caption(),'');p.bridges[0].cueSent(0,Date.now());assert.equal(caption(),'');
+});
+
+test('OBS switches native song priority before vocal PCM and gap replies share RTC without local duplicates',async()=>{
   const p=await player();
+  await readySongAudio(p);
   const control={action:'start',live_id:'123',task_id:'song-task',playback_token:'attempt',song_id:'song-id'};
   p.handlers.get('song-control')({payload:control});await new Promise(resolve=>setImmediate(resolve));
   assert.equal(p.bridges.length,1);assert.ok(p.calls.some(([name])=>name==='component_song_open'));
@@ -156,13 +179,22 @@ test('OBS switches native song priority before lyric PCM and keeps local gap rep
   const phase=p.calls.findIndex(([name,args])=>name==='component_song_phase'&&args.active===true);
   const pcm=p.calls.findIndex(([name])=>name==='component_audio_push');assert.ok(phase>=0&&pcm>phase);
   await p.bridges[0].phase(false,1);
-  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',true]);
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',false]);
   p.handlers.get('whisper-task')({payload:{live_id:'123',task_id:'gap-chat',capture_id:'gap-capture',enabled:true}});
-  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',true]);
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',false]);
+  const local=p.localPlayers[0], count=local.events.length;
+  p.handlers.get('component-pcm')({payload:{live_id:'123',epoch:2,state:'frame',task_id:'gap-chat',pcm:[0,1]}});
+  assert.equal(local.events.length,count);
+  const remote=p.monitors.find(m=>m.track.id==='avatar');
+  remote.activity({healthy:true,speaking:true,ended:false,quiet_ms:0});
+  assert.equal(p.calls.filter(([name])=>name==='avatar-audio').at(-1)[1].playback_source,'rtc-song');
   assert.equal(p.calls.filter(([name])=>name==='interrupt_session').length,globalStops);
   p.songs[0].onended();await new Promise(resolve=>setImmediate(resolve));
   assert.ok(p.calls.some(([name])=>name==='component_song_close'));
   assert.equal(p.calls.filter(([name])=>name==='interrupt_session').length,globalStops);
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',false]);
+  p.handlers.get('whisper-task')({payload:{live_id:'123',task_id:'next-task',capture_id:'next',enabled:true}});
+  assert.deepEqual(p.calls.filter(([name])=>name==='muteAllRemoteAudioPlaying').at(-1),['muteAllRemoteAudioPlaying',true]);
 });
 
 test('OBS ignores stale song commands and cancelling a pending load never starts late playback', async () => {
@@ -178,6 +210,31 @@ test('OBS ignores stale song commands and cancelling a pending load never starts
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(p.songs.length,0); assert.equal(p.calls.filter(([name]) => name === 'component_transcription').length,0);
   assert.ok(p.calls.some(([name, state]) => name === 'song-playback-state' && state.state === 'stopped'));
+});
+
+test('songs require a real RTC audio subscription and never fall back to the mixed original',async()=>{
+  const p=await player();
+  p.handlers.get('song-control')({payload:{action:'start',live_id:'123',task_id:'song',playback_token:'token',song_id:'saved'}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(p.songs.length,0);
+  assert.ok(p.calls.some(([name,value])=>name==='song-playback-state'&&value.state==='error'&&value.error.includes('下行人声')));
+});
+
+test('gap reply recognition consumes remote PCM while the local copy is suppressed',async()=>{
+  const p=await player({transcribe:async request=>({...request,segments:[{text:'欢迎来到直播间',start_ms:0,end_ms:1000}],inference_ms:10})});
+  await readySongAudio(p);
+  p.handlers.get('song-control')({payload:{action:'start',live_id:'123',task_id:'song',playback_token:'token',song_id:'saved'}});
+  await new Promise(resolve=>setImmediate(resolve));
+  await p.bridges[0].phase(false,0);
+  p.handlers.get('whisper-task')({payload:{live_id:'123',task_id:'gap',capture_id:'gap-capture',enabled:true}});
+  for(let i=0;i<20;i++)p.monitors.find(m=>m.track.id==='local-pcm').pcm(new Float32Array(1600).fill(.1),16000,0);
+  assert.equal(p.calls.filter(([name])=>name==='speech_transcribe').length,0);
+  for(let i=0;i<20;i++)p.monitors.find(m=>m.track.id==='avatar').pcm(new Float32Array(1600).fill(.1),16000,0);
+  await new Promise(resolve=>setImmediate(resolve));
+  const result=p.calls.find(([name])=>name==='whisper-recognition')?.[1];
+  assert.equal(result?.task_id,'gap');assert.equal(result?.text,'欢迎来到直播间');
+  p.handlers.get('song-control')({payload:{action:'stop',live_id:'123',task_id:'song',playback_token:'token'}});
+  await new Promise(resolve=>setImmediate(resolve));
 });
 
 test('song VAD observations are logged under the matching lyric id and Vidu rejection stops local music', async () => {
@@ -200,6 +257,7 @@ test('song VAD observations are logged under the matching lyric id and Vidu reje
 
 test('OBS retains the song resume button across video frames and resumes the original audio on click', async () => {
   const p = await player({ blockSongAutoplay:true });
+  await readySongAudio(p);
   const control = { action:'start', live_id:'123', task_id:'song-task', playback_token:'attempt', song_id:'song-id' };
   p.handlers.get('song-control')({ payload:control }); await new Promise(resolve => setImmediate(resolve));
   assert.ok(p.calls.some(([name,state]) => name === 'song-playback-state' && state.state === 'blocked'));

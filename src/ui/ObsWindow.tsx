@@ -10,7 +10,7 @@ import { MicrophoneInput } from '../microphoneInput';
 import { WhisperCapture, type RecognitionTarget, type WhisperResult } from '../whisperRecognition';
 import { ObsCaption } from './ObsCaption';
 import { loadCaptionSettings, normalizeCaptionSettings } from '../captionSettings';
-import { SongDirectorPlayer, type SongDirector, type SongPlaybackIdentity } from '../songDirector';
+import { DEFAULT_LYRIC_DISPLAY_DELAY_MS, SongDirectorPlayer, type SongDirector, type SongPlaybackIdentity } from '../songDirector';
 
 type Snapshot = { live_id: string; rtc: { token: string; user_id: string } };
 type MediaControl = { enabled: boolean; live_id?: string };
@@ -33,6 +33,8 @@ export function ObsWindow() {
   const [resumePlayback, setResumePlayback] = useState(false);
   const [microphoneCaption, setMicrophoneCaption] = useState('');
   const [queueCaption, setQueueCaption] = useState('');
+  const [songFollowing, setSongFollowing] = useState<string[] | undefined>(undefined);
+  const [songPrevious, setSongPrevious] = useState<string | undefined>(undefined);
   const [captionSettings, setCaptionSettings] = useState(loadCaptionSettings);
   const [overlayPosition, setOverlayPosition] = useState<{ left: number; top: number; width: number | string; height: number | string }>({ left: 0, top: 0, width: '100%', height: '100%' });
   const updateOverlayPosition = () => {
@@ -65,10 +67,17 @@ export function ObsWindow() {
     const downlinks = new Map<string, { token: object; bytes?: number; progressAt: number; activity: VadActivity }>();
     let videoSubscribed = false;
     let audioSubscribed = false;
-    let song: { identity: SongPlaybackIdentity; player?: SongDirectorPlayer; singing?: boolean } | undefined;
+    let rtcReplyTaskId: string | undefined;
+    let song: { identity: SongPlaybackIdentity; player?: SongDirectorPlayer; singing?: boolean; lastSentAt?: number; captionActive?: boolean } | undefined;
+    const rtcAudioActive = () => !!song?.player || !!rtcReplyTaskId;
+    const updateAudioRoute = () => rtcRef.current?.muteAllRemoteAudioPlaying(!rtcAudioActive());
     let songCleanup = Promise.resolve();
     const stopSong = async () => {
       const previous = song; song = undefined;
+      if (previous?.captionActive) setQueueCaption('');
+      setSongFollowing(undefined);
+      setSongPrevious(undefined);
+      updateAudioRoute();
       resumeSongRef.current = null;
       const stopping = previous?.player?.stop();
       songCleanup = Promise.all([songCleanup, stopping]).then(() => {});
@@ -91,8 +100,11 @@ export function ObsWindow() {
       const healthy = all.length > 0 && all.every(item => item.activity.healthy);
       const speaking = all.some(item => item.activity.speaking);
       song?.player?.observeAudio({ healthy, speaking, quiet_ms: Math.min(...all.map(item => item.activity.quiet_ms ?? 0)) });
-      // Remote audio, when present, is diagnostic evidence for song rendering.
-      // Reply playback and recognition observe our local speaker branch below.
+      if (rtcAudioActive()) {
+        if (!healthy) whisper.invalidate('歌曲下行音频中断，请确认当前任务');
+        void emit('avatar-audio', { live_id: liveIdRef.current, source: 'pcm-vad', playback_source: 'rtc-song',
+          healthy, speaking, ended: state.ended, quiet_ms: Math.min(...all.map(item => item.activity.quiet_ms ?? 0)), at: Date.now() });
+      }
     };
     async function reportMic(enabled: boolean, error?: string) {
       micRef.current = enabled;
@@ -102,6 +114,7 @@ export function ObsWindow() {
     }
     async function leave() {
       stopMicrophone();
+      rtcReplyTaskId = undefined;
       await stopSong();
       whisper.start();
       for (const monitor of downlinkMonitorsRef.current.values()) monitor.dispose();
@@ -111,6 +124,8 @@ export function ObsWindow() {
       setMicrophoneCaption('');
       setQueueCaption('');
       liveIdRef.current = null;
+      setSongFollowing(undefined);
+      setSongPrevious(undefined);
       lastFrameRef.current = { time: -1, reportedAt: 0 };
       joinedRef.current = false;
       videoSubscribed = false; audioSubscribed = false;
@@ -203,7 +218,7 @@ export function ObsWindow() {
       const onAudioSubscribe = (_uid: string, _old: number, next: number) => {
         if (disposed || rtcRef.current !== rtc || liveIdRef.current !== snapshot.live_id) return;
         audioSubscribed = next === 3;
-        rtc.muteAllRemoteAudioPlaying(true);
+        updateAudioRoute();
         void emit('rtc-media-status', { live_id: snapshot.live_id, kind: 'audio' satisfies MediaKind, subscribed: audioSubscribed });
         if (!_uid || _uid === snapshot.rtc.user_id) return;
         downlinkMonitorsRef.current.get(_uid)?.dispose();
@@ -221,6 +236,7 @@ export function ObsWindow() {
             () => current() && entry.progressAt > 0 && Date.now() - entry.progressAt < 3500,
             state => { if (current()) reportVad(_uid, state); },
             message => { if (current()) void emit('rtc-vad-status', { live_id: snapshot.live_id, message: `可选RTC音频观测：${message}` }); },
+            (samples, rate, quietMs) => { if (current() && rtcAudioActive() && !song?.singing && !micRef.current) whisper.push(samples, rate, quietMs); },
           );
           if (!current()) { monitor.dispose(); return; }
           downlinkMonitorsRef.current.set(_uid, monitor);
@@ -267,6 +283,7 @@ export function ObsWindow() {
           () => current() && localPcm.running && joinedRef.current,
           state => {
             if (!current()) return;
+            if (rtcAudioActive()) return;
             if (!state.healthy) whisper.invalidate('本地音频播放中断，请确认当前任务');
             if (!localPcm.running) { vadNeedsResumeRef.current = true; setResumePlayback(true); }
             void emit('avatar-audio', { live_id: snapshot.live_id, source: 'pcm-vad', playback_source: 'local-pcm', ...state, at: Date.now() });
@@ -277,7 +294,7 @@ export function ObsWindow() {
             setStatus(`本地音频播放检测：${message}`);
             void emit('rtc-vad-status', { live_id: snapshot.live_id, error: `本地音频播放检测：${message}` });
           },
-          (samples, rate, quietMs) => { if (current() && !micRef.current && !song?.singing) whisper.push(samples, rate, quietMs); },
+          (samples, rate, quietMs) => { if (current() && !micRef.current && !rtcAudioActive()) whisper.push(samples, rate, quietMs); },
         );
         if (!current()) { monitor.dispose(); localPcm.dispose(); return; }
         downlinkMonitorsRef.current.set('local-pcm', monitor);
@@ -307,6 +324,13 @@ export function ObsWindow() {
       await emit('caption-settings-request');
       unlisteners.push(await listen<LocalPcmEvent>('component-pcm', event => {
         if (disposed || event.payload.live_id !== liveIdRef.current) return;
+        // Gap replies also use RTC while a song is active, avoiding a second
+        // local copy of the same reply. Stop events still clear old buffers.
+        if (event.payload.state !== 'stop') {
+          if (song) { rtcReplyTaskId = event.payload.task_id; return; }
+          if (rtcReplyTaskId && event.payload.task_id === rtcReplyTaskId) return;
+          if (rtcReplyTaskId) { rtcReplyTaskId = undefined; updateAudioRoute(); }
+        }
         try { localPcmRef.current?.accept(event.payload); }
         catch (error) {
           localPcmRef.current?.accept({ ...event.payload, state: 'stop' });
@@ -334,7 +358,9 @@ export function ObsWindow() {
           try {
             const director = await invoke<SongDirector>('director_get', { id: control.song_id });
             if (song !== currentSong || disposed || control.live_id !== liveIdRef.current) return;
-            if (director.status !== 'ready' || !director.available || !director.cues.length || !director.pcm_ready || !director.pcm_segments?.length) throw new Error('请先在唱歌模块按歌词时间轴截取PCM');
+            if (!director.stems_ready || !director.accompaniment_path || !director.vocals_path) throw new Error('请先在唱歌模块分离人声与伴奏');
+            if (director.status !== 'ready' || !director.available || !director.cues.length || !director.pcm_ready || !director.pcm_segments?.length) throw new Error('请先在唱歌模块按歌词时间轴截取人声PCM');
+            if (!audioSubscribed) throw new Error('歌曲需要RTC下行人声，请等待音频订阅就绪后重试');
             whisper.start();
             const rtc = rtcRef.current!;
             const audio = new Audio();
@@ -342,10 +368,10 @@ export function ObsWindow() {
             // src, otherwise Web Audio's optional lead path produces silence.
             audio.crossOrigin = 'anonymous'; audio.preload = 'auto';
             audio.muted = false; audio.volume = 1;
-            audio.src = convertFileSrc(director.audio_path);
+            audio.src = convertFileSrc(director.accompaniment_path);
             let bridge: Awaited<ReturnType<typeof createSongAudioBridge>> | undefined;
             const player = new SongDirectorPlayer(audio, director.cues, {
-              mute: () => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(true); },
+              mute: active => { if (rtcRef.current === rtc) rtc.muteAllRemoteAudioPlaying(!active && !rtcReplyTaskId); },
               speak: (content, index) => invoke('component_transcription', { liveId: control.live_id, taskId: `${control.playback_token}-${index}`, content }),
               interrupt: () => invoke('component_song_close', { liveId: control.live_id, token: control.playback_token }),
               prepare: async () => {
@@ -355,29 +381,60 @@ export function ObsWindow() {
                 bridge = await createSongAudioBridge(audio, director.pcm_segments!, async path => {
                   const response = await fetch(convertFileSrc(path)); if (!response.ok) throw new Error('无法读取歌词PCM片段'); return response.arrayBuffer();
                 }, director.pcm_lead_ms ?? 0,
-                  (samples, sequence) => invoke('component_audio_push', { liveId: control.live_id, token: control.playback_token, sequence, samples }),
+                  async (samples, sequence) => {
+                    await invoke('component_audio_push', { liveId: control.live_id, token: control.playback_token, sequence, samples });
+                    if (song === currentSong) currentSong.lastSentAt = Date.now();
+                  },
                   error => { void player.stop('error', error); },
                   async (active, sequence) => {
                     if(song!==currentSong||disposed)throw new Error('歌曲已取消');
                     await invoke('component_song_phase',{liveId:control.live_id,token:control.playback_token,active,sequence});
                     if(song!==currentSong||disposed)return;
                     currentSong.singing=active;
-                    // Songs and gap replies both have their own local audio.
-                    rtc.muteAllRemoteAudioPlaying(true);setQueueCaption('');
+                    if (active) rtcReplyTaskId = undefined;
+                    rtc.muteAllRemoteAudioPlaying(false);
+                    if (!currentSong.captionActive) setQueueCaption('');
                     if(active)whisper.start();
-                    else void emit('queue-caption-request',{live_id:control.live_id});
-                  });
+                    else if (!currentSong.captionActive) void emit('queue-caption-request',{live_id:control.live_id});
+                  }, (index, sentAt) => { if (song === currentSong && !disposed) player.pcmSent(index, sentAt); });
                 if (song !== currentSong || disposed) { bridge.dispose(); throw new Error('歌曲已取消'); }
               },
               activateAudio: () => bridge?.resume() || Promise.resolve(),
               cleanup: () => bridge?.dispose(),
-              drain: () => bridge?.drain() || Promise.resolve(),
+              drain: async () => {
+                await bridge?.drain();
+                if (rtcReplyTaskId && !player.hasPendingCaptions) return; // A gap reply retains RTC until its own task finishes.
+                const deadline = Date.now() + 8000 + Math.max(0, director.lyric_display_delay_ms ?? DEFAULT_LYRIC_DISPLAY_DELAY_MS);
+                // Keep remote vocals audible after accompaniment ends. This
+                // observes the returned tail and does not delay accompaniment.
+                while (song === currentSong && !disposed && Date.now() < deadline) {
+                  const entries = [...downlinks.values()];
+                  const healthy = entries.length > 0 && entries.every(item => item.activity.healthy && Date.now() - item.progressAt < 3500);
+                  const quiet = entries.every(item => !item.activity.speaking && (item.activity.quiet_ms || 0) >= 900);
+                  if (!player.hasPendingCaptions && (rtcReplyTaskId || (healthy && quiet && Date.now() - (currentSong.lastSentAt || 0) >= 2000))) return;
+                  await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                if (song === currentSong && !disposed) throw new Error('歌曲下行人声尚未确认结束，请检查RTC声音');
+              },
+              audioHealthy: () => audioSubscribed && [...downlinks.values()].some(item => item.activity.healthy && Date.now() - item.progressAt < 3500),
               observe: observation => {
                 void invoke('tts_log_song_observation', { liveId: control.live_id, msgId: `tts-${control.playback_token}-${observation.index}`, observation })
                   .catch(error => { if (!disposed) setStatus(`歌曲同步日志保存失败：${String(error)}`); });
               },
               progress: progress => { void emit('song-sync-progress', { ...control, ...progress }); },
-              caption: text => { if (liveIdRef.current === control.live_id && (text || currentSong.singing)) setQueueCaption(text); },
+              caption: (text, following, previousLine) => {
+                if (song !== currentSong || disposed || liveIdRef.current !== control.live_id) return;
+                if (text) {
+                  currentSong.captionActive = true; setQueueCaption(text);
+                  const next = following || [];
+                  setSongFollowing(previous => previous?.length === next.length && previous.every((line, index) => line === next[index]) ? previous : next);
+                  setSongPrevious(previousLine);
+                }
+                else if (currentSong.captionActive) {
+                  currentSong.captionActive = false; setQueueCaption(''); setSongFollowing(undefined); setSongPrevious(undefined);
+                  if (!currentSong.singing) void emit('queue-caption-request', { live_id:control.live_id });
+                }
+              },
               state: (state, error) => {
                 if (state === 'blocked') {
                   resumeSongRef.current = () => player.resume();
@@ -385,10 +442,10 @@ export function ObsWindow() {
                 } else if (song === currentSong || !song) {
                   resumeSongRef.current = null;
                 }
-                if ((state === 'ended' || state === 'error') && song === currentSong) song = undefined;
+                if ((state === 'ended' || state === 'error') && song === currentSong) { song = undefined; updateAudioRoute(); }
                 void emit('song-playback-state', { ...control, state, error });
               },
-            });
+            }, director.lyric_display_delay_ms ?? DEFAULT_LYRIC_DISPLAY_DELAY_MS, director.pcm_lead_ms ?? 0);
             currentSong.player = player;
             await player.start();
           } catch (error) {
@@ -441,16 +498,17 @@ export function ObsWindow() {
       }));
       unlisteners.push(await listen<{ live_id: string; content: string }>('queue-caption', event => {
         if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
-        if ((!song || !song.singing) && typeof event.payload.content === 'string') setQueueCaption(event.payload.content.trim());
+        if ((!song || (!song.singing && !song.captionActive)) && typeof event.payload.content === 'string') setQueueCaption(event.payload.content.trim());
       }));
       unlisteners.push(await listen<RecognitionTarget>('whisper-task', event => {
         if (disposed || micRef.current || event.payload.live_id !== liveIdRef.current) return;
+        if (rtcReplyTaskId && (!event.payload.enabled || event.payload.task_id !== rtcReplyTaskId)) { rtcReplyTaskId = undefined; updateAudioRoute(); }
         if (!song || !song.singing) {
           whisper.start(event.payload);
         }
       }));
       unlisteners.push(await listen<{ live_id: string }>('vidu-disconnected', event => {
-        if (event.payload.live_id === liveIdRef.current) { localPcmRef.current?.dispose(); localPcmRef.current = null; void stopSong().catch(() => {}); setMicrophoneCaption(''); setQueueCaption(''); }
+        if (event.payload.live_id === liveIdRef.current) { rtcReplyTaskId = undefined; localPcmRef.current?.dispose(); localPcmRef.current = null; void stopSong().catch(() => {}); setMicrophoneCaption(''); setQueueCaption(''); }
       }));
       const snapshot = await invoke<Snapshot | null>('session_snapshot');
       if (snapshot) enqueue(() => join(snapshot));
@@ -472,7 +530,7 @@ export function ObsWindow() {
       void emit('rtc-playback', { live_id: liveId, playing: true });
     }} />
     <div className="obs-overlay obs-caption-viewport" style={overlayPosition}>
-      <ObsCaption content={queueCaption || (microphoneCaption ? `我：${microphoneCaption}` : '')} settings={captionSettings}/>
+      <ObsCaption content={queueCaption || (microphoneCaption ? `我：${microphoneCaption}` : '')} previous={songPrevious} following={songFollowing} settings={captionSettings}/>
       {resumePlayback && <button className="obs-status" onClick={() => {
         void resumeSongRef.current?.();
         void Promise.all([localPcmRef.current?.resume(), ...[...downlinkMonitorsRef.current.values()].map(monitor => monitor.resume())]).then(() => {

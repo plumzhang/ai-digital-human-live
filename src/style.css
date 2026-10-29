@@ -110,6 +110,9 @@
 .obs-caption-anchor{position:absolute;max-width:100%;pointer-events:none}
 .obs-caption{max-width:100%;max-height:32vh;overflow-y:auto;background:transparent;color:#fff;padding:0;font-size:clamp(14px,1.6vw,20px);line-height:1.5;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;text-shadow:0 1px 2px #0007;pointer-events:auto}
 .obs-caption{animation:obs-caption-in 280ms ease-out both;box-sizing:border-box;max-height:32cqh}
+.obs-song-caption{display:flex;flex-direction:column;gap:.25em}
+.obs-song-current{font-weight:700}
+.obs-song-previous,.obs-song-following{font-size:.85em;opacity:.65}
 .obs-caption[data-entrance=slide]{animation-name:obs-caption-slide}
 .obs-caption[data-entrance=zoom]{animation-name:obs-caption-zoom}
 .obs-caption[data-entrance=none]{animation:none}
@@ -157,6 +160,8 @@
 .song-form>label textarea{width:100%;resize:vertical;line-height:1.8}
 .song-form>.button-row{margin-top:20px}
 .song-card audio{width:100%;margin:12px 0}
+.song-stems-preview{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.song-stems-preview label{min-width:0}
 .song-card-editing{grid-column:1/-1}
 .song-bulk-lead{flex-direction:row;align-items:center;gap:8px}
 .song-bulk-lead input{width:120px}

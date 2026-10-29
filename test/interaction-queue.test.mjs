@@ -1405,7 +1405,7 @@ test('normal recognition uses the configured percentage and still waits for 350m
   }
 });
 
-const songDirector = { pcm_ready: true, pcm_segments: [{index:0,start_ms:2000,end_ms:3000,sample_count:24000,pcm_path:'test.pcm'}], id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
+const songDirector = { stems_ready:true, vocals_path:'vocals.wav', accompaniment_path:'accompaniment.wav', pcm_ready: true, pcm_segments: [{index:0,start_ms:2000,end_ms:3000,sample_count:24000,pcm_path:'test.pcm'}], id: 'song-1', title: '测试歌曲', duration_ms: 240000, status: 'ready', available: true, cues: [{ start_ms: 2000, end_ms: 3000, text: '歌词', lead_ms: 500 }] };
 
 async function startSong(p,active){
   await p.engine.enqueueSong(songDirector);await p.engine.setContext(false,'live',true);p.engine.observeVideo('live');await p.engine.tick();

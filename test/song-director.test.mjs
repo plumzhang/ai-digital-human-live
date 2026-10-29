@@ -27,7 +27,7 @@ test('PCM and lyric text have independent send times on the unchanged original a
   const overlap=[{start_ms:100,end_ms:600},{start_ms:500,end_ms:800},{start_ms:2000,end_ms:2500}];
   assert.deepEqual(Array.from(api.songPcmSchedule(overlap,500),c=>c.send_at_ms),[0,400,1500]);
 });
-function setup(extra = {}) {
+function setup(extra = {}, lyricDelay = 1500, pcmLead = 0) {
   now = 10000;
   const calls = [];
   const audio = { paused: true, currentTime: 0, onended: null, onerror: null,
@@ -38,7 +38,7 @@ function setup(extra = {}) {
     speak: async (text, index) => calls.push(['speak', text, index]),
     interrupt: async () => calls.push(['interrupt']), caption: text => calls.push(['caption', text]),
     state: (state, error) => calls.push(['state', state, error]), ...extra,
-  });
+  }, lyricDelay, pcmLead);
   return { player, audio, calls, speaks: () => calls.filter(c => c[0] === 'speak') };
 }
 test('lyric cues follow audio time, clamp negative send times and honor each lead without duplicates', async () => {
@@ -51,10 +51,65 @@ test('lyric cues follow audio time, clamp negative send times and honor each lea
   await p.player.tick(); assert.equal(p.speaks().length, 2);
   p.audio.currentTime = 3.299; await p.player.tick(); assert.equal(p.speaks().length, 2);
   p.audio.currentTime = 3.3; await p.player.tick(); assert.equal(p.speaks()[2][1], '第二句');
-  p.audio.currentTime = 4.2; await p.player.tick(); assert.deepEqual(p.calls.at(-1), ['caption', '第二句']);
+  p.audio.currentTime = 4.2; await p.player.tick(); assert.deepEqual(p.calls.at(-1), ['caption', '']); // No PCM write yet.
   p.audio.currentTime = 8; await p.player.tick(); assert.deepEqual(p.calls.at(-1), ['caption', '']);
   assert.equal(p.calls.some(c => c[0] === 'state' && c[1] === 'ended'), false);
   await p.player.stop();
+});
+
+test('OBS lyrics start after the acknowledged PCM time plus the saved delay, independent of music and text dispatch',async()=>{
+  const p=setup({},1500);await p.player.start();
+  p.audio.currentTime=4.2;await p.player.tick();assert.deepEqual(p.calls.filter(c=>c[0]==='caption').at(-1),['caption','']);
+  p.player.pcmSent(2,now);assert.deepEqual(p.calls.at(-1),['caption','']);
+  now+=1499;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','']);
+  now+=1;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','第二句']);
+  p.player.pcmSent(2,now); // A duplicate frame cannot extend the lyric.
+  now+=1000;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','']);
+  assert.equal(p.player.hasPendingCaptions,false);await p.player.stop();
+});
+
+test('zero lyric delay displays after send and interruption rejects late PCM callbacks',async()=>{
+  const p=setup({},0);await p.player.start();p.player.pcmSent(0,now);
+  assert.deepEqual(p.calls.at(-1),['caption','开头']);
+  await p.player.stop();const count=p.calls.length;now+=5000;p.player.pcmSent(1,now);await p.player.tick();
+  assert.equal(p.calls.length,count);assert.equal(p.player.hasPendingCaptions,false);
+});
+
+test('negative lyric timing displays before scheduled PCM using its configured lead, without waiting for a write',async()=>{
+  const p=setup({},-1500,500);await p.player.start();
+  p.audio.currentTime=1.999;await p.player.tick();assert.deepEqual(p.calls.filter(c=>c[0]==='caption').at(-1),['caption','']);
+  p.audio.currentTime=2;await p.player.tick();assert.deepEqual(p.calls.filter(c=>c[0]==='caption').at(-1),['caption','第二句']); // PCM: 4s - .5s = 3.5s, lyric: 2s.
+  p.audio.currentTime=3;await p.player.tick();assert.deepEqual(p.calls.filter(c=>c[0]==='caption').at(-1),['caption','']);
+  await p.player.stop();
+});
+
+test('song lyrics roll through previous, current and next cues and clear on stop',async()=>{
+  const captions=[];const p=setup({caption:(text,following,previous)=>captions.push({text,following,previous})},0);
+  await p.player.start();assert.equal(captions.at(-1).text,'');
+  p.player.pcmSent(0,now);
+  assert.deepEqual(JSON.parse(JSON.stringify(captions.at(-1))),{text:'开头',following:['第一句']});
+  now+=900;p.player.pcmSent(1,now);
+  assert.deepEqual(JSON.parse(JSON.stringify(captions.at(-1))),{text:'第一句',following:['第二句'],previous:'开头'});
+  now+=3000;p.player.pcmSent(2,now);
+  assert.deepEqual(JSON.parse(JSON.stringify(captions.at(-1))),{text:'第二句',following:[],previous:'第一句'});
+  await p.player.stop();assert.equal(captions.at(-1).text,'');assert.equal(captions.at(-1).following,undefined);assert.equal(captions.at(-1).previous,undefined);
+});
+
+test('delayed lyrics survive accompaniment end until their display interval finishes',async()=>{
+  let finishDrain;const p=setup({drain:()=>new Promise(resolve=>{finishDrain=resolve;})},10000);
+  await p.player.start();p.player.pcmSent(0,now);p.audio.paused=true;p.audio.onended();
+  now+=9999;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','']);assert.equal(p.player.hasPendingCaptions,true);
+  now+=1;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','开头']);
+  now+=300;await p.player.tick();assert.deepEqual(p.calls.at(-1),['caption','']);assert.equal(p.player.hasPendingCaptions,false);
+  finishDrain();await new Promise(resolve=>setImmediate(resolve));assert.equal(p.calls.at(-1)[1],'ended');
+});
+
+test('a sustained RTC vocal outage stops accompaniment rather than silently playing instrumental alone',async()=>{
+  let healthy=true;const p=setup({audioHealthy:()=>healthy});await p.player.start();
+  healthy=false;now+=100;await p.player.tick();assert.equal(p.audio.paused,false);
+  now+=3600;p.audio.currentTime=3.7;await p.player.tick();
+  assert.equal(p.audio.paused,true);
+  assert.ok(p.calls.some(c=>c[0]==='state'&&c[1]==='error'&&c[2].includes('RTC下行人声中断')));
 });
 
 test('a 57-second missing lyric interval is exposed as a timeline gap and the next send remains visible', async () => {

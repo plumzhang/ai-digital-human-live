@@ -13,6 +13,7 @@ pub(crate) struct SongPcm {
     revision: String,
     source_len: u64,
     source_modified: u128,
+    #[serde(default)] source_name: String,
     cues: Vec<Cue>,
     sample_rate: u32,
     channels: u16,
@@ -51,7 +52,7 @@ pub(crate) fn load(directory: &Path, source: &Path, cues: &[Cue]) -> Result<Song
     }
     let (len, modified) = stamp(source)?;
     let same_crops=cache.cues.len()==cues.len()&&cache.cues.iter().zip(cues).all(|(old,new)|old.start_ms==new.start_ms&&old.end_ms==new.end_ms&&old.text==new.text);
-    if !same_crops || cache.source_len != len || cache.source_modified != modified {
+    if !same_crops || cache.source_name != source.file_name().unwrap_or_default().to_string_lossy() || cache.source_len != len || cache.source_modified != modified {
         return Err("原歌曲或歌词时间轴已变化，请重新截取PCM".into());
     }
     for (index, cue) in cues.iter().enumerate() {
@@ -147,6 +148,7 @@ pub(crate) fn build(
             revision: revision.clone(),
             source_len: before.0,
             source_modified: before.1,
+            source_name: source.file_name().unwrap_or_default().to_string_lossy().into_owned(),
             cues: cues.to_vec(),
             sample_rate: 24000,
             channels: 1,
