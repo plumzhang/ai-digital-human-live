@@ -12,6 +12,8 @@ Windows 桌面客户端，使用 Tauri 2 + React、Vidu S2-Avatar **组件版**�
 npm install
 npm run setup:speech
 npm run dev:desktop
+
+
 ```
 
 安装器创建独立的 Ubuntu 24.04 WSL2 发行版 InnoTechx-Speech，保留 Docker 环境。FunASR 在 CPU 环境运行，OmniVoice 在独立 CUDA 12.8 环境运行。需要可用的 WSL2 和 NVIDIA GPU；启动时执行实际推理，验证 FlashInfer + CUDA Graph 后才报告就绪。环境与模型不修改系统 Python。首次安装需下载数 GB 模型和依赖。
