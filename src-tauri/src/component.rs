@@ -73,14 +73,68 @@ pub fn component_local_voice(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn component_tts_preview(app: tauri::AppHandle, tts: TtsConfig, text: String) -> Result<String, String> {
+pub async fn component_tts_preview(app: tauri::AppHandle, tts: TtsConfig, text: String) -> Result<TtsPreview, String> {
     app.state::<crate::prepared_speech::PreparedSpeech>().preempt();
     if text.trim().is_empty() || text.chars().count() > 200 { return Err("试听文本需为1到200字".into()); }
     let (tx, rx) = mpsc::channel(1); tx.send(text).await.map_err(|_| "试听取消")?; drop(tx);
     let (audio, mut received) = mpsc::channel(1);
     synthesize(tts, uuid::Uuid::new_v4().to_string(), rx, audio).await?;
     let (_, pcm) = received.recv().await.ok_or("试听没有返回音频")?;
-    Ok(format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(pcm_wav(&pcm))))
+    let wav = pcm_wav(&pcm);
+    let path = save_tts_preview(&tts_preview_directory(&app)?, &wav)?;
+    Ok(TtsPreview {
+        audio_url: format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(wav)),
+        file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+    })
+}
+
+#[derive(Serialize)]
+pub struct TtsPreview { audio_url: String, file_name: String }
+
+fn tts_preview_directory(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app.path().app_local_data_dir().map_err(|e| e.to_string())?.join("speech").join("previews"))
+}
+
+fn save_tts_preview(directory: &std::path::Path, wav: &[u8]) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(directory).map_err(|e| format!("无法创建试听文件夹：{e}"))?;
+    let path = directory.join(format!("试听-{}-{}.wav", unix_ms(), uuid::Uuid::new_v4()));
+    std::fs::write(&path, wav).map_err(|e| format!("无法保存试听音频：{e}"))?;
+    Ok(path)
+}
+
+#[tauri::command]
+pub fn component_tts_open_preview_folder(app: tauri::AppHandle, file_name: Option<String>) -> Result<(), String> {
+    let directory = tts_preview_directory(&app)?;
+    std::fs::create_dir_all(&directory).map_err(|e| format!("无法创建试听文件夹：{e}"))?;
+    let path = tts_preview_open_target(&directory, file_name.as_deref())?;
+    #[cfg(windows)] {
+        use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn ShellExecuteW(window: *mut c_void, operation: *const u16, file: *const u16, parameters: *const u16, directory: *const u16, show: i32) -> *mut c_void;
+        }
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let target = if file_name.is_some() { std::ffi::OsStr::new("explorer.exe") } else { path.as_os_str() };
+        let target: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
+        let parameters = file_name.as_ref().map(|_| format!("/select,\"{}\"", path.display()).encode_utf16().chain(Some(0)).collect::<Vec<_>>());
+        let result = unsafe { ShellExecuteW(ptr::null_mut(), operation.as_ptr(), target.as_ptr(), parameters.as_ref().map_or(ptr::null(), |value| value.as_ptr()), ptr::null(), 1) } as isize;
+        if result <= 32 { return Err(format!("无法打开试听文件夹（Windows 错误码 {result}）")); }
+    }
+    #[cfg(not(windows))] {
+        let _ = path;
+        std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(&directory).spawn().map_err(|e| format!("无法打开试听文件夹：{e}"))?;
+    }
+    Ok(())
+}
+
+fn tts_preview_open_target(directory: &std::path::Path, file_name: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let Some(name) = file_name else { return Ok(directory.to_path_buf()); };
+    if name.is_empty() || name.contains(['/', '\\', ':', '"']) || std::path::Path::new(name).extension().and_then(|ext| ext.to_str()) != Some("wav") {
+        return Err("试听文件名无效".into());
+    }
+    let path = directory.join(name);
+    if !path.is_file() { return Err("试听文件不存在，可能已被移动或删除，请重新生成试听".into()); }
+    Ok(path)
 }
 
 pub(crate) fn pcm_wav(pcm: &[u8]) -> Vec<u8> {
@@ -479,6 +533,36 @@ pub fn component_transcription(app: tauri::AppHandle, state: State<'_, AppState>
 mod tests {
     use super::*;
     use std::{io::{BufRead, BufReader, Read, Write}, net::TcpListener, thread};
+
+    #[test]
+    fn tts_previews_are_saved_as_distinct_wav_files_and_report_write_errors() {
+        let directory = std::env::temp_dir().join(format!("tts-preview-test-{}", uuid::Uuid::new_v4()));
+        let wav = pcm_wav(&[0, 1, 2, 3]);
+        let first = save_tts_preview(&directory, &wav).unwrap();
+        let second = save_tts_preview(&directory, &wav).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.extension().unwrap(), "wav");
+        assert_eq!(std::fs::read(&first).unwrap(), wav);
+        assert_eq!(std::fs::read(&second).unwrap(), wav);
+        assert!(save_tts_preview(&first, &wav).unwrap_err().contains("无法创建试听文件夹"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tts_preview_open_target_is_the_saved_wav_and_rejects_missing_or_external_files() {
+        let directory = std::env::temp_dir().join(format!("试听 目录-{}", uuid::Uuid::new_v4())).join("speech").join("previews");
+        let saved = save_tts_preview(&directory, &pcm_wav(&[0, 1])).unwrap();
+        let name = saved.file_name().unwrap().to_str().unwrap();
+        assert_eq!(tts_preview_open_target(&directory, Some(name)).unwrap(), saved);
+        assert_eq!(tts_preview_open_target(&directory, None).unwrap(), directory);
+        #[cfg(windows)] assert!(!saved.to_string_lossy().contains('/'));
+        for name in ["../outside.wav", "..\\outside.wav", "C:\\outside.wav", "wrong.mp3"] {
+            assert!(tts_preview_open_target(&directory, Some(name)).unwrap_err().contains("文件名无效"));
+        }
+        std::fs::remove_file(&saved).unwrap();
+        assert!(tts_preview_open_target(&directory, Some(name)).unwrap_err().contains("文件不存在"));
+        std::fs::remove_dir_all(directory.parent().unwrap().parent().unwrap()).unwrap();
+    }
 
     fn llm(base_url: String) -> LlmConfig { LlmConfig { base_url, key:"test-key".into(), model:"test-model".into(), persona:"主播规则".into() } }
 

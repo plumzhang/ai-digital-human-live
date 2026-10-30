@@ -126,7 +126,7 @@ test('legacy Doubao clones are excluded while API provider metadata takes preced
   ], voice => voice === 'OldDoubaoClone' ? 'doubao' : 'qwen_omni')), ['MyQwenClone', 'DefaultQwen']);
 });
 
-test('stored avatar cards migrate Doubao voices atomically without losing images or persona', async () => {
+test('stored avatars migrate legacy voices and snapshot reference audio once without losing images or persona', async () => {
   const model = compile('src/avatarProfiles.ts');
   assert.equal(model.defaultAvatarConfig.voice, 'Tina');
   assert.equal(model.defaultAvatarConfig.voiceProvider, 'qwen_omni');
@@ -136,6 +136,9 @@ test('stored avatar cards migrate Doubao voices atomically without losing images
       { id: 'two', name: '千问形象', image: null, config: { ...model.defaultAvatarConfig, voice: 'Cindy' } },
     ],
   };
+  delete stored.profiles[0].config.referenceVoice;
+  delete stored.profiles[1].config.referenceVoice;
+  let legacyAudio = 'G:\\legacy.wav';
   let writes = 0;
   const indexedDB = { open: () => {
     const request = {};
@@ -149,14 +152,19 @@ test('stored avatar cards migrate Doubao voices atomically without losing images
     queueMicrotask(() => request.onsuccess());
     return request;
   } };
-  const storage = compile('src/imageStorage.ts', { indexedDB, require: name => name === './avatarProfiles' ? model : { normalizeStoredVoice } });
+  const storage = compile('src/imageStorage.ts', { indexedDB, require: name => name === './avatarProfiles' ? model : name === './ttsConfig' ? { loadTtsConfig: () => ({ ref_audio: legacyAudio, ref_text: '原来的声音' }) } : { normalizeStoredVoice } });
   const loaded = await storage.loadAvatarLibrary(model.defaultAvatarConfig);
   assert.equal(loaded.profiles[0].config.voice, 'Tina');
   assert.equal(loaded.profiles[0].config.voiceProvider, 'qwen_omni');
   assert.equal(loaded.profiles[0].config.persona, '保留人设');
   assert.equal(loaded.profiles[0].image.data, 'photo');
   assert.equal(loaded.profiles[1].config.voice, 'Cindy');
+  assert.equal(loaded.profiles[0].config.referenceVoice.ref_audio, legacyAudio);
+  assert.equal(loaded.profiles[1].config.referenceVoice.ref_audio, legacyAudio);
+  assert.notEqual(loaded.profiles[0].config.referenceVoice, loaded.profiles[1].config.referenceVoice);
   assert.equal(writes, 1);
-  await storage.loadAvatarLibrary(model.defaultAvatarConfig);
+  legacyAudio = 'G:\\another-service-test.wav';
+  const reloaded = await storage.loadAvatarLibrary(model.defaultAvatarConfig);
+  assert.equal(reloaded.profiles[0].config.referenceVoice.ref_audio, 'G:\\legacy.wav');
   assert.equal(writes, 1);
 });

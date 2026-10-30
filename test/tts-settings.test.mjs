@@ -27,10 +27,13 @@ function mount(query, model = small, active = true) {
     '@tauri-apps/api/core': { invoke: async (name, args) => { calls.push({ name, args }); return query(name, args); } },
     '@tauri-apps/api/event': { listen: async (name, callback) => { listeners.set(name, callback); return () => listeners.delete(name); } },
     '../ttsConfig': configExports,
+    './ReferenceVoiceFields': { ReferenceVoiceFields: function ReferenceVoiceFields() {} },
   };
-  vm.runInNewContext(compile('src/ui/TtsSettings.tsx'), { exports, require: name => modules[name], localStorage, window: { dispatchEvent: () => {} }, Event: class { constructor(type) { this.type = type; } }, setInterval: callback => { const key = Symbol(); timers.set(key, callback); return key; }, clearInterval: key => timers.delete(key) });
+  const windowListeners = new Map();
+  const window = { addEventListener: (name, fn) => windowListeners.set(name, fn), removeEventListener: name => windowListeners.delete(name), dispatchEvent: event => windowListeners.get(event.type)?.() };
+  vm.runInNewContext(compile('src/ui/TtsSettings.tsx'), { exports, require: name => modules[name], localStorage, window, Event: class { constructor(type) { this.type = type; } }, setInterval: callback => { const key = Symbol(); timers.set(key, callback); return key; }, clearInterval: key => timers.delete(key) });
   const render = () => { cursor = refCursor = effectCursor = 0; pending = []; const result = exports.TtsSettings({ active }); pending.forEach(effect => effect()); return result; };
-  return { render, calls, storage, timers, listeners, close: () => effects.forEach(effect => effect.cleanup?.()) };
+  return { render, calls, storage, timers, listeners, sync: () => window.dispatchEvent({ type: 'speech-config-updated' }), setActive: value => { active = value; }, close: () => effects.forEach(effect => effect.cleanup?.()) };
 }
 const ready = model => ({ state: 'ready', running_model: model, device: 'cuda', managed: true, installed_models: [small], acceleration: { flashinfer: true, cuda_graph: true, verified: true }, stt: { ready: true, model: "FunASR/Paraformer-zh" } });
 const stopped = { state: 'stopped', installed_models: [small, large] };
@@ -82,4 +85,41 @@ test('hidden TTS settings do not poll and stopping a foreign service reports the
   p.render(); await flush(); button(p, '关闭本机服务').props.onClick(); await flush();
   assert.ok(text(p.render()).includes('端口程序不匹配')); assert.ok(!text(p.render()).includes('进程及显存已释放'));
   p.close(); assert.equal(p.timers.size, 0);
+});
+
+const input = (p, label) => nodes(p.render()).find(node => node.tag === 'label' && text(node) === label)?.props.children;
+const field = (p, label) => nodes(input(p, label)).find(node => node.tag === 'input' || node.tag === 'textarea');
+const referenceFields = p => nodes(p.render()).find(node => node.tag?.name === 'ReferenceVoiceFields');
+
+test('service test previews a draft reference without persisting it before save', async () => {
+  const p = mount(async name => name === 'component_local_status' ? ready(small) : { audio_url: 'data:audio/wav;base64,preview', file_name: '试听-service.wav' });
+  p.render(); await flush();
+  assert.ok(text(p.render()).includes('语音服务测试'));
+  referenceFields(p).props.onChange({ ref_audio: 'G:\\声音\\新音色.wav', ref_text: '新的参考原话' });
+  field(p, '试听文本').props.onChange({ target: { value: '试听这段声音' } });
+  button(p, '生成克隆试听').props.onClick(); await flush();
+  const preview = p.calls.find(call => call.name === 'component_tts_preview');
+  assert.equal(preview.args.tts.ref_audio, 'G:\\声音\\新音色.wav');
+  assert.equal(preview.args.tts.ref_text, '新的参考原话');
+  assert.equal(preview.args.text, '试听这段声音');
+  assert.equal(nodes(p.render()).find(node => node.tag === 'audio').props.src, 'data:audio/wav;base64,preview');
+  button(p, '打开生成文件夹').props.onClick(); await flush();
+  assert.equal(p.calls.find(call => call.name === 'component_tts_open_preview_folder').args.fileName, '试听-service.wav');
+  assert.equal(JSON.parse(p.storage.get('speech-service-config-v1')).ref_text, '参考原话');
+  button(p, '保存语音配置').props.onClick();
+  assert.equal(JSON.parse(p.storage.get('speech-service-config-v1')).ref_text, '新的参考原话');
+  p.close();
+});
+
+test('shared voice changes synchronize mounted settings and discard an older pending preview', async () => {
+  let finishPreview;
+  const p = mount(async name => name === 'component_local_status' ? ready(small) : new Promise(resolve => { finishPreview = resolve; }));
+  p.render(); await flush(); button(p, '生成克隆试听').props.onClick(); await flush();
+  const next = { ...JSON.parse(p.storage.get('speech-service-config-v1')), ref_audio: 'G:\\changed.wav', ref_text: '已在另一页保存' };
+  p.storage.set('speech-service-config-v1', JSON.stringify(next)); p.sync();
+  assert.equal(referenceFields(p).props.voice.ref_audio, next.ref_audio);
+  assert.equal(referenceFields(p).props.voice.ref_text, next.ref_text);
+  finishPreview('data:audio/wav;base64,old'); await flush();
+  assert.equal(nodes(p.render()).some(node => node.tag === 'audio'), false);
+  p.close();
 });

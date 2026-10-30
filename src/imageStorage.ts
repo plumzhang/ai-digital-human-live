@@ -3,6 +3,8 @@ export type SavedAvatarImage = { data: string; name: string };
 import { migrateAvatarLibrary, parseAvatarLibrary, type AvatarConfig, type AvatarLibrary } from './avatarProfiles';
 
 import { normalizeStoredVoice } from './voiceSelection';
+import { loadTtsConfig } from './ttsConfig';
+import { invoke } from '@tauri-apps/api/core';
 
 const databaseName = 'digital-human-live-assets';
 const storeName = 'images';
@@ -45,6 +47,13 @@ export async function saveAvatarImage(image: SavedAvatarImage | null): Promise<v
 }
 
 export async function loadAvatarLibrary(legacyConfig: AvatarConfig): Promise<AvatarLibrary> {
+  let { ref_audio, ref_text } = loadTtsConfig();
+  if (!ref_audio.trim()) {
+    try {
+      const voice = await invoke<{ ref_audio: string; ref_text: string } | null>('component_local_voice');
+      if (voice && typeof voice.ref_audio === 'string' && typeof voice.ref_text === 'string') ({ ref_audio, ref_text } = voice);
+    } catch { /* 旧版本未配置参考音频时保留空音色，等待用户填写。 */ }
+  }
   const db = await openDatabase();
   try {
     // Read and migrate in one transaction: concurrent startup reads cannot create duplicate cards.
@@ -58,7 +67,7 @@ export async function loadAvatarLibrary(legacyConfig: AvatarConfig): Promise<Ava
           const value = (event.target as IDBRequest).result;
           if (value !== undefined) {
             library = parseAvatarLibrary(value);
-            const profiles = library.profiles.map(profile => ({ ...profile, config: { ...profile.config, ...normalizeStoredVoice(profile.config) } }));
+            const profiles = library.profiles.map(profile => ({ ...profile, config: { ...profile.config, ...normalizeStoredVoice(profile.config), referenceVoice: profile.config.referenceVoice ?? { ref_audio, ref_text } } }));
             if (profiles.some((profile, index) => JSON.stringify(profile.config) !== JSON.stringify(library.profiles[index].config))) {
               library = { ...library, profiles };
               store.put(library, libraryKey);
@@ -67,7 +76,7 @@ export async function loadAvatarLibrary(legacyConfig: AvatarConfig): Promise<Ava
           else {
             store.get(avatarKey).onsuccess = event => {
               try {
-                library = migrateAvatarLibrary(legacyConfig, (event.target as IDBRequest).result || null);
+                library = migrateAvatarLibrary({ ...legacyConfig, referenceVoice: legacyConfig.referenceVoice?.ref_audio ? legacyConfig.referenceVoice : { ref_audio, ref_text } }, (event.target as IDBRequest).result || null);
                 store.put(library, libraryKey);
               } catch (error) { failure = error; transaction.abort(); }
             };

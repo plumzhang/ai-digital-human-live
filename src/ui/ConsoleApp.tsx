@@ -18,7 +18,7 @@ import { loadSlotPcmTiming } from '../localPcmSettings';
 import { TtsLog } from './TtsLog';
 import { FilterRules } from './FilterRules';
 import { loadCaptionSettings } from '../captionSettings';
-import { loadTtsConfig, ttsStorageKey } from '../ttsConfig';
+import { loadTtsConfig } from '../ttsConfig';
 import { TtsSettings } from './TtsSettings';
 import { loadModelConfig } from '../modelConfig';
 import { ManualQuestions, type ManualQuestion } from '../manualQuestions';
@@ -92,12 +92,8 @@ function avatarConfigOfProfile(profile: AvatarProfile): AvatarConfig {
 const call = <T,>(name: string, args?: Record<string, unknown>) => invoke<T>(name, args);
 
 export function ConsoleApp() {
-  useEffect(() => {
-    if (loadTtsConfig().ref_audio.trim()) return;
-    void call<{ ref_audio: string; ref_text: string } | null>('component_local_voice').then(voice => {
-      if (voice && !loadTtsConfig().ref_audio.trim()) localStorage.setItem(ttsStorageKey, JSON.stringify({ ...loadTtsConfig(), ...voice }));
-    }).catch(() => {});
-  }, []);
+  const activeAvatarRef = useRef<AvatarProfile | null>(null);
+  const currentTtsConfig = () => loadTtsConfig(activeAvatarRef.current?.config.referenceVoice);
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [apiKey, setApiKey] = useState(loadApiKey);
   const [keyStorageError, setKeyStorageError] = useState(false);
@@ -108,8 +104,11 @@ export function ConsoleApp() {
   const [showCreditDetails, setShowCreditDetails] = useState(false);
   const [imageFileData, setImageFileData] = useState('');
   const avatars = useAvatarLibrary(settings, profile => {
+    const previous = activeAvatarRef.current;
+    activeAvatarRef.current = profile;
     setSettings(old => ({ ...old, ...avatarConfigOfProfile(profile) }));
     setImageFileData(profile.image?.data || '');
+    if (previous && (previous.id !== profile.id || JSON.stringify(previous.config.referenceVoice) !== JSON.stringify(profile.config.referenceVoice))) window.dispatchEvent(new Event('speech-config-updated'));
   });
   const [tab, setTab] = useState<'live' | 'rules' | 'songs' | 'settings' | 'voice' | 'models'>('live');
   const [modelTab, setModelTab] = useState<ModelSettingsTab>('reply');
@@ -161,7 +160,7 @@ export function ConsoleApp() {
   const checkAsr = async () => {
     setAsrStatus('loading'); setAsrMessage('正在检查 FunASR 服务…');
     try {
-      const info = await call<{ ready: boolean; device: string; model: string }>('speech_prepare', { tts: loadTtsConfig() });
+      const info = await call<{ ready: boolean; device: string; model: string }>('speech_prepare', { tts: currentTtsConfig() });
       if (!info.ready) throw new Error('FunASR 尚未就绪，请先启动本机语音服务');
       setAsrStatus('ready'); setAsrMessage('FunASR 已就绪');
     } catch (error) { setAsrStatus('error'); setAsrMessage(errorText(error)); }
@@ -211,7 +210,7 @@ export function ConsoleApp() {
         },
         rewriteReply: (task, draft, history, diversity, liveId) => rewriteComponentReply(task, draft, history, diversity, loadModelConfig(), call, liveId),
         retainAudio: async (liveId, tokens) => call('component_audio_retain', { owner: await audioOwner, liveId, tokens }),
-        prepareAudio: (task, liveId) => call('component_prepare_audio', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig() }),
+        prepareAudio: (task, liveId) => call('component_prepare_audio', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: currentTtsConfig() }),
         act:async(task,liveId)=>{const gesture=avatarActionFor(task);if(gesture)await call('send_avatar_action',{liveId,taskId:task.id,gesture:gesture.kind,instruction:gesture.instruction});},
         interruptReply:task=>call('component_interrupt_reply',{liveId:task.live_id,taskId:task.id}),
         speak: async (task, liveId) => {
@@ -220,9 +219,9 @@ export function ConsoleApp() {
             log(`歌曲导播 · ${task.song.title}`); return;
           }
           const config = loadModelConfig();
-          await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          await call('component_configure', { liveId, tts: currentTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
           const gesture = avatarActionFor(task);
-          await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: loadTtsConfig(),
+          await call('component_play_prepared', { liveId, taskId: task.id, token: task.prepared_audio!.token, text: task.result!.prepared_reply!, tts: currentTtsConfig(),
             slotActions: { playback_token: task.playback_token!, started_at: task.started_at!, ...task.pcm_timing, reply_delay_ms: task.reply_action_delay_ms ?? 0, handoff_delay_ms: task.handoff_action_delay_ms ?? 0,
               handoff: task.handoff_action ? { direction: task.handoff_action.direction, angle_deg: task.handoff_action.angle_deg } : null,
               reply: !task.song_parent&&gesture ? { gesture: gesture.kind, instruction: gesture.instruction } : null } });
@@ -256,7 +255,7 @@ export function ConsoleApp() {
         send: async (content, liveId) => {
           if (!readyRef.current || activeLiveIdRef.current !== liveId) throw new Error('原会话已结束，已取消手动提问');
           const config = loadModelConfig();
-          await call('component_configure', { liveId, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          await call('component_configure', { liveId, tts: currentTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
           await call('send_question', { content, liveId });
           log(`文本消息已发送：${content}`);
         },
@@ -598,7 +597,7 @@ export function ConsoleApp() {
         const config = loadModelConfig();
         log('麦克风识别：' + input.text);
         void (async () => {
-          await call('component_configure', { liveId: input.live_id, tts: loadTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
+          await call('component_configure', { liveId: input.live_id, tts: currentTtsConfig(), llm: { base_url: config.baseUrl, key: config.apiKey, model: config.selectedModel, persona: config.persona } });
           if (generation !== modelRequestRef.current || !micRef.current || input.live_id !== activeLiveIdRef.current) return;
           await call('component_respond', { liveId: input.live_id, taskId: 'microphone-' + input.capture_id, content: input.text });
         })().catch(error => { if (generation === modelRequestRef.current) reportError('语音互动失败：' + errorText(error)); });
@@ -779,9 +778,9 @@ export function ConsoleApp() {
       if (!apiKey.trim()) throw new Error('请先在“模型配置 → Vidu数字人”填写 Vidu API Key');
       if (!(imageFileData || settings.imageUri.trim())) throw new Error('请先在“形象设定”设置形象图片');
       if (!settings.persona.trim()) throw new Error('请先在“形象设定”填写人设');
-      const tts = loadTtsConfig();
+      const tts = currentTtsConfig();
       const modelConfig = loadModelConfig();
-      if (!tts.ref_audio.trim() || !tts.ref_text.trim()) throw new Error('请在“模型配置 → OmniVoice 语音”保存参考音频路径和参考文字');
+      if (!tts.ref_audio.trim() || !tts.ref_text.trim()) throw new Error('请在“形象设定 → 编辑数字人”保存当前角色的参考音频路径和参考原话');
       if (!modelConfig.apiKey.trim() || !modelConfig.selectedModel.trim()) throw new Error('请先保存大语言模型配置');
       const creation: SessionCreation = { key: apiKey, region: settings.region, avatar: { tts, llm: { base_url: modelConfig.baseUrl, key: modelConfig.apiKey, model: modelConfig.selectedModel, persona: modelConfig.persona }, model: settings.avatarModel, image_uri: imageFileData || settings.imageUri, persona: settings.persona } };
       sessionCreationRef.current = creation;

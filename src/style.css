@@ -45,6 +45,8 @@
 .local-image-row{display:flex;justify-content:space-between;align-items:center;gap:12px;color:#9aabc1;font-size:12px;min-width:0}
 .local-image-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .local-image-row button{flex:none;padding:7px 10px;font-size:11px}
+.reference-audio-picker{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end}
+.reference-audio-picker>.voice-notice{grid-column:1/-1;margin-top:0}
 .api-key-field{min-width:0}
 .api-key-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:7px;color:#8092aa;font-size:11px}
 .api-key-actions button{padding:4px 7px;font-size:11px}

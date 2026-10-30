@@ -54,6 +54,23 @@ test('invalid stored profiles are rejected without falling back to destructive m
   assert.throws(() => model.parseAvatarLibrary(invalid));
 });
 
+test('each role persists its own reference voice with no shared mutable objects', () => {
+  const voice = { ref_audio: 'one.wav', ref_text: '第一位角色' };
+  const first = model.newAvatarProfile({ ...model.defaultAvatarConfig, referenceVoice: voice }, '第一位');
+  let library = { version: 1, activeId: first.id, profiles: [first] };
+  const second = model.newAvatarProfile({ ...model.defaultAvatarConfig, referenceVoice: { ref_audio: 'two.wav', ref_text: '第二位角色' } }, '第二位');
+  library = model.saveProfileInLibrary(library, second);
+  voice.ref_audio = 'mutated.wav'; second.config.referenceVoice.ref_text = 'mutated';
+  assert.equal(library.profiles[0].config.referenceVoice.ref_audio, 'one.wav');
+  assert.equal(library.profiles[1].config.referenceVoice.ref_text, '第二位角色');
+  const selected = model.activateProfile(plain(library), second.id);
+  assert.equal(selected.profiles.find(profile => profile.id === selected.activeId).config.referenceVoice.ref_audio, 'two.wav');
+  const empty = model.newAvatarProfile();
+  assert.equal(empty.config.referenceVoice.ref_audio, '');
+  const invalid = plain(library); invalid.profiles[0].config.referenceVoice.ref_text = 123;
+  assert.throws(() => model.parseAvatarLibrary(invalid), /音色配置/);
+});
+
 function mount(storage) {
   const values = [], refs = [], effects = [];
   let stateIndex = 0, refIndex = 0, effectIndex = 0, scheduled = [];

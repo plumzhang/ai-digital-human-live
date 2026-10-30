@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Check, Pencil, Plus, Save, Settings2, Video } from 'lucide-react';
 import { avatarConfigOf, defaultAvatarConfig, newAvatarProfile, validateAdvanced, type AvatarConfig, type AvatarLibrary, type AvatarProfile } from '../avatarProfiles';
 import { normalizeStoredVoice } from '../voiceSelection';
+import { AvatarVoiceFields } from './AvatarVoiceFields';
 
 type Props = {
   active: boolean; library: AvatarLibrary | null; loading: boolean; saving: boolean; error: string;
@@ -18,7 +19,7 @@ function AvatarCard({ profile, selected, disabled, saving, onEdit, onSelect }: {
   return <article className={`card avatar-profile-card${selected ? ' selected' : ''}`}>
     <div className="avatar-card-picture">{src && !failedImage ? <img src={src} alt={`${profile.name}的形象`} loading="lazy" onError={() => setFailedImage(true)}/> : <div><Video size={38}/><span>{failedImage ? '图片加载失败' : '待设置形象图片'}</span></div>}{selected && <span className="avatar-current-badge"><Check size={13}/> 当前使用</span>}</div>
     <h3>{profile.name}</h3><p className="avatar-card-model">{profile.config.avatarModel} · {profile.config.region === 'cn' ? '中国区' : '国际区'}</p>
-    <p className="avatar-card-voice">音色：本机 OmniVoice</p>
+    <p className="avatar-card-voice">音色：{profile.config.referenceVoice?.ref_audio.split(/[\\/]/).pop() || '待设置角色音色'}</p>
     <p className="avatar-card-persona">{profile.config.persona || '待填写人设'}</p>
     <div className="button-row"><button type="button" className={selected ? '' : 'primary'} disabled={disabled || selected} onClick={onSelect}><Check size={15}/>{selected ? '当前使用' : '设为当前'}</button><button type="button" disabled={saving} onClick={onEdit}><Pencil size={15}/> 编辑</button></div>
   </article>;
@@ -32,6 +33,7 @@ function AvatarEditor({ profile, isNew, saving, locked, onClose, onSave, ...prop
   const [settings, setSettings] = useState<AvatarConfig>(() => ({ ...avatarConfigOf(profile.config), ...normalizeStoredVoice(profile.config) }));
   const [image, setImage] = useState(profile.image);
   const [imageReading, setImageReading] = useState(false);
+  const [recognizingReference, setRecognizingReference] = useState(false);
   const [previewError, setPreviewError] = useState(false);
   const [error, setError] = useState('');
   const imageInput = useRef<HTMLInputElement>(null);
@@ -55,7 +57,7 @@ function AvatarEditor({ profile, isNew, saving, locked, onClose, onSave, ...prop
   }
 
   async function save() {
-    if (submitting.current || disabled || locked) return;
+    if (submitting.current || disabled || locked || recognizingReference) return;
     setError('');
     try {
       if (!name.trim() || name.trim().length > 50) throw new Error('请填写 1～50 个字符的数字人名称');
@@ -69,9 +71,9 @@ function AvatarEditor({ profile, isNew, saving, locked, onClose, onSave, ...prop
   }
 
   return <>
-    <div className="avatar-library-heading"><div className="avatar-editor-heading"><button type="button" disabled={disabled} onClick={onClose}><ArrowLeft size={16}/> 返回卡片</button><div><h2>{isNew ? '新建数字人' : `编辑数字人 · ${profile.name}`}</h2><p className="hint">独立保存形象与主播人设，语音使用本机 OmniVoice。</p></div></div></div>
-    <form className="settings-layout avatar-editor-layout" noValidate onSubmit={event => { event.preventDefault(); void save(); }}>
-      <section className="card settings-form"><div className="section-title"><h2>数字人配置</h2><Settings2 size={19}/></div>
+    <div className="avatar-library-heading"><div className="avatar-editor-heading"><button type="button" disabled={disabled} onClick={onClose}><ArrowLeft size={16}/> 返回卡片</button><div><h2>{isNew ? '新建数字人' : `编辑数字人 · ${profile.name}`}</h2><p className="hint">独立保存角色的形象、人设与音色。</p></div></div></div>
+    <div className="settings-layout avatar-editor-layout">
+      <form className="card settings-form" noValidate onSubmit={event => { event.preventDefault(); void save(); }}><div className="section-title"><h2>数字人配置</h2><Settings2 size={19}/></div>
         <fieldset className="avatar-editor-fields" disabled={disabled}><div className="form-grid">
           <label className="full">数字人名称<input value={name} onChange={event => { setName(event.target.value); setError(''); }} maxLength={50} placeholder="例如：晚晚" required/></label>
           <label className="full">数字人模型<select value={settings.avatarModel} onChange={e => update({ avatarModel: e.target.value as AvatarConfig['avatarModel'] })}><option value="vidu-s2">vidu-s2（最新模型，灰度测试中）</option><option value="vidu-s1">vidu-s1</option></select></label>
@@ -80,19 +82,19 @@ function AvatarEditor({ profile, isNew, saving, locked, onClose, onSave, ...prop
           <label className="full">形象图片 URL<input value={settings.imageUri} onChange={e => update({ imageUri: e.target.value })} placeholder="https://..."/></label>
           <label className="full">或选择本地形象图片<input ref={imageInput} type="file" accept="image/png,image/jpeg,image/webp" onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) readImage(file); }}/></label>
           {image && <div className="full local-image-row"><span>当前使用：{image.name}</span><button type="button" onClick={() => { setImage(null); setError(''); }}>改用图片 URL</button></div>}
-          <p className="hint full">组件版使用本机 OmniVoice 克隆音色，请在“模型配置 → OmniVoice 语音”设置参考音频。</p>
           <label className="full">人设<textarea rows={7} value={settings.persona} onChange={e => update({ persona: e.target.value })}/></label>
+          <AvatarVoiceFields voice={settings.referenceVoice ?? { ref_audio: '', ref_text: '' }} onChange={referenceVoice => update({ referenceVoice })} active={props.active} disabled={disabled} onRecognizingChange={setRecognizingReference}/>
         </div>
         </fieldset>
         {locked && <p className="hint">此数字人正在使用中，请先结束直播会话，再保存修改。</p>}
-        <div className="button-row"><button type="submit" className="primary" disabled={disabled || locked}><Save size={16}/>{saving || submittingState ? '保存中…' : imageReading ? '读取图片中…' : '保存数字人'}</button><button type="button" disabled={disabled} onClick={onClose}>取消</button></div>
+        <div className="button-row"><button type="submit" className="primary" disabled={disabled || locked || recognizingReference}><Save size={16}/>{saving || submittingState ? '保存中…' : imageReading ? '读取图片中…' : '保存数字人'}</button><button type="button" disabled={disabled} onClick={onClose}>取消</button></div>
         {error && <div className="voice-notice error" role="alert">{error}</div>}
-      </section>
+      </form>
       <aside className="card settings-preview"><div className="section-title"><h2>{name.trim() || '形象预览'}</h2><Video size={19}/></div>
         <div className="avatar-preview-stage">{previewSrc && !previewError ? <img src={previewSrc} alt="数字人形象预览" onError={() => setPreviewError(true)}/> : <div className="avatar-preview-empty"><Video size={32}/><strong>{previewError ? '图片加载失败' : '尚未设置形象图片'}</strong><span>填写图片 URL，或选择本地图片。</span></div>}</div>
-        <div className="preview-details"><div><span>图片来源</span><strong>{image ? '本地图片' : settings.imageUri.trim() ? '图片 URL' : '未设置'}</strong></div><div><span>音色</span><strong>本机 OmniVoice</strong></div><div><span>人设</span><p>{settings.persona || '未设置'}</p></div></div>
+        <div className="preview-details"><div><span>图片来源</span><strong>{image ? '本地图片' : settings.imageUri.trim() ? '图片 URL' : '未设置'}</strong></div><div><span>音色</span><strong>{settings.referenceVoice?.ref_audio.split(/[\\/]/).pop() || '未设置'}</strong></div><div><span>人设</span><p>{settings.persona || '未设置'}</p></div></div>
       </aside>
-    </form>
+    </div>
   </>;
 }
 
