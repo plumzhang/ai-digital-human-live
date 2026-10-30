@@ -1499,6 +1499,27 @@ test('FunASR completes a gap reply and advances child slots while the song stays
   }finally{p.engine.dispose();}
 });
 
+test('3 second silence advances only the interlude reply and never consumes its song director parent',async()=>{
+  const p=setup(undefined,false,{autoAnswer:false,prepareAudio:async()=>({state:'ready',duration_ms:2000}),speak:async task=>{
+    if(task.song)return;
+    await p.engine.observeOutput({live_id:'live',text:task.result.prepared_reply,received_at:p.now(),final:true,request_id:task.id});
+  }});
+  try{
+    await p.engine.configureRecognition(true);const song=await startSong(p,false);
+    await p.engine.ingest(p.event('chat'));await p.engine.setContext(true,'live',true);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true},'live');
+    p.jobs.get('chat').resolve({...reply('chat'),generation_mode:'component',prepared_reply:'间奏里聊聊天，祝大家开心。',prepared_for_live:'live'});await flush();
+    const child=p.engine.snapshot().tasks[1];assert.equal(child.status,'playing');
+    p.engine.observeVad({speaking:true,ended:false,healthy:true,quiet_ms:0},'live');p.advance(3000);
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:3000},'live');await p.engine.tick();
+    let state=p.engine.snapshot();assert.equal(state.tasks.length,1);assert.equal(state.tasks[0].id,song.task_id);assert.equal(state.tasks[0].status,'playing');
+    assert.equal(state.history[0].task.id,child.id);assert.match(state.history[0].reason,/连续3秒无说话/);
+    p.advance(10000);p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:false,healthy:true,quiet_ms:13000},'live');await p.engine.tick();
+    state=p.engine.snapshot();assert.equal(state.tasks[0].id,song.task_id);assert.equal(state.history.length,1);
+    await p.engine.observeSong({...song,state:'ended'});assert.equal(p.engine.snapshot().tasks.length,0);
+  }finally{p.engine.dispose();}
+});
+
 test('ending a song during an unconfirmed action never replays that action as a new spoken reply',async()=>{
   const action=deferred(),calls=[];const p=setup(undefined,false,{act:async t=>{calls.push(t.id);await action.promise;}});
   try{
@@ -1591,6 +1612,9 @@ test('songs remain durable beyond 60 seconds and finish only on their own origin
   p.advance(31000); await p.engine.setContext(true, 'live', true);
   await p.observe(); p.advance(1600); await p.observe();
   let task = p.engine.snapshot().tasks[0]; assert.equal(task.status, 'playing'); assert.equal(p.jobs.size, 0);
+  p.engine.observeVad({speaking:true,ended:false,healthy:true,quiet_ms:0},'live');p.advance(3000);
+  p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:3000},'live');await p.engine.tick();
+  assert.equal(p.engine.snapshot().tasks[0].status,'playing');assert.equal(p.engine.snapshot().history.length,0);
   p.advance(61000); await p.observe(); assert.equal(p.engine.snapshot().tasks[0].status, 'playing');
   const identity = { task_id: task.id, playback_token: task.playback_token, live_id: 'live', state: 'ended' };
   await p.engine.observeSong({ ...identity, live_id: 'old' });
@@ -2012,7 +2036,7 @@ test('FunASR confirms a component ending without waiting for 1.5 seconds or the 
   } finally {p.engine.dispose();}
 });
 
-test('a component cannot complete from a first-sentence match, omitted final words or VAD silence alone', async () => {
+test('a component cannot complete from a first-sentence match, omitted final words or less than 3 seconds of silence', async () => {
   const text='先跟你打个招呼。接下来甲乙丙丁戊己庚辛壬癸。';
   const p=await startRecognizedComponent(text);
   try {
@@ -2042,15 +2066,66 @@ test('component ending evidence must follow all PCM writes and belong to the cur
   } finally {p.engine.dispose();sent.resolve();await p.sending;}
 });
 
-test('FunASR failure keeps the component slot for confirmation instead of falling back to silence', async () => {
-  const p=await startRecognizedComponent('欢迎来到直播间，祝大家晚上开心。');
+test('3 seconds of observed silence advances component replies despite wrong, missing or failed recognition', async () => {
+  for (const recognition of ['mismatch', 'wrong-ending', 'missing', 'error']) {
+    const p=await startRecognizedComponent('先跟你打个招呼。接下来甲乙丙丁戊己庚辛壬癸。');
+    try {
+      await p.sending;p.media();await p.output(p.task.result.prepared_reply);
+      await p.engine.ingest(p.event('next'));
+      p.jobs.get('next').resolve({...reply('下一条'),generation_mode:'component',prepared_reply:'接着聊下一个话题。',prepared_for_live:'live'});
+      await flush();
+      if (recognition === 'mismatch') await p.heard('完全不相关的识别结果');
+      if (recognition === 'wrong-ending') await p.heard('甲乙丙丁戊己庚');
+      if (recognition === 'error') await p.heard('',{error:'FunASR unavailable'});
+      assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+      const quiet=async ms=>{
+        p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:ms},'live');await p.engine.tick();await flush();
+      };
+      p.advance(2999);await quiet(2999);
+      assert.equal(p.engine.snapshot().history.length,0);
+      p.advance(1);await quiet(3000);
+      const state=p.engine.snapshot();
+      assert.equal(state.history.length,1);assert.equal(state.history[0].task.id,p.task.id);
+      assert.equal(state.history[0].outcome,'played');assert.match(state.history[0].reason,/连续3秒无说话/);
+      assert.equal(state.tasks[0].event.event_id,'next');assert.equal(state.tasks[0].status,'playing');
+      // The next slot must observe its own speech before it can use the fallback.
+      p.advance(3000);await quiet(6000);assert.equal(p.engine.snapshot().history.length,1);
+    } finally {p.engine.dispose();}
+  }
+});
+
+test('silence fallback waits for all PCM and final output, and restarts when speech resumes', async () => {
+  const sent=deferred();
+  const p=await startRecognizedComponent('先聊一会儿。最后祝你开心。',{speak:()=>sent.promise});
+  const quiet=async ms=>{
+    p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:ms},'live');await p.engine.tick();
+  };
   try {
-    await p.sending;p.media();await p.output(p.task.result.prepared_reply);
-    await p.heard('',{error:'FunASR unavailable'});
-    assert.equal(p.engine.snapshot().tasks[0].status,'uncertain');assert.equal(p.engine.snapshot().history.length,0);
-    p.advance(3000);p.engine.observeVideo('live');p.engine.observeVad({speaking:false,ended:true,healthy:true,quiet_ms:3000},'live');await p.engine.tick();
-    assert.equal(p.engine.snapshot().tasks[0].status,'uncertain');
-  } finally {p.engine.dispose();}
+    p.media();await p.output('先聊一会儿。',false);
+    p.advance(4000);await quiet(4000);assert.equal(p.engine.snapshot().history.length,0);
+    p.media();sent.resolve();await p.sending;
+    p.advance(4000);await quiet(4000);assert.equal(p.engine.snapshot().history.length,0);
+    // A resumed sentence resets the 3 second window even after sending finishes.
+    p.media();await p.output(p.task.result.prepared_reply);
+    p.advance(2000);await quiet(2000);assert.equal(p.engine.snapshot().history.length,0);
+    p.media();p.advance(2999);await quiet(2999);assert.equal(p.engine.snapshot().history.length,0);
+    p.advance(1);await quiet(3000);assert.equal(p.engine.snapshot().history[0].outcome,'played');
+  } finally {sent.resolve();await p.sending;p.engine.dispose();}
+});
+
+test('silence fallback requires actual speech and healthy current-session audio and video observations', async () => {
+  for (const invalid of ['no-speech','stale-audio','stale-video','unhealthy','foreign-session']) {
+    const p=await startRecognizedComponent('欢迎来到直播间，祝大家晚上开心。');
+    try {
+      await p.sending;await p.output(p.task.result.prepared_reply);
+      if (invalid !== 'no-speech') p.media();
+      p.advance(3000);
+      if (invalid !== 'stale-video') p.engine.observeVideo('live');
+      if (invalid !== 'stale-audio') p.engine.observeVad({speaking:false,ended:true,healthy:invalid!=='unhealthy',quiet_ms:3000},invalid==='foreign-session'?'other':'live');
+      await p.engine.tick();assert.equal(p.engine.snapshot().history.length,0,invalid);
+      assert.equal(p.engine.snapshot().tasks[0].status,'playing');
+    } finally {p.engine.dispose();}
+  }
 });
 
 test('each component slot owns its handoff and reply delay, with no end-of-previous-slot wait', async () => {

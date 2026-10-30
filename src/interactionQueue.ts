@@ -81,6 +81,7 @@ export const emptyQueue = (): QueueSnapshot => ({ version: 1, room_id: '', tasks
 // text_msg has no completion acknowledgement. Use one RTC silence window,
 // shared by completion detection and the next submission, without waiting twice.
 const PLAYBACK_SILENCE_MS = 1500;
+const REPLY_SILENCE_FALLBACK_MS = 3000;
 const SONG_ENDING_ACTION='歌曲结束时动作仍在提交，请稍候…';
 
 export function normalizeInteraction(raw: unknown, now = Date.now()): InteractionEvent | null {
@@ -374,7 +375,8 @@ export class InteractionQueue {
       if (task?.song || !task?.result || !Number.isFinite(observation.captured_at) || observation.captured_at < (task.started_at || 0) || observation.captured_at > this.now() + 1000 || observation.captured_at < (task.recognition?.captured_at || 0)) return false;
       const match = observation.error ? { matched: false, progress: 0 } : matchTaskReply(task, observation.text, next.recognition?.match_percent ?? 70);
       task.recognition = { text: observation.text.slice(0, 10000), ...match, captured_at: observation.captured_at, inference_ms: observation.inference_ms, segments: observation.segments?.slice(-500), error: observation.error };
-      if (observation.error) { task.status = 'uncertain'; task.error = `语音识别失败，需人工确认完成或跳过：${observation.error}`; clearTimeout(this.playbackTimer); }
+      // Component playback can still finish from observed silence when ASR fails.
+      if (observation.error && task.result.generation_mode !== 'component') { task.status = 'uncertain'; task.error = `语音识别失败，需人工确认完成或跳过：${observation.error}`; clearTimeout(this.playbackTimer); }
       return true;
     });
     await this.tick();
@@ -862,6 +864,10 @@ export class InteractionQueue {
             this.now() - this.audioAt < 500 && this.now() - this.videoAt < 2000) {
           this.vadIdle = true;
           await this.finish('played', `FunASR 实际本地播放回答末尾匹配达到${this.state.recognition.match_percent ?? 70}%，最后3字已确认，全部PCM已发送`, true);
+        } else if (!this.speaking && task.audio_sent_at && task.answer?.final === true && this.heardSpeech && this.vadIdle &&
+            this.whisperQuietMs >= REPLY_SILENCE_FALLBACK_MS && this.now() - this.lastActualVoiceAt >= REPLY_SILENCE_FALLBACK_MS &&
+            this.now() - this.audioAt < 500 && this.now() - this.videoAt < 2000) {
+          await this.finish('played', '全部PCM已发送，实际播放发声后连续3秒无说话，自动完成弹幕回复槽位', true);
         }
         return;
       }
